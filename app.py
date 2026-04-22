@@ -9,7 +9,7 @@ import random
 from OpenGL.GL import *
 from OpenGL.GLU import (
     gluPerspective, gluLookAt, gluNewQuadric, gluQuadricTexture,
-    gluQuadricNormals, gluCylinder, GLU_SMOOTH,
+    gluQuadricNormals, gluCylinder, gluProject, GLU_SMOOTH,
 )
 
 
@@ -388,6 +388,121 @@ def draw_rain(state, intensity, cam_x, cam_y, cam_z):
     glLineWidth(1.0)
     glDepthMask(GL_TRUE)
     glDisable(GL_BLEND)
+
+
+# --- Lens flare (sprite-based, canonical approach: sun→center ghost chain
+# + anamorphic horizontal streak + main burst). Only fires when the view
+# is roughly pointing at the sun and the sun sits well above the horizon;
+# a 0.5s EMA on the combined intensity keeps the flare from flickering as
+# the road curves and the view direction oscillates past the threshold.
+# Storm dampens it (clouds block the beam). Rare by construction: only
+# shows when road heading aligns with the sun within ~35° and the sun is
+# > ~0.25 elevation.
+def make_flare_disc_texture(size=128):
+    """Soft radial disc in RGBA — one sprite reused for every flare element,
+    scaled non-uniformly to produce the anamorphic streak."""
+    ys, xs = np.mgrid[0:size, 0:size].astype(np.float32)
+    c = (size - 1) / 2.0
+    d = np.sqrt((xs - c) ** 2 + (ys - c) ** 2) / c
+    alpha = np.clip(1.0 - d, 0.0, 1.0) ** 1.7
+    rgba = np.zeros((size, size, 4), dtype=np.float32)
+    rgba[..., 0] = 1.0
+    rgba[..., 1] = 1.0
+    rgba[..., 2] = 1.0
+    rgba[..., 3] = alpha
+    return (rgba * 255).astype(np.uint8)
+
+
+def _flare_sprite(cx, cy, w, h):
+    glBegin(GL_QUADS)
+    glTexCoord2f(0.0, 0.0); glVertex2f(cx - w / 2, cy - h / 2)
+    glTexCoord2f(1.0, 0.0); glVertex2f(cx + w / 2, cy - h / 2)
+    glTexCoord2f(1.0, 1.0); glVertex2f(cx + w / 2, cy + h / 2)
+    glTexCoord2f(0.0, 1.0); glVertex2f(cx - w / 2, cy + h / 2)
+    glEnd()
+
+
+# Ghost table: (t along sun→center axis, radius, RGBA). t=1 is sun, 0 is
+# screen centre, negative values land past centre on the far side.
+_FLARE_GHOSTS = (
+    (0.78, 55.0, (1.00, 0.80, 0.55, 0.30)),
+    (0.45, 36.0, (0.75, 1.00, 0.80, 0.25)),
+    (0.18, 28.0, (0.85, 0.70, 1.00, 0.22)),
+    (-0.12, 42.0, (1.00, 0.85, 0.60, 0.26)),
+    (-0.42, 28.0, (0.65, 0.90, 1.00, 0.20)),
+    (-0.80, 52.0, (1.00, 0.95, 0.70, 0.28)),
+    (-1.15, 34.0, (0.90, 0.70, 0.90, 0.18)),
+)
+
+
+def draw_lens_flare(disc_tex, sun_dir, cam_x, cam_y, cam_z,
+                    look_x, look_y, look_z, W, H, intensity):
+    if intensity < 0.02:
+        return
+    # Project sun world position (pushed way out along sun_dir) to screen
+    sun_world = (cam_x + sun_dir[0] * 600.0,
+                 cam_y + sun_dir[1] * 600.0,
+                 cam_z + sun_dir[2] * 600.0)
+    modelview = glGetDoublev(GL_MODELVIEW_MATRIX)
+    projection = glGetDoublev(GL_PROJECTION_MATRIX)
+    viewport = glGetIntegerv(GL_VIEWPORT)
+    try:
+        sx, sy, sz = gluProject(
+            sun_world[0], sun_world[1], sun_world[2],
+            modelview, projection, viewport,
+        )
+    except Exception:
+        return
+    if sz <= 0.0 or sz >= 1.0:
+        return  # sun is behind the camera or past the far plane
+
+    # Switch to 2D ortho overlay
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glOrtho(0, W, 0, H, -1, 1)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+
+    glDisable(GL_DEPTH_TEST)
+    glDisable(GL_FOG)
+    glDisable(GL_LIGHTING)
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, disc_tex)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE)  # additive — flares only brighten
+    glDepthMask(GL_FALSE)
+
+    # Anamorphic horizontal streak through the sun
+    glColor4f(1.0, 0.97, 0.85, 0.55 * intensity)
+    _flare_sprite(sx, sy, W * 0.55, 4.0)
+
+    # Main sun burst glow (two layers for softer falloff)
+    glColor4f(1.0, 0.95, 0.78, 0.45 * intensity)
+    _flare_sprite(sx, sy, 180.0, 180.0)
+    glColor4f(1.0, 0.98, 0.85, 0.65 * intensity)
+    _flare_sprite(sx, sy, 80.0, 80.0)
+
+    # Ghosts along the sun→centre axis
+    cx_s = W * 0.5
+    cy_s = H * 0.5
+    for t, radius, col in _FLARE_GHOSTS:
+        px = cx_s + (sx - cx_s) * t
+        py = cy_s + (sy - cy_s) * t
+        glColor4f(col[0], col[1], col[2], col[3] * intensity)
+        _flare_sprite(px, py, radius * 2.0, radius * 2.0)
+
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_FOG)
+
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
 
 
 # --- Rain puddles ---
@@ -1846,6 +1961,8 @@ def main():
     building_lists = build_building_variants()
     rain_state = init_rain()
     pond_tex = upload_texture(make_pond_texture(), internal=GL_RGBA, src=GL_RGBA)
+    flare_tex = upload_texture(make_flare_disc_texture(), internal=GL_RGBA, src=GL_RGBA)
+    flare_smoothed = 0.0
     bolt_rng = np.random.default_rng(613)
     active_bolt = None
     bolt_age = 0.0
@@ -1996,6 +2113,24 @@ def main():
 
         # lightning bolt (if one is currently active)
         draw_bolt(active_bolt, bolt_age)
+
+        # Lens flare: last pass so it overlays everything like real lens
+        # optics. Intensity = sun altitude × view alignment × (1 - storm),
+        # smoothed with a 0.5 s EMA so the flare fades in and out cleanly
+        # instead of flickering as the road sways across the sun direction.
+        sun_alt_factor = _smooth((sun_d[1] - 0.18) / 0.40)
+        vdx = lx - cx; vdy = ly - cy; vdz = lz - cz
+        vL = math.sqrt(vdx * vdx + vdy * vdy + vdz * vdz) + 1e-9
+        vdx /= vL; vdy /= vL; vdz /= vL
+        align = (vdx * float(sun_d[0])
+                 + vdy * float(sun_d[1])
+                 + vdz * float(sun_d[2]))
+        align_factor = _smooth((align - 0.72) / 0.28)
+        storm_damp = max(0.0, 1.0 - 0.8 * storm_i)
+        flare_target = sun_alt_factor * align_factor * storm_damp * 0.55
+        flare_smoothed += (flare_target - flare_smoothed) * min(1.0, dt / 0.5)
+        draw_lens_flare(flare_tex, sun_d, cx, cy, cz, lx, ly, lz,
+                        W, H, flare_smoothed)
 
         pygame.display.flip()
 
