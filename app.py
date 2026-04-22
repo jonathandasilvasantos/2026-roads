@@ -526,17 +526,44 @@ SOUNDFONT_PATH = "soundfonts/UprightPianoKW.sf2"
 
 
 class MinimalPianoPlayer:
-    # A-minor pentatonic-plus across ~3 octaves (MIDI note numbers)
-    SCALE = [57, 60, 62, 64, 67, 69, 72, 74, 76, 79, 81, 84]
-    # Tonic triad notes used by the tintinnabuli accompaniment
-    TRIAD = [57, 60, 64, 69, 72, 76, 81]
-    BPM = 45.0
+    """Two-voice procedural minimalist piano over a slow chord cycle with
+    a sustained bass pedal underneath. Voice 2 follows Fux first-species
+    counterpoint rules: consonant interval with voice 1, preference for
+    contrary motion. Each note is additionally shadowed by 2 quieter
+    echo notes 400 / 850 ms later for an atmospheric delay feel, and
+    FluidSynth is configured with a long reverb tail.
+    """
 
-    def __init__(self, sf2_path=SOUNDFONT_PATH, gain=0.32):
+    # A-minor natural scale (A B C D E F G) across ~3 octaves. Voices
+    # pick from this; voice 1 weights chord tones higher during each
+    # chord so the melody follows the harmony.
+    SCALE = [48, 50, 52, 53, 55, 57, 59, 60, 62, 64, 65, 67, 69, 71,
+             72, 74, 76, 77, 79, 81, 83, 84]
+
+    # Diatonic minor progression i - VI - III - VII = Am F C G, each
+    # chord held for 8 beats so the full cycle is 32 beats (~48 s at
+    # 40 BPM). Each entry: (name, chord-tone pool, bass-pedal pitch).
+    CHORDS = [
+        ("Am", [57, 60, 64, 69, 72, 76, 81], 45),   # A C E  / A2 pedal
+        ("F",  [57, 60, 65, 69, 72, 77, 81], 41),   # F A C  / F2 pedal
+        ("C",  [60, 64, 67, 72, 76, 79, 84], 48),   # C E G  / C3 pedal
+        ("G",  [59, 62, 67, 71, 74, 79, 83], 43),   # G B D  / G2 pedal
+    ]
+
+    # Consonant intervals reduced modulo octave (Fux species-1):
+    # unison/octave, m3, M3, P5, m6, M6. P4 is technically dissonant in
+    # two-voice counterpoint but sounds fine modally, so we include it.
+    CONSONANT_INTERVALS_MOD12 = {0, 3, 4, 5, 7, 8, 9}
+
+    BPM = 40.0
+    BEATS_PER_CHORD = 8
+
+    # Echo delays (seconds) and relative velocity each echo plays at.
+    ECHOES = ((0.40, 0.55), (0.85, 0.28))
+
+    def __init__(self, sf2_path=SOUNDFONT_PATH, gain=0.35):
         self.beat_sec = 60.0 / self.BPM
         self.fs = _fluidsynth.Synth(samplerate=44100, gain=gain)
-        # CoreAudio driver on macOS; fluidsynth picks the default if the
-        # named driver isn't available on other platforms.
         try:
             self.fs.start(driver="coreaudio")
         except Exception:
@@ -544,9 +571,18 @@ class MinimalPianoPlayer:
         sfid = self.fs.sfload(sf2_path)
         if sfid == -1:
             raise RuntimeError(f"failed to load SoundFont at {sf2_path}")
-        # Channel 0 = melody, channel 1 = tintinnabuli triad
-        self.fs.program_select(0, sfid, 0, 0)
-        self.fs.program_select(1, sfid, 0, 0)
+        # Three voices share the same piano program
+        for ch in (0, 1, 2):
+            self.fs.program_select(ch, sfid, 0, 0)
+
+        # Crank up the reverb to give a long atmospheric tail. Room size
+        # near 1.0, moderate damping, full width, high wet level.
+        try:
+            self.fs.set_reverb(roomsize=0.92, damping=0.35,
+                               width=0.9, level=0.95)
+        except Exception:
+            pass  # older pyfluidsynth versions — reverb stays at default
+
         self.rng = random.Random(2024)
         self.stop_event = threading.Event()
         self.thread = None
@@ -560,61 +596,159 @@ class MinimalPianoPlayer:
         if self.thread is not None:
             self.thread.join(timeout=2.0)
         try:
-            self.fs.all_notes_off(0)
-            self.fs.all_notes_off(1)
+            for ch in (0, 1, 2):
+                self.fs.all_notes_off(ch)
             self.fs.delete()
         except Exception:
             pass
 
+    # ----- note + echo firing ---------------------------------------
+    def _fire_note(self, channel, pitch, velocity, hold_sec, echo_scale=1.0):
+        """Play a note with scheduled noteoff and 2 atmospheric echoes."""
+        if self.stop_event.is_set() or pitch < 21 or pitch > 108:
+            return
+        try:
+            self.fs.noteon(channel, pitch, velocity)
+        except Exception:
+            return
+        threading.Timer(hold_sec,
+                        self._safe_noteoff, args=(channel, pitch)).start()
+        for delay, vel_factor in self.ECHOES:
+            echo_vel = max(8, int(velocity * vel_factor * echo_scale))
+            threading.Timer(
+                delay,
+                self._echo_fire,
+                args=(channel, pitch, echo_vel, hold_sec),
+            ).start()
+
+    def _echo_fire(self, channel, pitch, velocity, hold_sec):
+        if self.stop_event.is_set():
+            return
+        try:
+            self.fs.noteon(channel, pitch, velocity)
+        except Exception:
+            return
+        threading.Timer(hold_sec,
+                        self._safe_noteoff, args=(channel, pitch)).start()
+
+    def _safe_noteoff(self, channel, pitch):
+        if self.stop_event.is_set():
+            return
+        try:
+            self.fs.noteoff(channel, pitch)
+        except Exception:
+            pass
+
+    # ----- voice selection ------------------------------------------
+    def _pick_voice1(self, chord_tones, last_pitch):
+        """Melody: 70% chord tones + 30% scale (passing notes), weighted
+        by proximity to the previous note so leaps are rare (classic
+        smooth voice leading)."""
+        pool = chord_tones if self.rng.random() < 0.70 else self.SCALE
+        weights = [1.0 / (1.0 + abs(p - last_pitch) * 0.40) for p in pool]
+        return self.rng.choices(pool, weights=weights, k=1)[0]
+
+    def _pick_voice2(self, chord_tones, voice1_pitch, voice2_last,
+                     voice1_motion):
+        """Counterpoint: among chord tones forming a consonant interval
+        with voice 1, pick one that gives contrary motion relative to
+        voice 1's last step and stays close to voice 2's last note.
+        Returns None if no feasible note exists (voice 2 rests).
+        """
+        feasible = []
+        for p in chord_tones:
+            if p == voice1_pitch:
+                continue
+            interval = abs(p - voice1_pitch) % 12
+            if interval in self.CONSONANT_INTERVALS_MOD12:
+                # keep voices in separate registers
+                if 48 <= p <= 74:
+                    feasible.append(p)
+        if not feasible:
+            return None
+        weights = []
+        for p in feasible:
+            v2_motion = 0 if p == voice2_last else (
+                1 if p > voice2_last else -1)
+            w = 1.0
+            # Preference for contrary motion vs voice 1 (Fux)
+            if voice1_motion != 0 and v2_motion == -voice1_motion:
+                w *= 2.4
+            elif voice1_motion != 0 and v2_motion == voice1_motion:
+                w *= 0.7   # parallel motion discouraged
+            # Voice leading — closeness
+            w *= 1.0 / (1.0 + abs(p - voice2_last) * 0.30)
+            weights.append(w)
+        return self.rng.choices(feasible, weights=weights, k=1)[0]
+
+    # ----- main scheduler -------------------------------------------
     def _loop(self):
-        """Main scheduler: alternates rests, melody notes, and tintinnabuli
-        overlays. Uses Event.wait(seconds) for all timing so shutdown
-        interrupts any in-flight sleep immediately."""
-        scale = self.SCALE
-        triad = self.TRIAD
-        last_pitch = 69  # A4 starting point
+        beat = 0
+        v1_last = 69   # A4
+        v2_last = 60   # C4
+        v1_motion = 0
         rng = self.rng
         wait = self.stop_event.wait
-        beat = self.beat_sec
+        bsec = self.beat_sec
+        active_bass = None  # (pitch, release_beat)
 
         while not self.stop_event.is_set():
-            # Rests are as much of the composition as the notes
-            if rng.random() < 0.35:
-                if wait(beat):
+            chord_idx = (beat // self.BEATS_PER_CHORD) % len(self.CHORDS)
+            _name, chord_tones, bass_pitch = self.CHORDS[chord_idx]
+            beat_in_chord = beat % self.BEATS_PER_CHORD
+
+            # Bass pedal: fire at chord boundaries, hold through the chord
+            if beat_in_chord == 0:
+                if active_bass is not None:
+                    self._safe_noteoff(2, active_bass[0])
+                self._fire_note(2, bass_pitch, velocity=34,
+                                hold_sec=bsec * self.BEATS_PER_CHORD,
+                                echo_scale=0.55)
+                active_bass = (bass_pitch, beat + self.BEATS_PER_CHORD)
+
+            # Voice 1 (melody) — fires on ~55% of beats, softer than before
+            if rng.random() < 0.55:
+                v1_pitch = self._pick_voice1(chord_tones, v1_last)
+                v1_motion = (0 if v1_pitch == v1_last
+                             else (1 if v1_pitch > v1_last else -1))
+                velocity = 40 + rng.randint(0, 20)
+                hold_beats = rng.choice([1, 2, 2, 3, 4])
+                self._fire_note(0, v1_pitch, velocity,
+                                hold_sec=bsec * hold_beats)
+
+                # Voice 2 (counterpoint) — fires on ~45% of the notes
+                # where voice 1 did. Fewer events than voice 1 so the
+                # two lines don't pulse in lock-step.
+                if rng.random() < 0.45:
+                    v2_pitch = self._pick_voice2(
+                        chord_tones, v1_pitch, v2_last, v1_motion,
+                    )
+                    if v2_pitch is not None:
+                        v2_last = v2_pitch
+                        v2_vel = 28 + rng.randint(0, 15)
+                        v2_hold_beats = rng.choice([2, 3, 4])
+                        self._fire_note(1, v2_pitch, v2_vel,
+                                        hold_sec=bsec * v2_hold_beats,
+                                        echo_scale=0.6)
+
+                v1_last = v1_pitch
+
+            # Phrase breath: occasional extra silence at the seam
+            # between chords for the atmospheric feel.
+            if beat_in_chord == self.BEATS_PER_CHORD - 1 and rng.random() < 0.35:
+                if wait(bsec * 1.5):
                     break
-                continue
 
-            # Markov-ish transition: weight by proximity to last pitch
-            weights = [1.0 / (1.0 + abs(s - last_pitch) * 0.40) for s in scale]
-            pitch = rng.choices(scale, weights=weights, k=1)[0]
-            last_pitch = pitch
-
-            velocity = 40 + rng.randint(0, 25)          # soft dynamics
-            hold_beats = rng.choice([1, 2, 2, 3, 4])
-            gap_beats = rng.choice([0.5, 1.0, 1.0, 1.5])
-            duration = beat * hold_beats
-
-            # Fire the melody note
-            self.fs.noteon(0, pitch, velocity)
-
-            # Tintinnabuli voice: lower-octave tonic triad note, ~45% of notes
-            triad_pitch = None
-            if rng.random() < 0.45:
-                cand = rng.choice(triad)
-                while cand >= pitch:
-                    cand -= 12
-                if cand >= 24:
-                    triad_pitch = cand
-                    self.fs.noteon(1, triad_pitch, max(20, velocity - 15))
-
-            if wait(duration):
+            if wait(bsec):
                 break
-            self.fs.noteoff(0, pitch)
-            if triad_pitch is not None:
-                self.fs.noteoff(1, triad_pitch)
+            beat += 1
 
-            if wait(beat * gap_beats):
-                break
+        # Shutdown: release anything still held
+        for ch in (0, 1, 2):
+            try:
+                self.fs.all_notes_off(ch)
+            except Exception:
+                pass
 
 
 # --- Lens flare (sprite-based, canonical approach: sun→center ghost chain
