@@ -24,11 +24,22 @@ Press **Esc** to quit. Runs fullscreen at the native display resolution.
 - Continuous ambient **brown noise** (1/f² spectrum, FFT-synthesised) plays
   under the scene. Its playback speed tracks the camera speed so
   accelerating raises the rumble pitch; stopping drops it into a deep idle.
-- A procedural **minimalist piano** layer plays CC0 *Upright Piano KW*
-  samples through FluidSynth. Requires the `fluidsynth` system library:
-  `brew install fluidsynth` (macOS) or `apt install fluidsynth` (Debian).
-  The SoundFont is 57 MB and downloaded on demand by `setup_soundfonts.py`
-  — kept out of the repo via `.gitignore`.
+- A procedural **minimalist ensemble** (Rhodes + strings) plays the CC0
+  *GeneralUser GS* SoundFont through FluidSynth. Requires the
+  `fluidsynth` system library:
+  - **macOS:** `brew install fluidsynth`
+  - **Debian/Ubuntu:** `apt install fluidsynth`
+  - **Windows:** `choco install fluidsynth` via Chocolatey. If you
+    install fluidsynth by another method (MSYS2 / manual), pyfluidsynth
+    still unconditionally calls `os.add_dll_directory(r'C:\tools\fluidsynth\bin')`
+    at import time — the app pre-creates that directory (empty is fine)
+    so the import succeeds, and the actual DLL is then looked up via the
+    system loader. If fluidsynth isn't installed at all, the ensemble
+    layer is silently skipped with a stderr warning and everything else
+    runs.
+
+  The SoundFont is 32 MB and downloaded on demand by
+  `setup_soundfonts.py` — kept out of the repo via `.gitignore`.
 
 ## What's in the scene
 

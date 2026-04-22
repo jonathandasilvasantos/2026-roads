@@ -6,22 +6,95 @@ from pygame.locals import (
     DOUBLEBUF, OPENGL, FULLSCREEN, QUIT, KEYDOWN, K_ESCAPE, K_UP, K_DOWN,
 )
 import random
+import os
+import threading
+import time as _time_mod
+
+def _print_help_banner(title, lines):
+    """Print a friendly boxed help message to stderr so missing-dependency
+    advice stands out instead of blending into the Python startup noise."""
+    width = max(len(title), max((len(l) for l in lines), default=0)) + 4
+    bar = "+" + "-" * (width - 2) + "+"
+    print(bar, file=sys.stderr)
+    print(f"| {title.ljust(width - 4)} |", file=sys.stderr)
+    print(bar, file=sys.stderr)
+    for line in lines:
+        print(f"| {line.ljust(width - 4)} |", file=sys.stderr)
+    print(bar, file=sys.stderr)
+
 
 try:
     import sounddevice as _sd
     _AUDIO_AVAILABLE = True
 except Exception:
     _AUDIO_AVAILABLE = False
+    _print_help_banner(
+        "Ambient audio disabled (sounddevice missing)",
+        [
+            "The procedural wind / rain / thunder / brown-noise layer",
+            "needs the 'sounddevice' Python package.",
+            "",
+            "Install with:    pip install sounddevice",
+            "",
+            "The simulation will run without audio.",
+        ],
+    )
+
+# pyfluidsynth on Windows calls `os.add_dll_directory(r'C:\tools\fluidsynth\bin')`
+# at module import time — that's the Chocolatey default install path for
+# fluidsynth. If you didn't install via Chocolatey the directory doesn't
+# exist and the import raises FileNotFoundError (WinError 3). Pre-create
+# the directory (empty is fine) so the import always succeeds; pyfluidsynth
+# then falls back to the system DLL loader for the actual library. If
+# fluidsynth itself isn't installed, Synth() later raises and the piano
+# is silently disabled, but the rest of the app still runs.
+if sys.platform == "win32":
+    try:
+        os.makedirs(r"C:\tools\fluidsynth\bin", exist_ok=True)
+    except Exception:
+        pass
 
 try:
     import fluidsynth as _fluidsynth
     _FLUIDSYNTH_AVAILABLE = True
-except Exception:
+except Exception as _exc:
     _FLUIDSYNTH_AVAILABLE = False
-
-import os
-import threading
-import time as _time_mod
+    # Split the advice based on what actually failed: the Python binding
+    # vs. the underlying C library. Both render as the same exception
+    # type from pyfluidsynth's point of view, so we key off the message.
+    _msg = str(_exc).lower()
+    if "fluidsynth" in _msg and ("library" in _msg or "dll" in _msg
+                                  or "cannot load" in _msg
+                                  or "no such file" in _msg):
+        _lines = [
+            "The 'fluidsynth' system library is not installed.",
+            "Install it for your OS (then re-run this program):",
+            "",
+            "  macOS:          brew install fluidsynth",
+            "  Debian/Ubuntu:  sudo apt install fluidsynth",
+            "  Fedora:         sudo dnf install fluidsynth",
+            "  Arch:           sudo pacman -S fluidsynth",
+            "  Windows:        choco install fluidsynth",
+            "                  (or download from fluidsynth.org and put",
+            "                   its .dll files on PATH)",
+            "",
+            "The simulation will run without the piano ensemble.",
+        ]
+    else:
+        _lines = [
+            "The 'pyfluidsynth' Python package is not installed.",
+            "",
+            "Install with:    pip install pyfluidsynth",
+            "",
+            "You also need the fluidsynth system library:",
+            "  macOS:          brew install fluidsynth",
+            "  Debian/Ubuntu:  sudo apt install fluidsynth",
+            "  Windows:        choco install fluidsynth",
+            "",
+            "The simulation will run without the piano ensemble.",
+        ]
+    _print_help_banner("Procedural music disabled (FluidSynth not ready)",
+                       _lines)
 
 from OpenGL.GL import *
 from OpenGL.GLU import (
@@ -1910,6 +1983,170 @@ def draw_terrain(terrain_tex, snow_tex, s_car, t_time, amb_rgb):
     glDisableClientState(GL_TEXTURE_COORD_ARRAY)
 
 
+# --- Civil structures: bridges, tunnels ---
+# Placement strategy is biome-driven rather than random:
+#   * Bridge: placed where the road passes a river biome on either side —
+#     the road always crosses water there, so rails fit naturally.
+#   * Tunnel: placed where mountain biome appears on BOTH sides — the
+#     road is in a mountain pass; the tunnel walls occlude the mountain
+#     rise and give the illusion of cutting through rock.
+# Collision avoidance is automatic because the biomes are disjoint:
+# trees (forest / frost) and buildings (city) live in different zones
+# from rivers and mountains, so structures never overlap them. Tunnel
+# walls sit just outside the road edge and cover the mountain's
+# steep rise behind.
+#
+# Weather reaction is per-vertex: the top edge of rails mixes toward
+# snow-white as frost biome weight rises at the camera, and the whole
+# concrete colour darkens while it's raining (wet surface absorbs more
+# light). Tunnel interiors are shielded from weather — they stay a
+# darker concrete regardless of the sky.
+
+CONCRETE_COLOR_BASE = (0.78, 0.78, 0.82)
+
+
+def make_concrete_texture(size=512, seed=211):
+    """Grey concrete with per-pixel noise, dark stains, and horizontal
+    panel seams every 80 px so it reads as cast-in-place construction."""
+    rng = np.random.default_rng(seed)
+    base = rng.integers(140, 180, (size, size)).astype(np.int16)
+    # dark stains
+    for _ in range(80):
+        cy, cx = rng.integers(0, size, 2)
+        r = int(rng.integers(5, 22))
+        y0, y1 = max(0, cy - r), min(size, cy + r)
+        x0, x1 = max(0, cx - r), min(size, cx + r)
+        shade = int(rng.integers(-22, 22))
+        base[y0:y1, x0:x1] = np.clip(base[y0:y1, x0:x1] + shade, 90, 220)
+    # panel seams
+    for y in range(0, size, 80):
+        base[y:y + 2] = 100
+    base = base.astype(np.uint8)
+    rgb = np.stack([base, base, np.clip(base.astype(int) + 3, 0, 255).astype(np.uint8)], axis=-1)
+    return rgb
+
+
+def _structure_tint(amb_rgb, storm_i, base_scale=0.82):
+    """Wet concrete darkens with storm; dry stays close to ambient tint."""
+    wet = 1.0 - 0.28 * storm_i
+    return (amb_rgb[0] * base_scale * wet,
+            amb_rgb[1] * base_scale * wet,
+            amb_rgb[2] * base_scale * wet)
+
+
+def _snow_mix(base_col, frost_i, amount=0.70):
+    """Mix base colour toward snow white by frost × amount."""
+    snow = (0.92, 0.94, 0.98)
+    t = frost_i * amount
+    return (base_col[0] * (1 - t) + snow[0] * t,
+            base_col[1] * (1 - t) + snow[1] * t,
+            base_col[2] * (1 - t) + snow[2] * t)
+
+
+def draw_civil_structures(s_car, concrete_tex, amb_rgb, storm_i, frost_i):
+    NS = N_SEG + 1
+    s_arr = np.arange(NS, dtype=np.float32) * SEG_LEN + s_car
+    wL = biome_weights_vec(s_arr, -1)
+    wR = biome_weights_vec(s_arr, +1)
+    bridge_w = np.maximum(wL[:, BIOME_RIVER], wR[:, BIOME_RIVER])
+    # Tunnels need a mountain presence on average — strictly requiring
+    # BOTH sides is too restrictive given the biome distribution (frost
+    # is the only forced-symmetric biome), so we use the mean weight
+    # instead. Practically: a tunnel fires when the road sits in a
+    # mountain pass on at least one side with the other side close.
+    tunnel_w = 0.5 * (wL[:, BIOME_MOUNTAIN] + wR[:, BIOME_MOUNTAIN])
+
+    if bridge_w.max() < 0.25 and tunnel_w.max() < 0.30:
+        return  # nothing to draw in the visible window
+
+    base = _structure_tint(amb_rgb, storm_i)
+
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, concrete_tex)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glDepthMask(GL_TRUE)  # solid structures participate in depth writes
+
+    if bridge_w.max() >= 0.25:
+        _draw_bridges(s_arr, bridge_w, base, frost_i, s_car)
+    if tunnel_w.max() >= 0.30:
+        _draw_tunnels(s_arr, tunnel_w, base, s_car)
+
+    glDisable(GL_BLEND)
+
+
+def _emit_strip_segments(s_arr, weight_arr, threshold, emit_pair):
+    """Walk the s_arr array and, for each run of consecutive samples where
+    weight > threshold, call emit_pair(i, alpha) twice per vertex pair.
+    Uses separate GL_QUAD_STRIP invocations per run so discontinuities
+    don't smear across large gaps."""
+    in_strip = False
+    for i in range(len(s_arr)):
+        w = float(weight_arr[i])
+        if w < threshold:
+            if in_strip:
+                glEnd()
+                in_strip = False
+        else:
+            alpha = float(min(1.0, (w - threshold) / 0.30))
+            if not in_strip:
+                glBegin(GL_QUAD_STRIP)
+                in_strip = True
+            emit_pair(i, alpha)
+    if in_strip:
+        glEnd()
+
+
+def _draw_bridges(s_arr, bridge_w, base_col, frost_i, s_car):
+    RAIL_H = 1.05
+    base_top = _snow_mix(base_col, frost_i, amount=0.80)  # snow caps the top
+    base_bot = base_col
+
+    for side in (-1, +1):
+        def emit(i, alpha, side=side):
+            s = float(s_arr[i])
+            x = curve_x(s) + side * (ROAD_WIDTH / 2 + 0.10)
+            y_base = curve_y(s) + 0.05
+            z = -(s - s_car)
+            u = s * 0.18
+            glColor4f(base_bot[0], base_bot[1], base_bot[2], alpha)
+            glTexCoord2f(u, 0.0); glVertex3f(x, y_base, z)
+            glColor4f(base_top[0], base_top[1], base_top[2], alpha)
+            glTexCoord2f(u, 1.0); glVertex3f(x, y_base + RAIL_H, z)
+        _emit_strip_segments(s_arr, bridge_w, 0.25, emit)
+
+
+def _draw_tunnels(s_arr, tunnel_w, base_col, s_car):
+    WALL_H = 5.6
+    CEIL_Y = 5.4
+    inner = (base_col[0] * 0.55, base_col[1] * 0.55, base_col[2] * 0.58)
+    ceiling = (base_col[0] * 0.40, base_col[1] * 0.40, base_col[2] * 0.44)
+
+    for side in (-1, +1):
+        def emit(i, alpha, side=side):
+            s = float(s_arr[i])
+            x = curve_x(s) + side * (ROAD_WIDTH / 2 + 0.05)
+            y_base = curve_y(s) + 0.03
+            z = -(s - s_car)
+            u = s * 0.18
+            glColor4f(inner[0], inner[1], inner[2], alpha)
+            glTexCoord2f(u, 0.0); glVertex3f(x, y_base, z)
+            glTexCoord2f(u, 1.5); glVertex3f(x, y_base + WALL_H, z)
+        _emit_strip_segments(s_arr, tunnel_w, 0.30, emit)
+
+    def emit_ceil(i, alpha):
+        s = float(s_arr[i])
+        x = curve_x(s)
+        y = curve_y(s) + CEIL_Y
+        z = -(s - s_car)
+        u = s * 0.18
+        glColor4f(ceiling[0], ceiling[1], ceiling[2], alpha)
+        glTexCoord2f(0.0, u); glVertex3f(x - ROAD_WIDTH / 2, y, z)
+        glTexCoord2f(1.0, u); glVertex3f(x + ROAD_WIDTH / 2, y, z)
+    _emit_strip_segments(s_arr, tunnel_w, 0.30, emit_ceil)
+
+
 def draw_road(tex_id, s_car, amb_rgb):
     glEnable(GL_TEXTURE_2D)
     glBindTexture(GL_TEXTURE_2D, tex_id)
@@ -2672,6 +2909,7 @@ def main():
     facade_tex = upload_texture(make_facade_texture())
     emission_tex = upload_texture(make_facade_emission_texture(), internal=GL_RGBA, src=GL_RGBA)
     building_lists = build_building_variants()
+    concrete_tex = upload_texture(make_concrete_texture())
     rain_state = init_rain()
     pond_tex = upload_texture(make_pond_texture(), internal=GL_RGBA, src=GL_RGBA)
     flare_tex = upload_texture(make_flare_disc_texture(), internal=GL_RGBA, src=GL_RGBA)
@@ -2686,25 +2924,56 @@ def main():
             audio_player = AmbientAudioMixer()
             audio_player.start()
         except Exception as exc:
-            print(f"[audio] disabled: {exc}", file=sys.stderr)
+            _print_help_banner(
+                "Ambient audio failed to start",
+                [
+                    f"Error: {exc}",
+                    "",
+                    "Check that an audio output device is available.",
+                    "On macOS you may need to grant microphone / audio",
+                    "permission the first time.",
+                    "",
+                    "The simulation will run without ambient audio.",
+                ],
+            )
             audio_player = None
 
-    # Procedural minimalist piano over the brown-noise bed. Needs
+    # Procedural minimalist ensemble over the ambient bed. Needs
     # fluidsynth (system library) + pyfluidsynth + the CC0 SoundFont.
-    # Silently skipped if any part is missing.
+    # Skipped gracefully with a friendly message if any part is missing.
     piano_player = None
     if _FLUIDSYNTH_AVAILABLE and os.path.exists(SOUNDFONT_PATH):
         try:
-            piano_player = MinimalPianoPlayer()
+            piano_player = MinimalEnsemblePlayer()
             piano_player.start()
         except Exception as exc:
-            print(f"[piano] disabled: {exc}", file=sys.stderr)
+            _print_help_banner(
+                "Procedural ensemble failed to start",
+                [
+                    f"Error: {exc}",
+                    "",
+                    "Check that fluidsynth is installed and that the",
+                    f"SoundFont at {SOUNDFONT_PATH}",
+                    "is readable. Re-run setup_soundfonts.py if unsure.",
+                    "",
+                    "The simulation will run without the piano ensemble.",
+                ],
+            )
             piano_player = None
-    elif not os.path.exists(SOUNDFONT_PATH):
-        print(
-            f"[piano] SoundFont missing at {SOUNDFONT_PATH} — "
-            "run setup_soundfonts.py to enable generative piano",
-            file=sys.stderr,
+    elif _FLUIDSYNTH_AVAILABLE and not os.path.exists(SOUNDFONT_PATH):
+        _print_help_banner(
+            "SoundFont missing — procedural ensemble disabled",
+            [
+                f"Expected file: {SOUNDFONT_PATH}",
+                "",
+                "Download the CC0 GeneralUser GS SoundFont with:",
+                "",
+                f"  {sys.executable} setup_soundfonts.py",
+                "",
+                "This fetches a ~32 MB .sf2 from GitHub and places it",
+                "under ./soundfonts/. The simulation will run without",
+                "the piano ensemble until it's in place.",
+            ],
         )
     bolt_rng = np.random.default_rng(613)
     active_bolt = None
@@ -2873,6 +3142,10 @@ def main():
         draw_forest(s_car, tree_lists, frost_tree_lists, amb)
         draw_ponds(pond_tex, s_car, storm_i, horizon, amb, t_time)
         draw_road(road_tex, s_car, amb)
+        # Bridges + tunnels: placed where biomes dictate (river / mountain)
+        # so they never collide with trees, buildings, or other structures.
+        # Concrete tint reacts to storm (wet darkening) and frost (snow cap).
+        draw_civil_structures(s_car, concrete_tex, amb, storm_i, frost_i)
         draw_snow_shoulders(snow_ground_tex, s_car, amb)
         draw_lamps(s_car, night_a)
 
