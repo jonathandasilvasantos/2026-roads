@@ -130,7 +130,8 @@ except Exception as _exc:
 from OpenGL.GL import *
 from OpenGL.GLU import (
     gluPerspective, gluLookAt, gluNewQuadric, gluQuadricTexture,
-    gluQuadricNormals, gluCylinder, gluProject, GLU_SMOOTH,
+    gluQuadricNormals, gluCylinder, gluDisk, gluSphere, gluDeleteQuadric,
+    gluProject, GLU_SMOOTH,
 )
 
 
@@ -4221,6 +4222,873 @@ def draw_city(s_car, building_lists, facade_tex, emission_tex,
     glDisable(GL_BLEND)
 
 
+# --- Procedural cars ---
+# Technique ported from the sibling cars/ project: a lower body built from
+# lofted superellipse cross-sections along the length axis (squircle
+# stations), a narrower tumblehome cabin extruded on top, quadric wheels
+# with brake disc + chrome hub + radial spokes, and parametric sockets for
+# mirrors / spoiler / grille / head- and taillights. Paint uses a procedural
+# metallic texture (gradient + noise + sparkle pixels) plus Blinn-Phong
+# high-shininess specular for a clearcoat look. Each variant is baked into
+# a single display list at startup; the live scene places a pool of them on
+# two lanes — player's left lane travels same direction as the player
+# (cars drift away), right lane is oncoming (cars close toward the camera).
+CAR_LANE_HALF = 2.5
+N_CAR_VARIANTS = 18
+N_CARS_PER_LANE = 10
+# Same-direction (player's left) cars enter from behind the camera, pass
+# through, and recede into the distance. So their spawn range is *behind*
+# s_car, and they're despawned only when they drift off the far horizon.
+CAR_SPAWN_BEHIND_MIN = 30.0    # metres behind s_car (min)
+CAR_SPAWN_BEHIND_MAX = 260.0   # metres behind s_car (max)
+# Oncoming (right lane) cars enter from far ahead and close on the camera,
+# despawning just after they pass.
+CAR_SPAWN_AHEAD_MIN = 120.0
+CAR_SPAWN_AHEAD_MAX = 780.0
+CAR_DESPAWN_BEHIND = 35.0      # oncoming: how far past the camera before respawn
+CAR_DESPAWN_AHEAD = 840.0      # same-dir:  how far ahead before respawn
+CAR_SPEED_ONCOMING_MIN = 20.0
+CAR_SPEED_ONCOMING_MAX = 34.0
+# Same-direction cars must always outrun the camera so they pull ahead
+# and visibly "go further" rather than being overtaken and popping out
+# of the visible window. The speed is clamped to player_speed + this
+# margin every frame inside update_cars, with a floor so stopped players
+# still see traffic move.
+CAR_SPEED_AWAY_OVER_MIN = 4.0
+CAR_SPEED_AWAY_OVER_MAX = 12.0
+CAR_SPEED_AWAY_FLOOR = 22.0
+
+CAR_PALETTE = [
+    (0.85, 0.10, 0.10), (0.10, 0.22, 0.70), (0.93, 0.93, 0.95),
+    (0.07, 0.07, 0.09), (0.18, 0.18, 0.22), (0.72, 0.72, 0.74),
+    (0.20, 0.55, 0.28), (0.92, 0.76, 0.12), (0.32, 0.24, 0.56),
+    (0.75, 0.38, 0.08), (0.08, 0.50, 0.55), (0.62, 0.08, 0.22),
+    (0.12, 0.35, 0.60), (0.55, 0.62, 0.70), (0.88, 0.84, 0.78),
+    (0.40, 0.10, 0.12), (0.14, 0.48, 0.38), (0.98, 0.58, 0.30),
+    (0.25, 0.30, 0.38), (0.65, 0.70, 0.22),
+]
+
+
+def _car_mat(amb, dif, spec, shine, emit=(0.0, 0.0, 0.0)):
+    glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT,
+                 (amb[0], amb[1], amb[2], 1.0))
+    glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE,
+                 (dif[0], dif[1], dif[2], 1.0))
+    glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR,
+                 (spec[0], spec[1], spec[2], 1.0))
+    glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, shine)
+    glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION,
+                 (emit[0], emit[1], emit[2], 1.0))
+
+
+def _car_mat_paint(c):
+    _car_mat((c[0] * 0.55, c[1] * 0.55, c[2] * 0.55),
+             (min(1.0, c[0] * 1.1), min(1.0, c[1] * 1.1),
+              min(1.0, c[2] * 1.1)),
+             (1.0, 1.0, 1.0), 110.0)
+
+
+def _car_mat_glass():
+    _car_mat((0.05, 0.06, 0.08), (0.09, 0.12, 0.18),
+             (1.0, 1.0, 1.0), 128.0)
+
+
+def _car_mat_tire():
+    _car_mat((0.05, 0.05, 0.05), (0.09, 0.09, 0.09),
+             (0.25, 0.25, 0.25), 8.0)
+
+
+def _car_mat_rim():
+    _car_mat((0.30, 0.30, 0.32), (0.80, 0.80, 0.84),
+             (1.0, 1.0, 1.0), 110.0)
+
+
+def _car_mat_hub():
+    _car_mat((0.08, 0.08, 0.09), (0.18, 0.18, 0.20),
+             (0.6, 0.6, 0.6), 50.0)
+
+
+def _car_mat_brake():
+    _car_mat((0.14, 0.14, 0.16), (0.30, 0.30, 0.34),
+             (0.6, 0.6, 0.65), 32.0)
+
+
+def _car_mat_dark():
+    _car_mat((0.04, 0.04, 0.04), (0.08, 0.08, 0.08),
+             (0.0, 0.0, 0.0), 1.0)
+
+
+def _car_mat_grille():
+    _car_mat((0.04, 0.04, 0.04), (0.08, 0.08, 0.08),
+             (0.4, 0.4, 0.4), 20.0)
+
+
+def _car_mat_chrome():
+    _car_mat((0.30, 0.30, 0.33), (0.90, 0.90, 0.95),
+             (1.0, 1.0, 1.0), 128.0)
+
+
+def _car_mat_emit(c):
+    _car_mat((c[0] * 0.55, c[1] * 0.55, c[2] * 0.55),
+             (c[0], c[1], c[2]), (0.95, 0.95, 0.95), 60.0, emit=c)
+
+
+def _car_mat_clear():
+    glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, (0.0, 0.0, 0.0, 1.0))
+
+
+def make_car_paint_texture(base_color, rng, size=128):
+    noise = rng.uniform(-0.035, 0.035, (size, size))
+    grad = np.linspace(1.05, 0.82, size).reshape(-1, 1)
+    tex = np.zeros((size, size, 3), dtype=np.float32)
+    for ch in range(3):
+        tex[:, :, ch] = np.clip(base_color[ch] * grad + noise, 0, 1)
+    sparkle = rng.random((size, size)) > 0.993
+    tex[sparkle] = np.clip(tex[sparkle] + 0.35, 0, 1)
+    img = (tex * 255).astype(np.uint8)
+    return upload_texture(img)
+
+
+def _car_superellipse_section(z_half, y_bot, y_top, exp_top, exp_bot, K=36):
+    y_c = 0.5 * (y_bot + y_top)
+    y_half = 0.5 * (y_top - y_bot)
+    pts = []
+    for i in range(K):
+        t = 2.0 * math.pi * i / K
+        c = math.cos(t)
+        s = math.sin(t)
+        e = exp_top if s >= 0 else exp_bot
+        inv = 2.0 / e
+        z = math.copysign(abs(c) ** inv, c) * z_half
+        y = y_c + math.copysign(abs(s) ** inv, s) * y_half
+        pts.append((z, y))
+    return pts
+
+
+def _generate_car_params(rng):
+    styles = ['sedan', 'coupe', 'suv', 'hatch', 'sport']
+    style = styles[int(rng.integers(0, len(styles)))]
+    L = float(rng.uniform(4.1, 4.8))
+    W = float(rng.uniform(1.72, 1.92))
+    WR = float(rng.uniform(0.34, 0.40))
+    LBH = float(rng.uniform(0.48, 0.60))
+    HL = float(rng.uniform(0.95, 1.25))
+    TL = float(rng.uniform(0.60, 0.95))
+    CH = float(rng.uniform(0.56, 0.70))
+    WS = float(rng.uniform(0.30, 0.50))
+    RW = float(rng.uniform(0.25, 0.40))
+    spoiler = False
+    spoke_count = int(rng.choice([5, 6, 7, 8, 10]))
+
+    if style == 'suv':
+        LBH = float(rng.uniform(0.68, 0.82))
+        WR = float(rng.uniform(0.40, 0.46))
+        CH = float(rng.uniform(0.78, 0.95))
+        L = float(rng.uniform(4.3, 4.95))
+    elif style == 'coupe':
+        RW = float(rng.uniform(0.55, 0.75))
+        CH = float(rng.uniform(0.52, 0.62))
+        TL = float(rng.uniform(0.50, 0.75))
+        spoiler = rng.random() < 0.35
+    elif style == 'hatch':
+        TL = float(rng.uniform(0.25, 0.45))
+        L = float(rng.uniform(3.8, 4.2))
+    elif style == 'sport':
+        LBH = float(rng.uniform(0.42, 0.52))
+        CH = float(rng.uniform(0.44, 0.56))
+        WS = float(rng.uniform(0.45, 0.65))
+        RW = float(rng.uniform(0.50, 0.70))
+        WR = float(rng.uniform(0.35, 0.40))
+        spoiler = rng.random() < 0.75
+
+    BH = WR * 0.85
+    body_top_y = BH + LBH
+    roof_y = body_top_y + CH
+
+    rear_x = -L / 2
+    front_x = L / 2
+    cabin_rear_bot = rear_x + TL
+    cabin_rear_top = cabin_rear_bot + RW
+    cabin_front_bot = front_x - HL
+    cabin_front_top = cabin_front_bot - WS
+    if cabin_front_top <= cabin_rear_top + 0.45:
+        cabin_front_top = cabin_rear_top + 0.55
+
+    W_cabin = W * float(rng.uniform(0.82, 0.90))
+    color = CAR_PALETTE[int(rng.integers(0, len(CAR_PALETTE)))]
+
+    zh = W / 2
+    station_defs = [
+        (rear_x,           0.46, BH * 0.55, body_top_y * 0.55, 3.0, 3.2),
+        (rear_x + 0.18,    0.88, BH * 0.50, body_top_y * 0.85, 4.0, 4.5),
+        (rear_x + 0.45,    0.98, BH * 0.45, body_top_y,        6.0, 6.0),
+        (cabin_rear_bot,   1.00, BH * 0.45, body_top_y,        6.5, 6.5),
+        ((cabin_rear_bot + cabin_front_bot) / 2,
+                           1.00, BH * 0.42, body_top_y,        7.0, 6.5),
+        (cabin_front_bot,  1.00, BH * 0.45, body_top_y,        6.5, 6.5),
+        (cabin_front_bot + 0.30,
+                           0.98, BH * 0.48, body_top_y * 0.97, 5.5, 5.5),
+        (front_x - 0.35,   0.92, BH * 0.52, body_top_y * 0.82, 4.2, 4.5),
+        (front_x,          0.48, BH * 0.55, body_top_y * 0.58, 3.0, 3.2),
+    ]
+    K = 36
+    stations = []
+    for (x, z_scale, y_bot, y_top, et, eb) in station_defs:
+        pts2d = _car_superellipse_section(zh * z_scale, y_bot, y_top,
+                                          et, eb, K)
+        stations.append({'x': x, 'pts': [(x, y, z) for (z, y) in pts2d]})
+
+    cabin = [
+        (cabin_rear_bot,  body_top_y),
+        (cabin_rear_top,  roof_y),
+        (cabin_front_top, roof_y),
+        (cabin_front_bot, body_top_y),
+    ]
+
+    rear_wx = rear_x + WR + float(rng.uniform(0.20, 0.32))
+    front_wx = front_x - WR - float(rng.uniform(0.20, 0.32))
+    inset = 0.04
+    wheels = [
+        (rear_wx,  WR,  W / 2 - inset),
+        (rear_wx,  WR, -W / 2 + inset),
+        (front_wx, WR,  W / 2 - inset),
+        (front_wx, WR, -W / 2 + inset),
+    ]
+
+    return {
+        'style': style, 'L': L, 'W': W, 'W_cabin': W_cabin, 'WR': WR,
+        'stations': stations, 'K': K, 'cabin': cabin, 'wheels': wheels,
+        'color': color, 'spoiler': spoiler, 'spoke_count': spoke_count,
+        'body_top_y': body_top_y, 'roof_y': roof_y,
+        'cabin_rear_bot': cabin_rear_bot,
+        'cabin_front_bot': cabin_front_bot,
+        'cabin_rear_top': cabin_rear_top,
+        'cabin_front_top': cabin_front_top,
+        'rear_x': rear_x, 'front_x': front_x, 'BH': BH,
+    }
+
+
+def _car_station_center(s):
+    n = len(s['pts'])
+    cx = sum(p[0] for p in s['pts']) / n
+    cy = sum(p[1] for p in s['pts']) / n
+    cz = sum(p[2] for p in s['pts']) / n
+    return (cx, cy, cz)
+
+
+def _car_draw_lower_body(car, paint_tex):
+    stations = car['stations']
+    K = car['K']
+    N = len(stations)
+
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, paint_tex)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    _car_mat_paint(car['color'])
+
+    centers = [_car_station_center(s) for s in stations]
+
+    def normal_for(si, pi):
+        p = stations[si]['pts'][pi]
+        _, cy, cz = centers[si]
+        ny = p[1] - cy
+        nz = p[2] - cz
+        r_here = math.hypot(ny, nz)
+        if si == 0:
+            nx = -0.8 * r_here
+        elif si == N - 1:
+            nx = 0.8 * r_here
+        else:
+            p_prev = stations[si - 1]['pts'][pi]
+            cp = centers[si - 1]
+            r_prev = math.hypot(p_prev[1] - cp[1], p_prev[2] - cp[2])
+            p_next = stations[si + 1]['pts'][pi]
+            cn = centers[si + 1]
+            r_next = math.hypot(p_next[1] - cn[1], p_next[2] - cn[2])
+            nx = (r_prev - r_next) * 0.8
+        ln = math.sqrt(nx * nx + ny * ny + nz * nz) + 1e-9
+        return (nx / ln, ny / ln, nz / ln)
+
+    for si in range(N - 1):
+        s0 = stations[si]['pts']
+        s1 = stations[si + 1]['pts']
+        glBegin(GL_QUAD_STRIP)
+        for i in range(K + 1):
+            idx = i % K
+            n0 = normal_for(si, idx)
+            n1 = normal_for(si + 1, idx)
+            p0 = s0[idx]
+            p1 = s1[idx]
+            u0 = (p0[0] + car['L']) / (2 * car['L'])
+            u1 = (p1[0] + car['L']) / (2 * car['L'])
+            v = i / K
+            glNormal3f(*n0); glTexCoord2f(u0, v); glVertex3f(*p0)
+            glNormal3f(*n1); glTexCoord2f(u1, v); glVertex3f(*p1)
+        glEnd()
+
+    for si, nx_sign in [(0, -1.0), (N - 1, 1.0)]:
+        c = centers[si]
+        glBegin(GL_TRIANGLE_FAN)
+        glNormal3f(nx_sign, 0, 0)
+        glTexCoord2f(0.5, 0.5)
+        glVertex3f(*c)
+        pts = stations[si]['pts']
+        order = range(K + 1) if nx_sign > 0 else range(K, -1, -1)
+        for i in order:
+            idx = i % K
+            p = pts[idx]
+            u = 0.5 + 0.5 * (p[2] / car['W'])
+            v = 0.5 + 0.5 * (p[1] / car['body_top_y'])
+            glTexCoord2f(u, v)
+            glVertex3f(*p)
+        glEnd()
+
+    glDisable(GL_TEXTURE_2D)
+
+
+def _car_draw_cabin(car, paint_tex):
+    cabin = car['cabin']
+    Wc = car['W_cabin']
+    color = car['color']
+
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, paint_tex)
+    _car_mat_paint(color)
+    for z, nz in [(Wc / 2, 1), (-Wc / 2, -1)]:
+        glBegin(GL_POLYGON)
+        glNormal3f(0, 0, nz)
+        pts = list(reversed(cabin)) if nz > 0 else list(cabin)
+        for (x, y) in pts:
+            glTexCoord2f((x + 3) / 6, y / 2)
+            glVertex3f(x, y, z)
+        glEnd()
+
+    for i in range(len(cabin)):
+        if i == 3:
+            continue
+        p0, p1 = cabin[i], cabin[(i + 1) % len(cabin)]
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        nlen = math.hypot(dx, dy)
+        if nlen < 1e-6:
+            continue
+        nx, ny = -dy / nlen, dx / nlen
+
+        if i in (0, 2):
+            glDisable(GL_TEXTURE_2D)
+            _car_mat_glass()
+        else:
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, paint_tex)
+            _car_mat_paint(color)
+
+        glBegin(GL_QUADS)
+        glNormal3f(nx, ny, 0)
+        glTexCoord2f(0, 0); glVertex3f(p0[0], p0[1],  Wc / 2)
+        glTexCoord2f(1, 0); glVertex3f(p1[0], p1[1],  Wc / 2)
+        glTexCoord2f(1, 1); glVertex3f(p1[0], p1[1], -Wc / 2)
+        glTexCoord2f(0, 1); glVertex3f(p0[0], p0[1], -Wc / 2)
+        glEnd()
+
+    glDisable(GL_TEXTURE_2D)
+
+    _car_mat_glass()
+    cx_mid = (cabin[0][0] + cabin[3][0]) / 2
+    cy_mid = (cabin[1][1] + cabin[2][1]) / 2
+    shrunk = []
+    for (x, y) in cabin:
+        sx = x + (cx_mid - x) * 0.12
+        sy = y + (cy_mid - y) * 0.18 if y < cy_mid - 0.01 else y - 0.05
+        shrunk.append((sx, sy))
+    for z, nz in [(Wc / 2 + 0.002, 1.0), (-Wc / 2 - 0.002, -1.0)]:
+        glBegin(GL_POLYGON)
+        glNormal3f(0, 0, nz)
+        pts = shrunk if nz > 0 else list(reversed(shrunk))
+        for (x, y) in pts:
+            glVertex3f(x, y, z)
+        glEnd()
+
+
+def _car_unit_cube():
+    faces = [
+        ((0, 0, 1),  [(-0.5, -0.5,  0.5), ( 0.5, -0.5,  0.5),
+                      ( 0.5,  0.5,  0.5), (-0.5,  0.5,  0.5)]),
+        ((0, 0, -1), [(-0.5,  0.5, -0.5), ( 0.5,  0.5, -0.5),
+                      ( 0.5, -0.5, -0.5), (-0.5, -0.5, -0.5)]),
+        ((0, 1, 0),  [(-0.5,  0.5,  0.5), ( 0.5,  0.5,  0.5),
+                      ( 0.5,  0.5, -0.5), (-0.5,  0.5, -0.5)]),
+        ((0, -1, 0), [(-0.5, -0.5, -0.5), ( 0.5, -0.5, -0.5),
+                      ( 0.5, -0.5,  0.5), (-0.5, -0.5,  0.5)]),
+        ((1, 0, 0),  [( 0.5, -0.5,  0.5), ( 0.5, -0.5, -0.5),
+                      ( 0.5,  0.5, -0.5), ( 0.5,  0.5,  0.5)]),
+        ((-1, 0, 0), [(-0.5, -0.5, -0.5), (-0.5, -0.5,  0.5),
+                      (-0.5,  0.5,  0.5), (-0.5,  0.5, -0.5)]),
+    ]
+    glBegin(GL_QUADS)
+    for n, verts in faces:
+        glNormal3f(*n)
+        for v in verts:
+            glVertex3f(*v)
+    glEnd()
+
+
+def _car_draw_details(car):
+    W = car['W']
+    Wc = car['W_cabin']
+    color = car['color']
+
+    _car_mat_paint(color)
+    mirror_x = car['cabin_front_bot'] - 0.05
+    mirror_y = car['body_top_y'] + 0.18
+    for sign in (1, -1):
+        glPushMatrix()
+        glTranslatef(mirror_x, mirror_y, sign * (Wc / 2 + 0.09))
+        glScalef(0.14, 0.09, 0.18)
+        _car_unit_cube()
+        glPopMatrix()
+
+        _car_mat_chrome()
+        glPushMatrix()
+        glTranslatef(mirror_x + 0.02, mirror_y,
+                     sign * (Wc / 2 + 0.19))
+        glBegin(GL_QUADS)
+        glNormal3f(0, 0, sign)
+        glVertex3f(-0.09, -0.055, 0)
+        glVertex3f( 0.09, -0.055, 0)
+        glVertex3f( 0.09,  0.055, 0)
+        glVertex3f(-0.09,  0.055, 0)
+        glEnd()
+        glPopMatrix()
+        _car_mat_paint(color)
+
+    if car['spoiler']:
+        _car_mat_paint(color)
+        sx1 = car['cabin_rear_bot'] - 0.05
+        sx0 = sx1 - 0.25
+        sy = car['body_top_y'] + 0.22
+        sz = Wc / 2 - 0.05
+        glPushMatrix()
+        glTranslatef((sx0 + sx1) / 2, sy, 0)
+        glScalef((sx1 - sx0), 0.04, sz * 2)
+        _car_unit_cube()
+        glPopMatrix()
+        for zside in (sz - 0.05, -(sz - 0.05)):
+            glPushMatrix()
+            glTranslatef((sx0 + sx1) / 2 + 0.03,
+                         car['body_top_y'] + 0.11, zside)
+            glScalef(0.04, 0.22, 0.04)
+            _car_unit_cube()
+            glPopMatrix()
+
+    _car_mat_grille()
+    fx = car['front_x'] - 0.01
+    gy_top = car['body_top_y'] * 0.55
+    gy_bot = car['BH'] * 0.75
+    gz = W * 0.28
+    glBegin(GL_QUADS)
+    glNormal3f(1, 0, 0)
+    glVertex3f(fx, gy_bot,  gz)
+    glVertex3f(fx, gy_bot, -gz)
+    glVertex3f(fx, gy_top, -gz)
+    glVertex3f(fx, gy_top,  gz)
+    glEnd()
+    _car_mat_chrome()
+    bs_top = gy_bot - 0.02
+    bs_bot = car['BH'] * 0.35
+    glBegin(GL_QUADS)
+    glNormal3f(1, 0, 0)
+    glVertex3f(fx + 0.004, bs_bot,  W * 0.40)
+    glVertex3f(fx + 0.004, bs_bot, -W * 0.40)
+    glVertex3f(fx + 0.004, bs_top, -W * 0.40)
+    glVertex3f(fx + 0.004, bs_top,  W * 0.40)
+    glEnd()
+
+    _car_mat_emit((1.0, 0.97, 0.82))
+    head_x = car['front_x'] - 0.06
+    head_y = car['body_top_y'] * 0.55
+    for zh in (W * 0.33, -W * 0.33):
+        glPushMatrix()
+        glTranslatef(head_x, head_y, zh)
+        glScalef(0.10, 0.07, 0.10)
+        q = gluNewQuadric()
+        gluSphere(q, 1.0, 16, 16)
+        gluDeleteQuadric(q)
+        glPopMatrix()
+
+    _car_mat_emit((0.88, 0.06, 0.06))
+    tail_x = car['rear_x'] + 0.06
+    tail_y = car['body_top_y'] * 0.80
+    for zh in (W * 0.34, -W * 0.34):
+        glPushMatrix()
+        glTranslatef(tail_x, tail_y, zh)
+        glScalef(0.14, 0.06, 0.09)
+        q = gluNewQuadric()
+        gluSphere(q, 1.0, 16, 16)
+        gluDeleteQuadric(q)
+        glPopMatrix()
+
+    _car_mat_clear()
+
+
+def _car_draw_wheel(x, y, zc, r, side, spoke_count):
+    tire_w = r * 0.56
+    hw = tire_w / 2
+    glPushMatrix()
+    glTranslatef(x, y, zc - hw)
+
+    q = gluNewQuadric()
+    gluQuadricNormals(q, GLU_SMOOTH)
+
+    r_mid = r
+    r_wall = r * 0.92
+    tread_w = tire_w * 0.45
+    wall_w = (tire_w - tread_w) / 2
+
+    _car_mat_tire()
+    gluCylinder(q, r_wall, r_mid, wall_w, 20, 1)
+    glPushMatrix(); glTranslatef(0, 0, wall_w)
+    gluCylinder(q, r_mid, r_mid, tread_w, 20, 1)
+    glPopMatrix()
+    glPushMatrix(); glTranslatef(0, 0, wall_w + tread_w)
+    gluCylinder(q, r_mid, r_wall, wall_w, 20, 1)
+    glPopMatrix()
+
+    inner_local_z = 0.0 if side > 0 else tire_w
+    glPushMatrix()
+    glTranslatef(0, 0, inner_local_z)
+    if side > 0:
+        glRotatef(180, 1, 0, 0)
+    _car_mat_tire()
+    gluDisk(q, 0, r_wall, 18, 1)
+    glPopMatrix()
+
+    outer_local_z = tire_w if side > 0 else 0.0
+    glPushMatrix()
+    glTranslatef(0, 0, outer_local_z)
+    if side < 0:
+        glRotatef(180, 1, 0, 0)
+
+    glPushMatrix()
+    glTranslatef(0, 0, -tire_w * 0.35)
+    _car_mat_brake()
+    gluDisk(q, r * 0.22, r * 0.72, 20, 1)
+    glPopMatrix()
+
+    glPushMatrix()
+    glTranslatef(0, 0, -0.012)
+    _car_mat_dark()
+    gluDisk(q, r * 0.20, r_wall * 0.96, 20, 1)
+    glPopMatrix()
+
+    _car_mat_hub()
+    gluDisk(q, 0, r * 0.18, 16, 1)
+
+    _car_mat_chrome()
+    gluDisk(q, r_wall * 0.93, r_wall * 0.99, 20, 1)
+
+    _car_mat_rim()
+    hub_r = r * 0.19
+    out_r = r_wall * 0.94
+    spoke_w_hub = 0.07
+    spoke_w_out = 0.05
+    glBegin(GL_QUADS)
+    glNormal3f(0, 0, 1)
+    for i in range(spoke_count):
+        a = 2 * math.pi * i / spoke_count
+        ca, sa = math.cos(a), math.sin(a)
+        px, py = -sa, ca
+        x1 = ca * hub_r + px * spoke_w_hub
+        y1 = sa * hub_r + py * spoke_w_hub
+        x2 = ca * hub_r - px * spoke_w_hub
+        y2 = sa * hub_r - py * spoke_w_hub
+        x3 = ca * out_r - px * spoke_w_out
+        y3 = sa * out_r - py * spoke_w_out
+        x4 = ca * out_r + px * spoke_w_out
+        y4 = sa * out_r + py * spoke_w_out
+        glVertex3f(x1, y1, 0.002)
+        glVertex3f(x2, y2, 0.002)
+        glVertex3f(x3, y3, 0.002)
+        glVertex3f(x4, y4, 0.002)
+    glEnd()
+
+    glPopMatrix()
+    gluDeleteQuadric(q)
+    glPopMatrix()
+
+
+def build_car_variant(seed):
+    rng = np.random.default_rng(seed)
+    car = _generate_car_params(rng)
+    paint_tex = make_car_paint_texture(car['color'], rng)
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    _car_draw_lower_body(car, paint_tex)
+    _car_draw_cabin(car, paint_tex)
+    _car_draw_details(car)
+    for (wx, wy, wz) in car['wheels']:
+        _car_draw_wheel(wx, wy, wz, car['WR'],
+                        1 if wz > 0 else -1, car['spoke_count'])
+    glEndList()
+    # Light hardpoints kept for the night additive-glow pass, which renders
+    # per-frame billboards (so intensity can be modulated by night_a).
+    return {
+        'list': list_id, 'paint_tex': paint_tex,
+        'L': car['L'], 'W': car['W'],
+        'head_x': car['front_x'] - 0.06,
+        'tail_x': car['rear_x'] + 0.06,
+        'head_y': car['body_top_y'] * 0.55,
+        'tail_y': car['body_top_y'] * 0.80,
+        'head_zoff': car['W'] * 0.33,
+        'tail_zoff': car['W'] * 0.34,
+    }
+
+
+def build_car_variants(n=N_CAR_VARIANTS):
+    return [build_car_variant(5000 + i) for i in range(n)]
+
+
+def _car_speed_for(lane, player_speed, rng):
+    if lane == -1:
+        # Always faster than the camera so the car recedes away.
+        base = max(CAR_SPEED_AWAY_FLOOR, float(player_speed))
+        return base + float(rng.uniform(CAR_SPEED_AWAY_OVER_MIN,
+                                        CAR_SPEED_AWAY_OVER_MAX))
+    return float(rng.uniform(CAR_SPEED_ONCOMING_MIN,
+                             CAR_SPEED_ONCOMING_MAX))
+
+
+def _car_respawn_s(lane, s_car, rng):
+    if lane == -1:
+        # Enter from behind the camera — offset is negative.
+        return s_car - float(rng.uniform(CAR_SPAWN_BEHIND_MIN,
+                                         CAR_SPAWN_BEHIND_MAX))
+    # Oncoming: far ahead so they have room to close on the camera.
+    return s_car + float(rng.uniform(CAR_SPAWN_AHEAD_MIN,
+                                     CAR_SPAWN_AHEAD_MAX))
+
+
+def init_cars(seed=303, s_car=0.0, player_speed=0.0):
+    rng = np.random.default_rng(seed)
+    cars = []
+    for lane in (-1, +1):
+        for _ in range(N_CARS_PER_LANE):
+            cars.append({
+                'variant': int(rng.integers(0, N_CAR_VARIANTS)),
+                'lane': lane,
+                's': _car_respawn_s(lane, s_car, rng),
+                'speed': _car_speed_for(lane, player_speed, rng),
+            })
+    return {'cars': cars, 'rng': rng}
+
+
+def update_cars(state, dt, s_car, player_speed):
+    rng = state['rng']
+    for c in state['cars']:
+        if c['lane'] == -1:
+            # Clamp same-direction cars to always outrun the camera so
+            # they actually pull ahead and pass it after spawning behind.
+            margin = max(CAR_SPEED_AWAY_OVER_MIN,
+                         c['speed'] - max(CAR_SPEED_AWAY_FLOOR,
+                                          float(player_speed)))
+            margin = min(margin, CAR_SPEED_AWAY_OVER_MAX)
+            c['speed'] = max(CAR_SPEED_AWAY_FLOOR,
+                             float(player_speed)) + margin
+            c['s'] += c['speed'] * dt
+            # Respawn behind the camera once the car has disappeared off
+            # the far horizon ahead. (Never respawn on the "behind" side —
+            # they *live* behind until they pass the camera.)
+            if c['s'] > s_car + CAR_DESPAWN_AHEAD:
+                c['s'] = _car_respawn_s(-1, s_car, rng)
+                c['variant'] = int(rng.integers(0, N_CAR_VARIANTS))
+                c['speed'] = _car_speed_for(-1, player_speed, rng)
+        else:
+            # Oncoming: closing on the camera.
+            c['s'] -= c['speed'] * dt
+            if c['s'] < s_car - CAR_DESPAWN_BEHIND:
+                c['s'] = _car_respawn_s(+1, s_car, rng)
+                c['variant'] = int(rng.integers(0, N_CAR_VARIANTS))
+                c['speed'] = _car_speed_for(+1, player_speed, rng)
+
+
+def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
+              night_a, flare_tex):
+    if not state['cars']:
+        return
+
+    glEnable(GL_LIGHTING)
+    glEnable(GL_LIGHT0)
+    glEnable(GL_NORMALIZE)
+    glDisable(GL_COLOR_MATERIAL)
+    # Directional light loosely tracking the sun; clamp altitude so night
+    # keeps some top-down fill (otherwise unlit sides go pure black).
+    sx = float(sun_dir[0])
+    sy = max(0.25, float(sun_dir[1]))
+    sz = float(sun_dir[2])
+    glLightfv(GL_LIGHT0, GL_POSITION, (sx, sy, sz, 0.0))
+    glLightfv(GL_LIGHT0, GL_AMBIENT,
+              (amb_rgb[0] * 0.55, amb_rgb[1] * 0.55,
+               amb_rgb[2] * 0.58, 1.0))
+    glLightfv(GL_LIGHT0, GL_DIFFUSE,
+              (min(1.0, amb_rgb[0] * 1.10),
+               min(1.0, amb_rgb[1] * 1.08),
+               min(1.0, amb_rgb[2] * 1.00), 1.0))
+    glLightfv(GL_LIGHT0, GL_SPECULAR,
+              (min(1.0, amb_rgb[0] * 1.10),
+               min(1.0, amb_rgb[1] * 1.08),
+               min(1.0, amb_rgb[2] * 1.00), 1.0))
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT,
+                   (amb_rgb[0] * 0.35, amb_rgb[1] * 0.35,
+                    amb_rgb[2] * 0.38, 1.0))
+    glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, GL_TRUE)
+
+    for c in state['cars']:
+        s = c['s']
+        if s < s_car - 15.0 or s > s_car + N_SEG * SEG_LEN:
+            continue
+        cx = curve_x(s)
+        cy = curve_y(s)
+        cz = -(s - s_car)
+        lane_sign = c['lane']  # -1 = left of player, +1 = right
+        cx += lane_sign * CAR_LANE_HALF
+
+        ds = 0.5
+        dxds = (curve_x(s + ds) - curve_x(s - ds)) / (2.0 * ds)
+        if c['lane'] == -1:
+            yaw_deg = math.degrees(math.atan2(1.0, dxds))
+        else:
+            yaw_deg = math.degrees(math.atan2(-1.0, -dxds))
+
+        glPushMatrix()
+        glTranslatef(cx, cy, cz)
+        glRotatef(yaw_deg, 0.0, 1.0, 0.0)
+        glCallList(car_variants[c['variant']]['list'])
+        glPopMatrix()
+
+    _car_mat_clear()
+    glDisable(GL_LIGHTING)
+    glDisable(GL_LIGHT0)
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, (0.2, 0.2, 0.2, 1.0))
+    glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, GL_FALSE)
+
+    # --- Night headlight / taillight pass ---
+    # Additive-blended, camera-facing billboards at each light's world
+    # position. Drawn per-frame (not baked) so intensity scales with the
+    # current night factor. Headlights read warm-white and only project
+    # from the car's front face; taillights read red and only from the
+    # rear. We gate per-face by checking whether the car's forward vector
+    # points toward or away from the camera, so recediing cars glow red
+    # and oncoming cars glow yellow — matching real traffic at night.
+    if night_a <= 0.03:
+        return
+    glDisable(GL_LIGHTING)
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, flare_tex)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+    glDepthMask(GL_FALSE)
+
+    mv = glGetFloatv(GL_MODELVIEW_MATRIX)
+    # Camera-space right/up expressed in world coords: columns 0/1 of the
+    # upper-left 3x3 of the current modelview matrix.
+    cam_right = (float(mv[0][0]), float(mv[1][0]), float(mv[2][0]))
+    cam_up = (float(mv[0][1]), float(mv[1][1]), float(mv[2][1]))
+
+    head_col = (1.0 * night_a, 0.96 * night_a, 0.78 * night_a)
+    tail_col = (0.95 * night_a, 0.10 * night_a, 0.08 * night_a)
+    head_size = 0.55
+    tail_size = 0.45
+
+    for c in state['cars']:
+        s = c['s']
+        if s < s_car - 15.0 or s > s_car + N_SEG * SEG_LEN:
+            continue
+        cx = curve_x(s)
+        cy = curve_y(s)
+        cz = -(s - s_car)
+        cx += c['lane'] * CAR_LANE_HALF
+        ds = 0.5
+        dxds = (curve_x(s + ds) - curve_x(s - ds)) / (2.0 * ds)
+        # Forward direction of the car in world coords.
+        if c['lane'] == -1:
+            fx, fz = dxds, -1.0
+        else:
+            fx, fz = -dxds, 1.0
+        fn = math.hypot(fx, fz) + 1e-9
+        fx /= fn; fz /= fn
+        # Right perpendicular (for lateral light offsets).
+        rx, rz = -fz, fx
+
+        v = car_variants[c['variant']]
+        # View direction from car to camera (camera is at +z = CAM_BACK,
+        # x = curve_x(s_cam), y = road_y + CAM_HEIGHT).
+        to_cam_x = -cx  # approx — the camera's x moves with the road too
+        to_cam_z = CAM_BACK - cz
+        to_cam_n = math.hypot(to_cam_x, to_cam_z) + 1e-9
+        to_cam_x /= to_cam_n; to_cam_z /= to_cam_n
+        face = fx * to_cam_x + fz * to_cam_z  # >0: car front faces camera
+
+        # Emit a camera-facing billboard at world position p.
+        def emit(p, col, size):
+            r0, r1, r2 = cam_right
+            u0, u1, u2 = cam_up
+            hx, hy, hz = r0 * size, r1 * size, r2 * size
+            vx, vy, vz = u0 * size, u1 * size, u2 * size
+            glColor4f(col[0], col[1], col[2], 1.0)
+            glBegin(GL_QUADS)
+            glTexCoord2f(0, 0); glVertex3f(p[0] - hx - vx,
+                                           p[1] - hy - vy,
+                                           p[2] - hz - vz)
+            glTexCoord2f(1, 0); glVertex3f(p[0] + hx - vx,
+                                           p[1] + hy - vy,
+                                           p[2] + hz - vz)
+            glTexCoord2f(1, 1); glVertex3f(p[0] + hx + vx,
+                                           p[1] + hy + vy,
+                                           p[2] + hz + vz)
+            glTexCoord2f(0, 1); glVertex3f(p[0] - hx + vx,
+                                           p[1] - hy + vy,
+                                           p[2] - hz + vz)
+            glEnd()
+
+        # Headlights visible when car front faces the camera (face > 0);
+        # taillights when it faces away (face < 0). A narrow crossfade
+        # around face=0 avoids flicker at perpendicular angles.
+        head_w = max(0.0, min(1.0, (face + 0.05) / 0.15))
+        tail_w = max(0.0, min(1.0, (-face + 0.05) / 0.15))
+
+        if head_w > 0.01:
+            hx_off = v['head_x']
+            hy_off = v['head_y']
+            hz_off = v['head_zoff']
+            for lateral in (+1, -1):
+                px = cx + fx * hx_off + rx * hz_off * lateral
+                pz = cz + fz * hx_off + rz * hz_off * lateral
+                py = cy + hy_off
+                emit((px, py, pz),
+                     (head_col[0] * head_w,
+                      head_col[1] * head_w,
+                      head_col[2] * head_w),
+                     head_size)
+
+        if tail_w > 0.01:
+            tx_off = v['tail_x']
+            ty_off = v['tail_y']
+            tz_off = v['tail_zoff']
+            for lateral in (+1, -1):
+                px = cx + fx * tx_off + rx * tz_off * lateral
+                pz = cz + fz * tx_off + rz * tz_off * lateral
+                py = cy + ty_off
+                emit((px, py, pz),
+                     (tail_col[0] * tail_w,
+                      tail_col[1] * tail_w,
+                      tail_col[2] * tail_w),
+                     tail_size)
+
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+    glDisable(GL_TEXTURE_2D)
+
+
 # --- Main ---
 def main():
     pygame.init()
@@ -4288,6 +5156,11 @@ def main():
         upload_texture(make_slate_roof_texture()),
     ]
     house_variants = build_house_variants(house_wall_texes, house_roof_texes)
+    # Procedural traffic: a pool of lofted-superellipse car variants
+    # driven along both lanes. Built once at startup; cars are looked-up
+    # by index per frame.
+    car_variants = build_car_variants()
+    car_state = init_cars(player_speed=SPEED)
     # Flowers: six colour palettes, each compiled as a crossed-quad
     # billboard display list.
     flower_variants = []
@@ -4656,6 +5529,13 @@ def main():
         draw_civil_structures(s_car, concrete_tex, amb, storm_i, frost_i)
         draw_snow_shoulders(snow_ground_tex, s_car, amb)
         draw_lamps(s_car, night_a)
+
+        # Procedural traffic. Two lanes: player's left lane travels the
+        # same direction as the player (cars recede), right lane is
+        # oncoming (cars close toward the camera).
+        update_cars(car_state, dt, s_car, speed)
+        draw_cars(car_state, car_variants, s_car, amb, sun_d,
+                  night_a, flare_tex)
 
         # snowfall: per-side gating. Flakes only fall where that side of
         # the road is in a frost biome; if left is frost and right isn't,
