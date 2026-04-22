@@ -2,7 +2,9 @@ import math
 import sys
 import numpy as np
 import pygame
-from pygame.locals import DOUBLEBUF, OPENGL, FULLSCREEN, QUIT, KEYDOWN, K_ESCAPE
+from pygame.locals import (
+    DOUBLEBUF, OPENGL, FULLSCREEN, QUIT, KEYDOWN, K_ESCAPE, K_UP, K_DOWN,
+)
 import random
 from OpenGL.GL import *
 from OpenGL.GLU import (
@@ -15,7 +17,10 @@ from OpenGL.GLU import (
 ROAD_WIDTH = 10.0
 SEG_LEN = 2.0
 N_SEG = 180
-SPEED = 28.0
+SPEED = 28.0           # default cruise speed (m/s); Up/Down adjust live
+SPEED_ACCEL = 24.0     # m/s² applied while Up/Down is held
+SPEED_MIN = 0.0
+SPEED_MAX = 90.0
 CAM_HEIGHT = 3.4
 CAM_BACK = 5.0
 LOOK_AHEAD = 20.0
@@ -625,6 +630,13 @@ def build_side_arrays(s_arr, s_car, side, t_time, amb_rgb):
            + weights[:, 2:3] * mnt + weights[:, 3:4] * river
            + weights[:, 4:5] * forest + weights[:, 5:6] * frost
            + weights[:, 6:7] * city)
+    # Seamless shoulder: ramp the biome height offset from 0 at the road
+    # edge up to full strength over the first ~3m perpendicular. Eliminates
+    # the curb drop at the pavement (each biome profile naturally sits a bit
+    # below road level at d=0) while keeping the biome geometry beyond.
+    edge_fac = np.clip(d / 3.0, 0.0, 1.0)
+    edge_fac = edge_fac * edge_fac * (3 - 2 * edge_fac)  # smoothstep
+    off = off * edge_fac[None, :]
     x = rx[:, None] + side * (ROAD_WIDTH / 2 + d[None, :])
     y = ry[:, None] + off
     z = np.broadcast_to(rz[:, None], (NS, K))
@@ -1126,12 +1138,21 @@ def update_snow(state, dt, t_time):
         pos[respawn, 2] = rng.uniform(-SNOW_BOX_Z, SNOW_BOX_Z * 0.3, n).astype(np.float32)
 
 
-def draw_snow(state, snow_tex, intensity, cam_x, cam_y, cam_z):
-    """Renders point-sprite flakes translated to camera. `intensity` is the
-    frost biome weight at camera — never draws above 0 outside frost zones."""
-    if intensity < 0.02:
+def draw_snow(state, snow_tex, wL, wR, cam_x, cam_y, cam_z):
+    """Per-side snowfall. Flakes with local x<0 belong to the left side and
+    use the left frost weight for alpha; flakes with x>=0 use the right
+    weight. That way if only one side of the road is in frost biome, snow
+    falls only on that side and cleanly tapers across transitions."""
+    if wL < 0.02 and wR < 0.02:
         return
     pos, _vel, _seed = state
+
+    # per-flake alpha — bumped 20% for visibility, clamped to 1
+    alpha = np.where(pos[:, 0] < 0.0, wL, wR).astype(np.float32)
+    np.clip(alpha * 1.2, 0.0, 1.0, out=alpha)
+    rgba = np.empty((len(pos), 4), dtype=np.float32)
+    rgba[:, 0:3] = 1.0
+    rgba[:, 3] = alpha
 
     glEnable(GL_TEXTURE_2D)
     glBindTexture(GL_TEXTURE_2D, snow_tex)
@@ -1146,10 +1167,12 @@ def draw_snow(state, snow_tex, intensity, cam_x, cam_y, cam_z):
 
     glPushMatrix()
     glTranslatef(cam_x, cam_y, cam_z)
-    glColor4f(1.0, 1.0, 1.0, min(1.0, intensity * 1.2))
     glEnableClientState(GL_VERTEX_ARRAY)
+    glEnableClientState(GL_COLOR_ARRAY)
     glVertexPointer(3, GL_FLOAT, 0, pos)
+    glColorPointer(4, GL_FLOAT, 0, rgba)
     glDrawArrays(GL_POINTS, 0, len(pos))
+    glDisableClientState(GL_COLOR_ARRAY)
     glDisableClientState(GL_VERTEX_ARRAY)
     glPopMatrix()
 
@@ -1417,6 +1440,7 @@ def main():
     t_time = 0.0
     # start near dawn so first sight is pretty
     t_day = 0.18
+    speed = SPEED
     running = True
     while running:
         dt = clock.tick(60) / 1000.0
@@ -1426,7 +1450,19 @@ def main():
             elif e.type == KEYDOWN and e.key == K_ESCAPE:
                 running = False
 
-        s_car += SPEED * dt
+        # Up/Down: live accel/decel. Held-key polling so the speed change is
+        # smooth and proportional to how long the key is held.
+        keys = pygame.key.get_pressed()
+        if keys[K_UP]:
+            speed += SPEED_ACCEL * dt
+        if keys[K_DOWN]:
+            speed -= SPEED_ACCEL * dt
+        if speed < SPEED_MIN:
+            speed = SPEED_MIN
+        elif speed > SPEED_MAX:
+            speed = SPEED_MAX
+
+        s_car += speed * dt
         t_time += dt
         t_day = (t_day + dt / DAY_PERIOD) % 1.0
 
@@ -1485,10 +1521,13 @@ def main():
         draw_snow_shoulders(snow_ground_tex, s_car, amb)
         draw_lamps(s_car, night_a)
 
-        # snowfall: only in frost biomes, intensity tracks frost weight at camera
-        snow_i = frost_intensity_at(s_car)
+        # snowfall: per-side gating. Flakes only fall where that side of
+        # the road is in a frost biome; if left is frost and right isn't,
+        # snow falls only to the left.
+        wL_frost = frost_weight_at(s_car, -1)
+        wR_frost = frost_weight_at(s_car, +1)
         update_snow(snow_state, dt, t_time)
-        draw_snow(snow_state, snowflake_tex, snow_i, cx, cy, cz)
+        draw_snow(snow_state, snowflake_tex, wL_frost, wR_frost, cx, cy, cz)
 
         pygame.display.flip()
 
