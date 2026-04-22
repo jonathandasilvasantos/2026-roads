@@ -3040,13 +3040,17 @@ DUST_Y_MAX = 12.0
 
 
 def dust_intensity_at(t_time):
-    """Three detuned sines with a high threshold — dust events are rare
-    and build/clear smoothly over tens of seconds."""
+    """Three detuned sines with a high threshold — tuned so dust events
+    are *genuinely rare*: roughly 1 % of sunny-daytime wall-clock time,
+    building and clearing smoothly over tens of seconds so each event
+    feels like a single breath of haze rather than a flicker."""
     a = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 210.0)
     b = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 67.0 + 1.7)
     c = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 143.0 + 0.5)
     raw = a * b * c
-    x = max(0.0, (raw - 0.46) / 0.54)
+    # Threshold raised and the 0→1 range narrowed; peaks only light up
+    # when all three sines align at the top of their cycles.
+    x = max(0.0, (raw - 0.78) / 0.22)
     x = min(1.0, x)
     return x * x * (3.0 - 2.0 * x)
 
@@ -3108,11 +3112,13 @@ def draw_dust(state, dust_tex, intensity, cam_x, cam_y, cam_z, amb_rgb):
 
     glPushMatrix()
     glTranslatef(cam_x, cam_y, cam_z)
-    # Warm ivory dust tint modulated by ambient, so motes dim at night
+    # Warm ivory dust tint modulated by ambient, so motes dim at night.
+    # Alpha capped low — dust should feel like a soft breath of haze,
+    # never a solid fog. The user-facing request was "soft".
     glColor4f(min(1.0, amb_rgb[0] + 0.05),
               min(1.0, amb_rgb[1] * 0.92),
               min(1.0, amb_rgb[2] * 0.72),
-              min(1.0, intensity * 0.55))
+              min(1.0, intensity * 0.32))
     glEnableClientState(GL_VERTEX_ARRAY)
     glVertexPointer(3, GL_FLOAT, 0, pos)
     glDrawArrays(GL_POINTS, 0, len(pos))
@@ -4421,15 +4427,17 @@ def main():
         rain_i = storm_i * (1.0 - frost_i)
         draw_rain(rain_state, rain_i, cx, cy, cz)
 
-        # Volumetric dust motes — rare, gated by dust_intensity_at(t_time),
-        # suppressed by rain (wet air carries no dust), scaled by ambient
-        # brightness (dust reads only when the sun catches it), and by
-        # open-biome exposure (dust rises where land is dry and wind-blown).
-        dust_base = dust_intensity_at(t_time)
-        dust_base *= max(0.0, 1.0 - 1.2 * storm_i)       # rain clears dust
-        dust_base *= min(1.0, bright)                     # needs light
-        dust_base *= (0.30 + 0.70 * open_exp_trees)       # open terrain bias
-        dust_i = min(1.0, dust_base * 1.4)
+        # Volumetric dust motes — rare, gated so they only appear in
+        # *sunny* moments. Hard sunny gate (storm ≈ 0 AND bright ≈ 1)
+        # via smooth thresholds, multiplied by the open-biome exposure
+        # and by the already-rare dust_intensity_at(t_time) event
+        # function. Peak overall intensity ~0.5 so the effect stays a
+        # soft haze, never a fog bank.
+        sunny_gate = _smooth((1.0 - storm_i - 0.05) / 0.25) \
+                     * _smooth((bright - 0.7) / 0.2)
+        dust_base = dust_intensity_at(t_time) * sunny_gate
+        dust_base *= (0.30 + 0.70 * open_exp_trees)
+        dust_i = min(0.55, dust_base)
         update_dust(dust_state, dt, t_time)
         draw_dust(dust_state, snowflake_tex, dust_i, cx, cy, cz, amb)
 
