@@ -55,23 +55,31 @@ Press **Esc** to quit. Runs fullscreen at the native display resolution.
   alpha-cutout quads). Six variants baked once into display lists at
   startup, instanced across forest zones via a deterministic per-slot hash
   for placement, yaw, scale, and variant.
-- **Storms** — independent weather cycle (~90s period) drives storm
-  intensity 0..1. Sky zenith and horizon darken toward neutral gray, cloud
-  tint shifts to storm gray, ambient brightness drops up to 55%, fog
-  thickens +30% at full storm.
+- **Storms** — product of three detuned sines (~4 min primary) with a
+  soft threshold so storms are rare events, roughly 8% of wall-clock
+  time. Sky zenith/horizon darken toward neutral gray, cloud tint shifts
+  to storm gray, ambient drops up to 55%, fog thickens +30% at full
+  storm.
 - **Rain** — 1,400 streak particles drawn as `GL_LINES`. Each drop's tail
-  is `pos - velocity * streak_dt`, so the streak direction and length
-  match its motion (a cheap motion-blur approximation). Fall velocity is
-  17–25 m/s with a slight wind-driven X component for slant. Alpha fades
-  with storm intensity; particles never appear outside a storm.
-- **Lightning** — procedural bolts via 6-level recursive midpoint
-  displacement (start at cloud altitude, end near ground, midpoint of
-  each segment perpendicularly displaced with displacement shrinking at
-  each iteration). Produces a 65-vertex jagged main line plus 1–3
-  branching forks subdivided 4 levels. Two-pass draw: wide additive glow
-  underneath, thin bright core on top. Lightning life ~0.22s, briefly
-  whites out the sky and boosts ambient so the whole scene flashes. Strike
-  probability scales with storm intensity.
+  is `pos - velocity * streak_dt`, so streak direction and length match
+  motion (motion-blur approximation without textures). Fall 17–25 m/s
+  with wind X drift. Alpha tied to storm intensity.
+- **Reflective puddles** — during rain, scattered water ponds appear on
+  the ground along non-river/non-frost biomes. Procedural seamless
+  ripple/caustic RGBA texture with radial alpha falloff for round
+  puddles. Surface color is the current sky-horizon tint modulated by
+  ambient — at noon they reflect bright sky, at night they look like wet
+  asphalt. Texture matrix drifts UVs for animated ripples. Fades in with
+  storm intensity and out shortly after the storm passes.
+- **Lightning** — rare procedural bolts via 7-level recursive midpoint
+  displacement (129 main-line vertices + 1–2 forks from the upper trunk
+  only). Horizontal displacement is larger than vertical and decays
+  geometrically per subdivision, so the bolt stays visibly vertical with
+  zigzag layered on. Strikes are deliberately sparse: rolled once per
+  second only when storm > 0.45, and a 5–12 s mandatory gap between
+  consecutive strikes. Life 0.22 s with a 35 Hz sinusoidal flicker
+  modulating both the bolt brightness and the scene flash — reads as
+  multiple return strokes like a real strike.
 - **City skyline** — rectangular-prism buildings tiled with a procedural
   facade texture (8-wide × 16-tall window grid on a concrete base). 12
   variants baked into display lists at startup with varied widths, depths,

@@ -303,12 +303,18 @@ BOLT_LIFE = 0.22  # seconds each bolt is visible
 
 
 def storm_intensity_at(t_time):
-    """0 in clear weather, 1 in the middle of a storm. Transitions are
-    naturally gradual because the two sines combine smoothly."""
-    a = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / STORM_PERIOD)
-    b = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 33.7 + 1.3)
-    raw = a * b
-    x = max(0.0, (raw - 0.30) / 0.55)
+    """0 in clear weather, 1 in the middle of a storm. Three detuned sines
+    multiplied together produce rare tall peaks — storms only fire when
+    all three happen to align, so most of the time the sky stays clear.
+
+    Tuning: period ~4 minutes, threshold 0.55 on the normalised product,
+    roughly 8-12% of wall-clock time sits in a visible storm, ~3% at peak.
+    """
+    a = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 260.0)
+    b = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 71.0 + 1.3)
+    c = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 131.0 + 0.7)
+    raw = a * b * c
+    x = max(0.0, (raw - 0.36) / 0.64)
     x = min(1.0, x)
     return x * x * (3.0 - 2.0 * x)
 
@@ -373,48 +379,187 @@ def draw_rain(state, intensity, cam_x, cam_y, cam_z):
     glDisable(GL_BLEND)
 
 
+# --- Rain puddles ---
+# Fixed-function GL can't run a real reflection shader, so we fake sky
+# reflection with a multi-scale noise "water" texture modulated at draw
+# time by the current sky-horizon color, drifted via the texture matrix
+# for a ripple animation. A second additive sparkle pass reads the same
+# texture at a different offset to fake shifting specular glints.
+POND_SPACING = 12.0
+POND_MIN_D = 2.0
+POND_MAX_D = 24.0
+
+
+def make_pond_texture(size=256):
+    """Seamless ripple/caustic pattern. RGB carries brightness bias for the
+    reflection; alpha carries wetness coverage so edges fade off."""
+    rng = np.random.default_rng(131)
+    # multi-octave seamless noise
+    tex = np.zeros((size, size), dtype=np.float32)
+    amp_sum = 0.0
+    for fx, fy, amp in [(4, 4, 0.5), (8, 8, 0.3), (16, 16, 0.18),
+                        (32, 32, 0.1)]:
+        tex += _wrap_noise(size, size, fx, fy, rng) * amp
+        amp_sum += amp
+    tex /= amp_sum
+    tex = (tex - tex.min()) / (tex.max() - tex.min() + 1e-9)
+
+    # warp to emphasise bright reflective highlights
+    rippled = tex ** 1.5
+    # radial alpha falloff so the pond shape reads as a round puddle
+    ys, xs = np.mgrid[0:size, 0:size].astype(np.float32)
+    c = (size - 1) / 2.0
+    r = np.sqrt((xs - c) ** 2 + (ys - c) ** 2) / c
+    alpha = np.clip(1.0 - r, 0.0, 1.0) ** 1.3
+
+    rgba = np.zeros((size, size, 4), dtype=np.float32)
+    rgba[..., 0] = 0.45 + 0.55 * rippled
+    rgba[..., 1] = 0.55 + 0.45 * rippled
+    rgba[..., 2] = 0.70 + 0.30 * rippled
+    rgba[..., 3] = alpha * (0.85 + 0.15 * rippled)
+    return (rgba * 255).clip(0, 255).astype(np.uint8)
+
+
+def draw_ponds(pond_tex, s_car, storm_i, horizon_rgb, amb_rgb, t_time):
+    """Scatter reflective water patches on the ground where rain falls.
+    Fades in with storm intensity; fades out shortly after the storm does.
+    Skips river/frost biomes (already water or snow)."""
+    if storm_i < 0.08:
+        return
+    s_start = math.floor(s_car / POND_SPACING) * POND_SPACING
+    max_s = s_car + N_SEG * SEG_LEN
+    n_steps = int((max_s - s_start) / POND_SPACING) + 1
+
+    # Precompute biome weights for pond eligibility and density modulation
+    s_arr = np.arange(n_steps, dtype=np.float32) * POND_SPACING + s_start
+    wL = biome_weights_vec(s_arr, -1)
+    wR = biome_weights_vec(s_arr, +1)
+
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, pond_tex)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glDepthMask(GL_FALSE)
+    glEnable(GL_POLYGON_OFFSET_FILL)
+    glPolygonOffset(-1.4, -1.4)
+
+    # Reflection color: sky horizon tinted toward water, then gently shaded
+    # down by ambient brightness so night ponds look like wet asphalt and
+    # daytime ponds look like bright sky.
+    refl_r = (horizon_rgb[0] * 0.55 + 0.15) * amb_rgb[0]
+    refl_g = (horizon_rgb[1] * 0.60 + 0.15) * amb_rgb[1]
+    refl_b = (horizon_rgb[2] * 0.70 + 0.20) * amb_rgb[2]
+    base_a = min(1.0, storm_i * 1.4)
+
+    # Animated ripple via texture matrix drift
+    glMatrixMode(GL_TEXTURE)
+    glPushMatrix()
+    glLoadIdentity()
+    glTranslatef(t_time * 0.02, t_time * 0.015, 0.0)
+    glMatrixMode(GL_MODELVIEW)
+
+    glColor4f(min(1.0, refl_r), min(1.0, refl_g), min(1.0, refl_b), base_a)
+
+    for i in range(n_steps):
+        s = float(s_arr[i])
+        if s < s_car - 1.0:
+            continue
+        for side, warr in ((-1, wL), (+1, wR)):
+            w = warr[i]
+            # skip river (already water) and frost (already snow)
+            if w[BIOME_RIVER] > 0.25 or w[BIOME_FROST] > 0.35:
+                continue
+            key = (int(s * 73) * 2654435761
+                   + (0 if side < 0 else 8191)
+                   + 13) & 0xFFFFFFFF
+            if (key & 0xFF) / 255.0 > 0.30:  # only ~30% slots produce ponds
+                continue
+            d_off = POND_MIN_D + ((key >> 8) & 0xFF) / 255.0 * (POND_MAX_D - POND_MIN_D)
+            radius = 1.5 + ((key >> 16) & 0x0F) / 15.0 * 2.3
+            aspect = 1.0 + ((key >> 20) & 0x07) / 7.0 * 0.7
+            yaw = ((key >> 24) & 0x3F) / 63.0 * 360.0
+
+            px = curve_x(s) + side * (ROAD_WIDTH / 2 + d_off)
+            py = curve_y(s) + 0.02
+            pz = -(s - s_car)
+
+            glPushMatrix()
+            glTranslatef(px, py, pz)
+            glRotatef(yaw, 0, 1, 0)
+            # draw as triangle fan ellipse with world-space UVs so the
+            # ripple texture tiles consistently across pond sizes
+            glBegin(GL_TRIANGLE_FAN)
+            glNormal3f(0.0, 1.0, 0.0)
+            glTexCoord2f(0.5, 0.5); glVertex3f(0.0, 0.0, 0.0)
+            steps = 16
+            for k in range(steps + 1):
+                t = 2 * math.pi * k / steps
+                x = math.cos(t) * radius
+                z = math.sin(t) * radius * aspect
+                u = 0.5 + (x / (radius * 2.2))
+                v = 0.5 + (z / (radius * 2.2))
+                glTexCoord2f(u, v); glVertex3f(x, 0.0, z)
+            glEnd()
+            glPopMatrix()
+
+    glMatrixMode(GL_TEXTURE)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glDisable(GL_POLYGON_OFFSET_FILL)
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+
+
 def generate_bolt(rng, cam_x, cam_y, cam_z):
-    """Fractal lightning via recursive midpoint displacement (Wonka-style
-    lightning from the 1986 paper by Reed & Wyvill; extended with random
-    branch forks). Starts high in the clouds, ends near the ground at a
-    random horizontal offset from the camera.
+    """Fractal lightning via recursive midpoint displacement (Reed & Wyvill
+    1986; Kim & Lin 2007 for branches). Starts high in the clouds, drops
+    steeply to ground. Horizontal displacement per subdivision decays
+    geometrically so the bolt keeps a recognisably vertical trunk with
+    smaller zigzags layered on. Vertical displacement is kept small so
+    segments don't double back or stall.
     """
     angle = rng.uniform(0, 2 * math.pi)
-    dist = rng.uniform(70.0, 180.0)
+    dist = rng.uniform(80.0, 200.0)
     end = np.array([cam_x + math.cos(angle) * dist,
                     cam_y - 4.0,
                     cam_z + math.sin(angle) * dist], dtype=np.float32)
-    start = np.array([end[0] + rng.uniform(-22, 22),
-                      cam_y + 110.0,
-                      end[2] + rng.uniform(-22, 22)], dtype=np.float32)
+    # Start almost directly above the strike point (small cloud wander only)
+    start = np.array([end[0] + rng.uniform(-12, 12),
+                      cam_y + 130.0,
+                      end[2] + rng.uniform(-12, 12)], dtype=np.float32)
 
     pts = [start, end]
-    for it in range(6):  # 6 subdivisions → 65 segments
+    for it in range(7):  # 7 subdivisions → 129 segments
         new_pts = [pts[0]]
         for i in range(len(pts) - 1):
             a = pts[i]
             b = pts[i + 1]
             mid = (a + b) * 0.5
             seg_len = float(np.linalg.norm(b - a))
-            disp_scale = seg_len * 0.30 * (0.58 ** it)  # shrinking
-            # displace roughly perpendicular-horizontal (X,Z) + small Y wobble
-            disp = np.array([rng.uniform(-1, 1), rng.uniform(-0.25, 0.25),
-                             rng.uniform(-1, 1)], dtype=np.float32) * disp_scale
+            # horizontal displacement shrinks fast → crisp mostly-vertical bolt
+            dh = seg_len * 0.22 * (0.55 ** it)
+            dv = seg_len * 0.05 * (0.55 ** it)
+            disp = np.array([rng.uniform(-1, 1) * dh,
+                             rng.uniform(-1, 1) * dv,
+                             rng.uniform(-1, 1) * dh], dtype=np.float32)
             new_pts.append(mid + disp)
             new_pts.append(b)
         pts = new_pts
 
     main_line = np.stack(pts).astype(np.float32)
 
-    # Optional forks — a couple of short tributaries
+    # Branch forks — 1 or 2, starting high and peeling off horizontally.
+    # Real bolts rarely fork at the bottom, so pick origins from the top
+    # half of the trunk.
+    n_forks = int(rng.integers(1, 3))
     forks = []
-    for _ in range(rng.integers(1, 4)):
-        i = int(rng.integers(2, len(pts) - 4))
+    for _ in range(n_forks):
+        i = int(rng.integers(len(pts) // 5, len(pts) // 2))
         origin = pts[i]
-        # tributary target: angle off the main direction, shorter
-        tgt = origin + np.array([rng.uniform(-35, 35),
-                                 rng.uniform(-25, -5),
-                                 rng.uniform(-35, 35)], dtype=np.float32)
+        tgt = origin + np.array([rng.uniform(-40, 40),
+                                 rng.uniform(-35, -10),
+                                 rng.uniform(-40, 40)], dtype=np.float32)
         fpts = [origin, tgt]
         for it in range(4):
             n_new = [fpts[0]]
@@ -422,9 +567,11 @@ def generate_bolt(rng, cam_x, cam_y, cam_z):
                 a = fpts[j]; b = fpts[j + 1]
                 mid = (a + b) * 0.5
                 sl = float(np.linalg.norm(b - a))
-                ds = sl * 0.28 * (0.55 ** it)
-                d = np.array([rng.uniform(-1, 1), rng.uniform(-0.2, 0.2),
-                              rng.uniform(-1, 1)], dtype=np.float32) * ds
+                dh = sl * 0.25 * (0.55 ** it)
+                dv = sl * 0.05 * (0.55 ** it)
+                d = np.array([rng.uniform(-1, 1) * dh,
+                              rng.uniform(-1, 1) * dv,
+                              rng.uniform(-1, 1) * dh], dtype=np.float32)
                 n_new.append(mid + d)
                 n_new.append(b)
             fpts = n_new
@@ -435,13 +582,16 @@ def generate_bolt(rng, cam_x, cam_y, cam_z):
 
 def draw_bolt(bolt, age):
     """Two-pass line rendering: thick dim glow beneath, thin bright core on
-    top. Additive blending makes the bolt pop against the dark storm sky."""
+    top. Real strikes consist of several return strokes flickering in
+    quick succession — we approximate that with a 35 Hz sinusoidal
+    flicker modulating the overall brightness during the life."""
     if bolt is None or age > BOLT_LIFE:
         return
     main_line, forks = bolt
     life_t = 1.0 - age / BOLT_LIFE
-    # tweak curve so bolt stays bright for first half, fades in the second
-    vis = life_t ** 0.6
+    flicker = 0.55 + 0.45 * math.sin(age * 2 * math.pi * 35.0)
+    # crisp early, softer later, with ongoing flicker through the whole life
+    vis = max(0.0, (life_t ** 0.5) * flicker)
 
     glDisable(GL_TEXTURE_2D)
     glEnable(GL_BLEND)
@@ -1644,6 +1794,7 @@ def main():
     emission_tex = upload_texture(make_facade_emission_texture(), internal=GL_RGBA, src=GL_RGBA)
     building_lists = build_building_variants()
     rain_state = init_rain()
+    pond_tex = upload_texture(make_pond_texture(), internal=GL_RGBA, src=GL_RGBA)
     bolt_rng = np.random.default_rng(613)
     active_bolt = None
     bolt_age = 0.0
@@ -1692,7 +1843,11 @@ def main():
 
         flash = 0.0
         if active_bolt is not None:
-            flash = (1.0 - bolt_age / BOLT_LIFE) ** 0.6
+            # Same ~35 Hz flicker as the bolt itself — sky and bolt strobe
+            # together, reading as multiple return strokes.
+            life_t = 1.0 - bolt_age / BOLT_LIFE
+            fl = 0.55 + 0.45 * math.sin(bolt_age * 2 * math.pi * 35.0)
+            flash = max(0.0, (life_t ** 0.6) * fl)
 
         # day/night + weather derived values
         zenith, horizon = sky_colors_at(t_day, storm_i, flash)
@@ -1728,15 +1883,18 @@ def main():
         lz = -(s_look - s_car)
         gluLookAt(cx, cy, cz, lx, ly, lz, 0.0, 1.0, 0.0)
 
-        # Try to trigger a new bolt now that we have the camera position
+        # Try to trigger a new bolt now that we have the camera position.
+        # Strikes are deliberately rare: poll once per second, low success
+        # probability even at peak storm, and a mandatory gap of several
+        # seconds between consecutive strikes so they feel like events.
         time_to_strike -= dt
         if active_bolt is None and time_to_strike <= 0.0:
-            if storm_i > 0.40 and bolt_rng.random() < storm_i * 0.7:
+            if storm_i > 0.45 and bolt_rng.random() < storm_i * 0.12:
                 active_bolt = generate_bolt(bolt_rng, cx, cy, cz)
                 bolt_age = 0.0
-                time_to_strike = float(bolt_rng.uniform(1.8, 5.0)) / max(0.4, storm_i)
+                time_to_strike = float(bolt_rng.uniform(5.0, 12.0))
             else:
-                time_to_strike = 0.35
+                time_to_strike = 1.0
 
         draw_sky(sky_state, cx, cy, cz, t_time, t_day, storm_i, flash)
 
@@ -1756,6 +1914,7 @@ def main():
         draw_terrain(terrain_tex, snow_ground_tex, s_car, t_time, amb)
         draw_city(s_car, building_lists, facade_tex, emission_tex, amb, night_a)
         draw_forest(s_car, tree_lists, frost_tree_lists, amb)
+        draw_ponds(pond_tex, s_car, storm_i, horizon, amb, t_time)
         draw_road(road_tex, s_car, amb)
         draw_snow_shoulders(snow_ground_tex, s_car, amb)
         draw_lamps(s_car, night_a)
