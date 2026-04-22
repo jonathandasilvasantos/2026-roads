@@ -32,7 +32,7 @@ N_LAMPS = 40
 # --- Terrain ---
 K_BANDS = 14
 D_STEP = 6.0
-TERRAIN_EDGE_D = 0.1
+TERRAIN_EDGE_D = 0.0   # terrain begins flush with road edge — no seam
 
 # --- Biomes ---
 ZONE_LEN = 280.0
@@ -1654,26 +1654,37 @@ def build_building_variant(seed):
     list_id = glGenLists(1)
     glNewList(list_id, GL_COMPILE)
     glBegin(GL_QUADS)
-    # -Z face (front)
+    # -Z face (front) — outward normal -Z
+    glNormal3f(0.0, 0.0, -1.0)
     glTexCoord2f(0, 0); glVertex3f(-w / 2, 0, -d / 2)
     glTexCoord2f(u_front, 0); glVertex3f(w / 2, 0, -d / 2)
     glTexCoord2f(u_front, v_up); glVertex3f(w / 2, h, -d / 2)
     glTexCoord2f(0, v_up); glVertex3f(-w / 2, h, -d / 2)
-    # +Z face (back)
+    # +Z face (back) — outward normal +Z
+    glNormal3f(0.0, 0.0, 1.0)
     glTexCoord2f(0, 0); glVertex3f(w / 2, 0, d / 2)
     glTexCoord2f(u_front, 0); glVertex3f(-w / 2, 0, d / 2)
     glTexCoord2f(u_front, v_up); glVertex3f(-w / 2, h, d / 2)
     glTexCoord2f(0, v_up); glVertex3f(w / 2, h, d / 2)
-    # -X face (left)
+    # -X face (left) — outward normal -X
+    glNormal3f(-1.0, 0.0, 0.0)
     glTexCoord2f(0, 0); glVertex3f(-w / 2, 0, d / 2)
     glTexCoord2f(u_side, 0); glVertex3f(-w / 2, 0, -d / 2)
     glTexCoord2f(u_side, v_up); glVertex3f(-w / 2, h, -d / 2)
     glTexCoord2f(0, v_up); glVertex3f(-w / 2, h, d / 2)
-    # +X face (right)
+    # +X face (right) — outward normal +X
+    glNormal3f(1.0, 0.0, 0.0)
     glTexCoord2f(0, 0); glVertex3f(w / 2, 0, -d / 2)
     glTexCoord2f(u_side, 0); glVertex3f(w / 2, 0, d / 2)
     glTexCoord2f(u_side, v_up); glVertex3f(w / 2, h, d / 2)
     glTexCoord2f(0, v_up); glVertex3f(w / 2, h, -d / 2)
+    # +Y face (roof) — dark flat cap so the building reads as solid from
+    # above; UVs point at a single neutral texel so no windows appear.
+    glNormal3f(0.0, 1.0, 0.0)
+    glTexCoord2f(0.02, 0.02); glVertex3f(-w / 2, h, -d / 2)
+    glTexCoord2f(0.03, 0.02); glVertex3f(w / 2, h, -d / 2)
+    glTexCoord2f(0.03, 0.03); glVertex3f(w / 2, h, d / 2)
+    glTexCoord2f(0.02, 0.03); glVertex3f(-w / 2, h, d / 2)
     glEnd()
     glEndList()
     return list_id, (w, h, d)
@@ -1726,10 +1737,28 @@ def draw_city(s_car, building_lists, facade_tex, emission_tex,
     glEnable(GL_TEXTURE_2D)
     glBindTexture(GL_TEXTURE_2D, facade_tex)
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
-    # day tint — a bit darker than ambient so buildings read as shaded
+
+    # Enable fixed-function lighting for the facade pass so each face
+    # picks up different brightness from the baked normals. Without this
+    # all four walls shade identically and buildings look flat/paper-like.
     tint = (min(1.0, amb_rgb[0] * 0.85),
             min(1.0, amb_rgb[1] * 0.85),
             min(1.0, amb_rgb[2] * 0.90))
+    glEnable(GL_LIGHTING)
+    glEnable(GL_LIGHT0)
+    glEnable(GL_COLOR_MATERIAL)
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+    # Directional key light (w=0). Fixed upper-right-front direction so
+    # face shading stays consistent regardless of camera and time of day —
+    # the sun drives scene ambient tint separately.
+    glLightfv(GL_LIGHT0, GL_POSITION, (0.6, 1.0, 0.45, 0.0))
+    # Ambient ~55% of tint so shadowed sides aren't black; diffuse drives
+    # face-to-face contrast.
+    glLightfv(GL_LIGHT0, GL_AMBIENT,
+              (tint[0] * 0.60, tint[1] * 0.60, tint[2] * 0.62, 1.0))
+    glLightfv(GL_LIGHT0, GL_DIFFUSE,
+              (tint[0] * 0.70, tint[1] * 0.70, tint[2] * 0.72, 1.0))
+    glLightfv(GL_LIGHT0, GL_SPECULAR, (0.0, 0.0, 0.0, 1.0))
     glColor3f(*tint)
 
     for s, side, key, tx, ty, tz, yaw, variant in slots:
@@ -1739,6 +1768,9 @@ def draw_city(s_car, building_lists, facade_tex, emission_tex,
         glRotatef(yaw, 0, 1, 0)
         glCallList(list_id)
         glPopMatrix()
+
+    glDisable(GL_LIGHTING)
+    glDisable(GL_COLOR_MATERIAL)
 
     if night_a < 0.03:
         return
@@ -1787,10 +1819,13 @@ def main():
     glMatrixMode(GL_MODELVIEW)
 
     glEnable(GL_FOG)
-    glFogi(GL_FOG_MODE, GL_EXP2)
-    # Lighter fog so distant mountains and terrain fade in gradually over
-    # several hundred metres instead of popping at the edge of the mesh.
-    glFogf(GL_FOG_DENSITY, 0.0032)
+    # GL_LINEAR fog gives smooth aerial-perspective fade across a specified
+    # range. Starts at 180m, fully opaque at 920m — mountains 800m away are
+    # barely-visible silhouettes that gradually resolve as you approach,
+    # instead of popping at the mesh edge.
+    glFogi(GL_FOG_MODE, GL_LINEAR)
+    glFogf(GL_FOG_START, 180.0)
+    glFogf(GL_FOG_END, 920.0)
 
     road_tex = upload_texture(make_road_texture())
     terrain_tex = upload_texture(make_terrain_texture())
@@ -1856,7 +1891,7 @@ def main():
         # ~30 seconds rather than whatever the sine product happens to do —
         # looks like weather building gradually, not flicking on and off.
         storm_raw = storm_intensity_at(t_time)
-        storm_tau = 30.0
+        storm_tau = 60.0   # weather blends over ~1 min
         storm_smoothed += (storm_raw - storm_smoothed) * min(1.0, dt / storm_tau)
         storm_i = storm_smoothed
         if active_bolt is not None:
@@ -1890,8 +1925,10 @@ def main():
         # frost_intensity_at returns the smoothstep-blended biome weight so
         # density eases in/out at zone transitions rather than snapping.
         frost_i = frost_intensity_at(s_car)
-        # +10% fog in frost, +30% more in heavy storm (rain reduces visibility)
-        glFogf(GL_FOG_DENSITY, 0.0032 * (1.0 + 0.10 * frost_i + 0.30 * storm_i))
+        # Frost biome and heavy storm both reduce visibility: shrink the
+        # fog-end distance so the linear fog ramp terminates sooner.
+        vis_end = 920.0 / (1.0 + 0.10 * frost_i + 0.30 * storm_i)
+        glFogf(GL_FOG_END, vis_end)
         glClearColor(horizon[0], horizon[1], horizon[2], 1.0)
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -1951,9 +1988,11 @@ def main():
         update_snow(snow_state, dt, t_time)
         draw_snow(snow_state, snowflake_tex, wL_frost, wR_frost, cx, cy, cz)
 
-        # rain: everywhere a storm is active. Fades with storm intensity.
+        # rain: storm active AND not in a frost biome (otherwise it's snow
+        # falling from the sibling snow system — don't draw both at once).
         update_rain(rain_state, dt)
-        draw_rain(rain_state, storm_i, cx, cy, cz)
+        rain_i = storm_i * (1.0 - frost_i)
+        draw_rain(rain_state, rain_i, cx, cy, cz)
 
         # lightning bolt (if one is currently active)
         draw_bolt(active_bolt, bolt_age)
