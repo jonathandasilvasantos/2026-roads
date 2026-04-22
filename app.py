@@ -3,7 +3,8 @@ import sys
 import numpy as np
 import pygame
 from pygame.locals import (
-    DOUBLEBUF, OPENGL, FULLSCREEN, QUIT, KEYDOWN, K_ESCAPE, K_UP, K_DOWN,
+    DOUBLEBUF, OPENGL, FULLSCREEN, QUIT, KEYDOWN, K_ESCAPE,
+    K_UP, K_DOWN, K_LEFT, K_RIGHT, K_SPACE,
 )
 import random
 import os
@@ -41,18 +42,48 @@ except Exception:
     )
 
 # pyfluidsynth on Windows calls `os.add_dll_directory(r'C:\tools\fluidsynth\bin')`
-# at module import time — that's the Chocolatey default install path for
-# fluidsynth. If you didn't install via Chocolatey the directory doesn't
-# exist and the import raises FileNotFoundError (WinError 3). Pre-create
-# the directory (empty is fine) so the import always succeeds; pyfluidsynth
-# then falls back to the system DLL loader for the actual library. If
-# fluidsynth itself isn't installed, Synth() later raises and the piano
-# is silently disabled, but the rest of the app still runs.
+# at module import time. That's the Chocolatey install path, which the
+# binding hard-codes even if the user installed fluidsynth by another
+# means (MSYS2, the official Windows installer, manual DLL drop). If the
+# hard-coded directory doesn't exist the import raises FileNotFoundError
+# (WinError 3) before our try/except can even engage, crashing the app.
+#
+# Fix: pre-create that directory (empty is fine) so the import always
+# succeeds, AND proactively add every common fluidsynth install location
+# to the DLL search path so the actual library can be found regardless
+# of which installer the user used.
 if sys.platform == "win32":
+    _WIN_FS_DLL_LOCATIONS = [
+        r"C:\tools\fluidsynth\bin",                      # Chocolatey
+        r"C:\Program Files\fluidsynth\bin",              # official installer
+        r"C:\Program Files (x86)\fluidsynth\bin",
+        r"C:\msys64\mingw64\bin",                        # MSYS2 mingw64
+        r"C:\msys64\ucrt64\bin",                         # MSYS2 ucrt64
+        os.path.expanduser(r"~\scoop\apps\fluidsynth\current\bin"),  # Scoop
+    ]
     try:
         os.makedirs(r"C:\tools\fluidsynth\bin", exist_ok=True)
     except Exception:
         pass
+    for _dll_dir in _WIN_FS_DLL_LOCATIONS:
+        if os.path.isdir(_dll_dir):
+            try:
+                os.add_dll_directory(_dll_dir)
+            except Exception:
+                pass
+
+
+def _fluidsynth_drivers_for_platform():
+    """Preference-ordered list of fluidsynth audio driver names for the
+    current OS. fluidsynth auto-selects a reasonable default when given
+    an empty/unknown name, so we try known-good drivers in order and
+    fall through to the library default if none work."""
+    if sys.platform == "win32":
+        return ("dsound", "wasapi", "waveout", "portaudio", "sdl2")
+    if sys.platform == "darwin":
+        return ("coreaudio", "portaudio", "sdl2")
+    # Linux / BSD / others
+    return ("pulseaudio", "alsa", "jack", "portaudio", "sdl2")
 
 try:
     import fluidsynth as _fluidsynth
@@ -111,6 +142,13 @@ SPEED = 28.0           # default cruise speed (m/s); Up/Down adjust live
 SPEED_ACCEL = 24.0     # m/s² applied while Up/Down is held
 SPEED_MIN = 0.0
 SPEED_MAX = 90.0
+
+# Camera yaw: Left/Right rotate the view around the vertical axis while
+# the car position and height stay the same. Limited to 180° total
+# (±90° each side) so the player can never look backward — the driving
+# view stays readable. Space re-centers to looking straight ahead.
+CAMERA_YAW_RATE = 70.0   # degrees per second while Left/Right held
+CAMERA_YAW_LIMIT = 90.0  # ±90° -> 180° total rotation range
 CAM_HEIGHT = 3.4
 CAM_BACK = 5.0
 LOOK_AHEAD = 20.0
@@ -827,10 +865,50 @@ class MinimalEnsemblePlayer:
     def __init__(self, sf2_path=SOUNDFONT_PATH, gain=0.32):
         self.beat_sec = 60.0 / self.BPM
         self.fs = _fluidsynth.Synth(samplerate=44100, gain=gain)
-        try:
-            self.fs.start(driver="coreaudio")
-        except Exception:
-            self.fs.start()
+
+        # Clear device settings that some builds seed with the literal
+        # "default" (a string that isn't a real device on Windows, giving
+        # the 'Device "default" does not exist' error). An empty value
+        # tells the platform driver to use the OS's actual default.
+        for _setting_key in (
+            "audio.dsound.device", "audio.wasapi.device",
+            "audio.waveout.device", "audio.coreaudio.device",
+            "audio.pulseaudio.device", "audio.alsa.device",
+        ):
+            try:
+                self.fs.setting(_setting_key, "")
+            except Exception:
+                pass
+        # We never read MIDI input (we inject notes via API). Tell
+        # fluidsynth not to try — avoids the "not enough MIDI in devices"
+        # error on systems with no MIDI hardware.
+        for _setting_key in ("midi.autoconnect",):
+            try:
+                self.fs.setting(_setting_key, 0)
+            except Exception:
+                pass
+
+        # Try platform-appropriate audio drivers in order until one works.
+        _started = False
+        _last_err = None
+        for _drv in _fluidsynth_drivers_for_platform():
+            try:
+                self.fs.start(driver=_drv)
+                _started = True
+                break
+            except Exception as _err:
+                _last_err = _err
+                continue
+        if not _started:
+            # Absolute fallback: let fluidsynth pick its compiled default
+            try:
+                self.fs.start()
+            except Exception as _err:
+                raise RuntimeError(
+                    f"fluidsynth could not open any audio driver. "
+                    f"Last error: {_last_err or _err}"
+                )
+
         sfid = self.fs.sfload(sf2_path)
         if sfid == -1:
             raise RuntimeError(f"failed to load SoundFont at {sf2_path}")
@@ -1499,8 +1577,14 @@ def draw_bolt(bolt, age):
 
 # --- Textures ---
 def make_road_texture(size=512):
+    """Procedural asphalt with realistic imperfections: base noise, oil
+    stains, random-walk cracks, and edge dirt smudges. Lane markings are
+    drawn last so imperfections never contaminate the stripes. Sides are
+    masked so cracks stay on the drivable lane."""
     rng = np.random.default_rng(7)
     base = rng.integers(72, 108, (size, size)).astype(np.uint8)
+
+    # 1. Coarse asphalt variation (granular/aggregate look)
     for _ in range(240):
         cy, cx = rng.integers(0, size, 2)
         r = rng.integers(4, 18)
@@ -1510,7 +1594,74 @@ def make_road_texture(size=512):
         base[y0:y1, x0:x1] = np.clip(
             base[y0:y1, x0:x1].astype(int) + shade, 55, 130
         ).astype(np.uint8)
-    tex = np.stack([base, base, base], axis=-1)
+
+    tex = np.stack([base, base, base], axis=-1).astype(np.int16)
+
+    # 2. Oil stains — sparse dark elliptical patches
+    ys_m, xs_m = np.mgrid[0:size, 0:size].astype(np.float32)
+    for _ in range(5):
+        cy = float(rng.integers(60, size - 60))
+        cx = float(rng.integers(60, size - 60))
+        rx = float(rng.integers(10, 22))
+        ry = float(rng.integers(22, 55))
+        angle = float(rng.uniform(0.0, math.pi))
+        cosA, sinA = math.cos(angle), math.sin(angle)
+        dx = xs_m - cx
+        dy = ys_m - cy
+        xr = dx * cosA + dy * sinA
+        yr = -dx * sinA + dy * cosA
+        d = (xr / rx) ** 2 + (yr / ry) ** 2
+        m = np.clip(1.0 - d, 0.0, 1.0) ** 1.4
+        dark = (m * 34).astype(np.int16)
+        tex[..., 0] -= dark
+        tex[..., 1] -= dark
+        tex[..., 2] -= (dark * 1.1).astype(np.int16)
+
+    # 3. Cracks — small random walks, stay off the stripes/center line.
+    # Side stripe is at x ∈ [10, 20] and [size-20, size-10]; center line
+    # at x ∈ [size/2-6, size/2+6]. We mask those zones when stamping.
+    center_lo, center_hi = size // 2 - 8, size // 2 + 8
+    for _ in range(90):
+        x = float(rng.integers(30, size - 30))
+        y = float(rng.integers(0, size))
+        dx = float(rng.uniform(-1.0, 1.0))
+        dy = float(rng.uniform(-1.0, 1.0))
+        n = math.hypot(dx, dy) + 1e-9
+        dx /= n; dy /= n
+        length = int(rng.integers(14, 55))
+        darkness = int(rng.integers(25, 45))
+        for _ in range(length):
+            xi = int(x) % size
+            yi = int(y) % size
+            if (20 < xi < size - 20) and not (center_lo <= xi < center_hi):
+                tex[yi, xi, 0] = max(15, tex[yi, xi, 0] - darkness)
+                tex[yi, xi, 1] = max(15, tex[yi, xi, 1] - darkness)
+                tex[yi, xi, 2] = max(15, tex[yi, xi, 2] - darkness)
+            # wander slightly
+            dx += float(rng.uniform(-0.25, 0.25))
+            dy += float(rng.uniform(-0.25, 0.25))
+            n = math.hypot(dx, dy) + 1e-9
+            dx /= n; dy /= n
+            x += dx
+            y += dy
+
+    # 4. Edge dirt — brownish smudges tires carry inward from shoulders
+    for _ in range(40):
+        cy = int(rng.integers(0, size))
+        if rng.random() < 0.5:
+            cx = int(rng.integers(22, 80))
+        else:
+            cx = int(rng.integers(size - 80, size - 22))
+        r = int(rng.integers(4, 11))
+        y0, y1 = max(0, cy - r), min(size, cy + r)
+        x0, x1 = max(0, cx - r), min(size, cx + r)
+        tex[y0:y1, x0:x1, 0] += 4    # warmer
+        tex[y0:y1, x0:x1, 1] -= 3
+        tex[y0:y1, x0:x1, 2] -= 8    # less blue → brownish
+
+    tex = np.clip(tex, 0, 255).astype(np.uint8)
+
+    # 5. Lane markings painted LAST so cracks/dirt don't contaminate them
     tex[:, 10:20] = 225
     tex[:, size - 20:size - 10] = 225
     dash = size // 10
@@ -2147,10 +2298,17 @@ def _draw_tunnels(s_arr, tunnel_w, base_col, s_car):
     _emit_strip_segments(s_arr, tunnel_w, 0.30, emit_ceil)
 
 
-def draw_road(tex_id, s_car, amb_rgb):
+def draw_road(tex_id, s_car, amb_rgb, storm_i=0.0):
+    # Wet asphalt reads darker (higher absorption, lower diffuse),
+    # which naturally dampens the visibility of cracks and dirt when
+    # it's raining — same optical reason real wet asphalt looks uniform.
+    wet = 1.0 - 0.18 * storm_i
+    r = min(1.0, amb_rgb[0] * wet)
+    g = min(1.0, amb_rgb[1] * wet)
+    b = min(1.0, amb_rgb[2] * (wet + 0.02))  # slight blue wet tint
     glEnable(GL_TEXTURE_2D)
     glBindTexture(GL_TEXTURE_2D, tex_id)
-    glColor3f(min(1.0, amb_rgb[0]), min(1.0, amb_rgb[1]), min(1.0, amb_rgb[2]))
+    glColor3f(r, g, b)
     glBegin(GL_QUAD_STRIP)
     for i in range(N_SEG + 1):
         s = s_car + i * SEG_LEN
@@ -2162,6 +2320,53 @@ def draw_road(tex_id, s_car, amb_rgb):
         glTexCoord2f(1.0, v); glVertex3f(x + ROAD_WIDTH / 2, y + 0.03, z)
     glEnd()
     glDisable(GL_TEXTURE_2D)
+
+
+def draw_road_snow_overlay(snow_tex, s_car, amb_rgb):
+    """Progressive snow accumulation on the pavement. Per-vertex alpha at
+    each s equals max(wL_frost, wR_frost) so snow fades in smoothly as
+    the road enters a frost biome and fades back out when it leaves —
+    matches the biome smoothstep transitions without any extra state.
+
+    Tint is slightly darker than fresh snow (road snow is slushy / tire-
+    trafficked, not pristine field snow)."""
+    NS = N_SEG + 1
+    s_arr = np.arange(NS, dtype=np.float32) * SEG_LEN + s_car
+    frost_w = np.maximum(
+        biome_weights_vec(s_arr, -1)[:, BIOME_FROST],
+        biome_weights_vec(s_arr, +1)[:, BIOME_FROST],
+    )
+    if frost_w.max() < 0.02:
+        return
+
+    # Slushy/dirty road-snow tint
+    tint = (amb_rgb[0] * 0.86, amb_rgb[1] * 0.88, amb_rgb[2] * 0.92)
+
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, snow_tex)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glDepthMask(GL_FALSE)
+    glEnable(GL_POLYGON_OFFSET_FILL)
+    glPolygonOffset(-1.4, -1.4)  # sit just above the asphalt
+
+    glBegin(GL_QUAD_STRIP)
+    for i in range(NS):
+        s = float(s_arr[i])
+        x = curve_x(s)
+        y = curve_y(s)
+        z = -(s - s_car)
+        alpha = float(min(1.0, frost_w[i] * 0.95))
+        glColor4f(tint[0], tint[1], tint[2], alpha)
+        v = s * 0.18
+        glTexCoord2f(0.0, v); glVertex3f(x - ROAD_WIDTH / 2, y + 0.04, z)
+        glTexCoord2f(0.45, v); glVertex3f(x + ROAD_WIDTH / 2, y + 0.04, z)
+    glEnd()
+
+    glDisable(GL_POLYGON_OFFSET_FILL)
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
 
 
 def draw_lamps(s_car, night_a):
@@ -3031,17 +3236,22 @@ def main():
     # start near dawn so first sight is pretty
     t_day = 0.18
     speed = SPEED
+    camera_yaw = 0.0    # degrees; + rotates view right, - rotates left
     running = True
     while running:
         dt = clock.tick(60) / 1000.0
         for e in pygame.event.get():
             if e.type == QUIT:
                 running = False
-            elif e.type == KEYDOWN and e.key == K_ESCAPE:
-                running = False
+            elif e.type == KEYDOWN:
+                if e.key == K_ESCAPE:
+                    running = False
+                elif e.key == K_SPACE:
+                    # Re-center the camera. Snap back to forward view.
+                    camera_yaw = 0.0
 
-        # Up/Down: live accel/decel. Held-key polling so the speed change is
-        # smooth and proportional to how long the key is held.
+        # Up/Down + Left/Right: held-key polling so changes feel
+        # proportional to how long the key is held.
         keys = pygame.key.get_pressed()
         if keys[K_UP]:
             speed += SPEED_ACCEL * dt
@@ -3051,6 +3261,14 @@ def main():
             speed = SPEED_MIN
         elif speed > SPEED_MAX:
             speed = SPEED_MAX
+        if keys[K_LEFT]:
+            camera_yaw -= CAMERA_YAW_RATE * dt
+        if keys[K_RIGHT]:
+            camera_yaw += CAMERA_YAW_RATE * dt
+        if camera_yaw < -CAMERA_YAW_LIMIT:
+            camera_yaw = -CAMERA_YAW_LIMIT
+        elif camera_yaw > CAMERA_YAW_LIMIT:
+            camera_yaw = CAMERA_YAW_LIMIT
 
         s_car += speed * dt
         t_time += dt
@@ -3118,6 +3336,22 @@ def main():
         lx = curve_x(s_look)
         ly = curve_y(s_look) + 0.8
         lz = -(s_look - s_car)
+
+        # Apply Left/Right camera yaw: rotate the look-vector around the
+        # world Y axis pinned at the camera. Positive yaw turns right
+        # (look drifts toward +X), negative yaw turns left. Pitch (look
+        # y) is preserved, so the camera only pivots horizontally.
+        if camera_yaw != 0.0:
+            yaw_r = math.radians(camera_yaw)
+            cos_y = math.cos(yaw_r)
+            sin_y = math.sin(yaw_r)
+            fx = lx - cx
+            fz = lz - cz
+            rx = fx * cos_y - fz * sin_y
+            rz = fx * sin_y + fz * cos_y
+            lx = cx + rx
+            lz = cz + rz
+
         gluLookAt(cx, cy, cz, lx, ly, lz, 0.0, 1.0, 0.0)
 
         # Try to trigger a new bolt now that we have the camera position.
@@ -3198,8 +3432,15 @@ def main():
         )
         draw_forest(s_car, tree_lists, frost_tree_lists, amb,
                     t_time, wind_strength)
+        # Road pavement with subtle wet darkening during rain, then the
+        # snow overlay pass that fades in/out with frost biome transitions.
+        draw_road(road_tex, s_car, amb, storm_i)
+        draw_road_snow_overlay(snow_ground_tex, s_car, amb)
+        # Ponds draw *after* the road so any puddle sits on top of the
+        # pavement (including its imperfections and snow overlay). This
+        # is the reason cracks / dirt never show through a puddle — the
+        # puddle's alpha composite is the last paint.
         draw_ponds(pond_tex, s_car, storm_i, horizon, amb, t_time)
-        draw_road(road_tex, s_car, amb)
         # Bridges + tunnels: placed where biomes dictate (river / mountain)
         # so they never collide with trees, buildings, or other structures.
         # Concrete tint reacts to storm (wet darkening) and frost (snow cap).

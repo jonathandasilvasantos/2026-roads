@@ -162,7 +162,14 @@ tree, so the forest is stable across frames without any storage.
 
 ## Controls
 
-- **Esc** — quit.
+| Key | Action |
+| --- | --- |
+| **Up** | accelerate |
+| **Down** | decelerate / brake |
+| **Left** | rotate camera left (up to −90°) |
+| **Right** | rotate camera right (up to +90°) |
+| **Space** | re-center the camera to the forward view |
+| **Esc** | quit |
 
 ## Status
 
