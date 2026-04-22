@@ -608,11 +608,18 @@ class AmbientAudioMixer:
         return np.concatenate([head, buf[:rem]])
 
     def _callback(self, outdata, frames, time_info, status):
-        alpha = 0.035
-        self.speed_current += (self.speed_target - self.speed_current) * alpha
-        self.brown_vol += (self.brown_vol_target - self.brown_vol) * alpha
-        self.rain_vol += (self.rain_vol_target - self.rain_vol) * alpha
-        self.wind_vol += (self.wind_vol_target - self.wind_vol) * alpha
+        # Two smoothing rates:
+        #   fast (α ≈ 0.035, τ ≈ 0.7 s) for brown-noise speed + volume
+        #     so the engine rumble responds snappily to Up/Down presses
+        #   slow (α ≈ 0.010, τ ≈ 2.5 s) for rain and wind so weather
+        #     fades in and out gradually, matching real atmospheric
+        #     transitions rather than snapping on/off
+        a_fast = 0.035
+        a_slow = 0.010
+        self.speed_current += (self.speed_target - self.speed_current) * a_fast
+        self.brown_vol += (self.brown_vol_target - self.brown_vol) * a_fast
+        self.rain_vol += (self.rain_vol_target - self.rain_vol) * a_slow
+        self.wind_vol += (self.wind_vol_target - self.wind_vol) * a_slow
 
         # brown noise with variable speed + linear interpolation
         sp = self.speed_current
@@ -675,16 +682,31 @@ BrownNoisePlayer = AmbientAudioMixer
 # Piano KW SoundFont. The synth runs its own real-time audio thread via
 # CoreAudio; the scheduler thread just issues noteon/noteoff events.
 
-SOUNDFONT_PATH = "soundfonts/UprightPianoKW.sf2"
+SOUNDFONT_PATH = "soundfonts/GeneralUser-GS.sf2"
 
 
-class MinimalPianoPlayer:
-    """Two-voice procedural minimalist piano over a slow chord cycle with
-    a sustained bass pedal underneath. Voice 2 follows Fux first-species
-    counterpoint rules: consonant interval with voice 1, preference for
-    contrary motion. Each note is additionally shadowed by 2 quieter
-    echo notes 400 / 850 ms later for an atmospheric delay feel, and
-    FluidSynth is configured with a long reverb tail.
+class MinimalEnsemblePlayer:
+    """Minimalist ensemble: Rhodes electric piano for the melody voice,
+    strings ensemble for counterpoint and bass pedal.
+
+    Upgrades over the previous piano-only version:
+
+    * Two timbres from GeneralUser GS (SoundFont bank 0, programs 4 +
+      48). Rhodes carries the sparse foreground; strings provide the
+      sustained atmospheric pad.
+    * String notes are always shaped by a **CC 11 expression envelope**
+      (0 → target over ~1.5s attack, hold, target → 0 over ~2s release)
+      so the strings *never* hard-clip on attack or release regardless
+      of the SoundFont's own envelope. Rendered as a discretised ramp
+      of MIDI CC events fired by threading.Timer.
+    * Melody uses **motif development** (a short scale-degree gesture
+      generated at startup and transposed / varied through the piece,
+      Reich-style) in addition to Markov-style chord-conditioned walks.
+    * Two-voice counterpoint still follows Fux first-species rules:
+      consonant intervals with the melody, contrary-motion preference.
+    * Bass pedal holds the chord root on strings for the full 8-beat
+      chord with a very long attack and release so chord changes blend
+      seamlessly rather than cross-fade with an audible edge.
     """
 
     # A-minor natural scale (A B C D E F G) across ~3 octaves. Voices
@@ -711,10 +733,25 @@ class MinimalPianoPlayer:
     BPM = 40.0
     BEATS_PER_CHORD = 8
 
-    # Echo delays (seconds) and relative velocity each echo plays at.
+    # GeneralUser GS — programs + channels
+    PROG_RHODES = 4           # Electric Piano 1 ("Tine" Rhodes)
+    PROG_STRINGS = 48         # String Ensemble 1
+    CH_MELODY = 0             # Rhodes
+    CH_CP = 1                 # Strings — counterpoint
+    CH_BASS = 2               # Strings — bass pedal
+
+    # Rhodes echo delays (seconds) and relative velocity each echo plays at
     ECHOES = ((0.40, 0.55), (0.85, 0.28))
 
-    def __init__(self, sf2_path=SOUNDFONT_PATH, gain=0.35):
+    # String expression envelope
+    STR_EXPR_MAX = 108        # CC 11 target value at the top of the swell
+    STR_RAMP_STEPS = 16       # discretisation of attack / release
+    STR_ATTACK_DEFAULT = 1.5  # seconds — attack ramp for counterpoint
+    STR_RELEASE_DEFAULT = 2.0 # seconds — release ramp for counterpoint
+    STR_BASS_ATTACK = 2.5     # longer, very gentle attack for bass pad
+    STR_BASS_RELEASE = 3.0
+
+    def __init__(self, sf2_path=SOUNDFONT_PATH, gain=0.32):
         self.beat_sec = 60.0 / self.BPM
         self.fs = _fluidsynth.Synth(samplerate=44100, gain=gain)
         try:
@@ -724,19 +761,24 @@ class MinimalPianoPlayer:
         sfid = self.fs.sfload(sf2_path)
         if sfid == -1:
             raise RuntimeError(f"failed to load SoundFont at {sf2_path}")
-        # Three voices share the same piano program
-        for ch in (0, 1, 2):
-            self.fs.program_select(ch, sfid, 0, 0)
+        # Rhodes on the melody channel, strings on CP + bass
+        self.fs.program_select(self.CH_MELODY, sfid, 0, self.PROG_RHODES)
+        self.fs.program_select(self.CH_CP, sfid, 0, self.PROG_STRINGS)
+        self.fs.program_select(self.CH_BASS, sfid, 0, self.PROG_STRINGS)
 
-        # Crank up the reverb to give a long atmospheric tail. Room size
-        # near 1.0, moderate damping, full width, high wet level.
+        # Long atmospheric reverb tail
         try:
             self.fs.set_reverb(roomsize=0.92, damping=0.35,
                                width=0.9, level=0.95)
         except Exception:
-            pass  # older pyfluidsynth versions — reverb stays at default
+            pass
 
         self.rng = random.Random(2024)
+        # Reich-style motif: 4-5 scale-degree steps that get transposed
+        # and rotated through the piece for thematic continuity.
+        self.motif = self._make_motif()
+        self.motif_pos = 0
+        self.motif_cycles = 0
         self.stop_event = threading.Event()
         self.thread = None
 
@@ -749,41 +791,14 @@ class MinimalPianoPlayer:
         if self.thread is not None:
             self.thread.join(timeout=2.0)
         try:
-            for ch in (0, 1, 2):
+            for ch in (self.CH_MELODY, self.CH_CP, self.CH_BASS):
                 self.fs.all_notes_off(ch)
+                self._safe_cc(ch, 11, 0)
             self.fs.delete()
         except Exception:
             pass
 
-    # ----- note + echo firing ---------------------------------------
-    def _fire_note(self, channel, pitch, velocity, hold_sec, echo_scale=1.0):
-        """Play a note with scheduled noteoff and 2 atmospheric echoes."""
-        if self.stop_event.is_set() or pitch < 21 or pitch > 108:
-            return
-        try:
-            self.fs.noteon(channel, pitch, velocity)
-        except Exception:
-            return
-        threading.Timer(hold_sec,
-                        self._safe_noteoff, args=(channel, pitch)).start()
-        for delay, vel_factor in self.ECHOES:
-            echo_vel = max(8, int(velocity * vel_factor * echo_scale))
-            threading.Timer(
-                delay,
-                self._echo_fire,
-                args=(channel, pitch, echo_vel, hold_sec),
-            ).start()
-
-    def _echo_fire(self, channel, pitch, velocity, hold_sec):
-        if self.stop_event.is_set():
-            return
-        try:
-            self.fs.noteon(channel, pitch, velocity)
-        except Exception:
-            return
-        threading.Timer(hold_sec,
-                        self._safe_noteoff, args=(channel, pitch)).start()
-
+    # ----- low-level MIDI helpers -----------------------------------
     def _safe_noteoff(self, channel, pitch):
         if self.stop_event.is_set():
             return
@@ -792,14 +807,152 @@ class MinimalPianoPlayer:
         except Exception:
             pass
 
+    def _safe_cc(self, channel, cc_num, value):
+        if self.stop_event.is_set():
+            return
+        try:
+            self.fs.cc(channel, cc_num, int(max(0, min(127, value))))
+        except Exception:
+            pass
+
+    # ----- Rhodes melody (with echoes) ------------------------------
+    def _fire_rhodes(self, pitch, velocity, hold_sec):
+        if self.stop_event.is_set() or pitch < 21 or pitch > 108:
+            return
+        try:
+            self.fs.noteon(self.CH_MELODY, pitch, velocity)
+        except Exception:
+            return
+        threading.Timer(hold_sec, self._safe_noteoff,
+                        args=(self.CH_MELODY, pitch)).start()
+        for delay, vel_factor in self.ECHOES:
+            echo_vel = max(8, int(velocity * vel_factor))
+            threading.Timer(delay, self._echo_rhodes,
+                            args=(pitch, echo_vel, hold_sec)).start()
+
+    def _echo_rhodes(self, pitch, velocity, hold_sec):
+        if self.stop_event.is_set():
+            return
+        try:
+            self.fs.noteon(self.CH_MELODY, pitch, velocity)
+        except Exception:
+            return
+        threading.Timer(hold_sec, self._safe_noteoff,
+                        args=(self.CH_MELODY, pitch)).start()
+
+    # ----- Strings with smooth envelope (no hard-clip attack) -------
+    def _fire_strings(self, channel, pitch, velocity,
+                      sustain_sec, attack_sec=None, release_sec=None):
+        """Strings swell: CC 11 ramps 0→target over attack_sec, holds
+        through sustain, then ramps back to 0 over release_sec. noteon
+        is issued before the ramp (so the SF2 sample starts with its
+        real attack transient, but CC 11 scales it to zero, masking the
+        hard transient); noteoff is scheduled once the whole envelope
+        has completed.
+        """
+        if self.stop_event.is_set() or pitch < 21 or pitch > 108:
+            return
+        if attack_sec is None:
+            attack_sec = self.STR_ATTACK_DEFAULT
+        if release_sec is None:
+            release_sec = self.STR_RELEASE_DEFAULT
+        target = self.STR_EXPR_MAX
+        steps = self.STR_RAMP_STEPS
+
+        # Start at silent expression, fire noteon, then ramp up
+        self._safe_cc(channel, 11, 0)
+        try:
+            self.fs.noteon(channel, pitch, velocity)
+        except Exception:
+            return
+        # Attack ramp
+        for i in range(1, steps + 1):
+            t = i / steps
+            threading.Timer(
+                attack_sec * t, self._safe_cc,
+                args=(channel, 11, int(target * t)),
+            ).start()
+        # Release ramp — starts after attack + sustain
+        rel_start = attack_sec + sustain_sec
+        for i in range(1, steps + 1):
+            t = i / steps
+            threading.Timer(
+                rel_start + release_sec * t, self._safe_cc,
+                args=(channel, 11, int(target * (1.0 - t))),
+            ).start()
+        # noteoff after the entire envelope has finished
+        threading.Timer(
+            attack_sec + sustain_sec + release_sec + 0.15,
+            self._safe_noteoff, args=(channel, pitch),
+        ).start()
+
+    # ----- motif system ---------------------------------------------
+    def _make_motif(self):
+        """A short scale-degree gesture (3-5 steps) generated at start
+        and evolved throughout the piece — gives thematic continuity
+        (Reich-style motif development)."""
+        n = self.rng.choice([3, 4, 5])
+        steps = []
+        for _ in range(n):
+            # Mostly stepwise, occasional leap; rarely repeat
+            steps.append(self.rng.choice([-2, -1, -1, 1, 1, 2]))
+        return steps
+
+    def _evolve_motif(self):
+        """Every few chord cycles the motif evolves: transpose, reverse,
+        or regenerate. Keeps the piece thematically connected while
+        still moving forward (Reich/Glass-style development)."""
+        roll = self.rng.random()
+        if roll < 0.35:
+            # retrograde
+            self.motif = list(reversed(self.motif))
+        elif roll < 0.65:
+            # small transposition (shift by 1 scale step)
+            shift = self.rng.choice([-1, 1])
+            self.motif = [s + shift for s in self.motif]
+            # clamp individual steps so we don't snowball
+            self.motif = [max(-3, min(3, s)) for s in self.motif]
+        else:
+            # fresh motif
+            self.motif = self._make_motif()
+        self.motif_pos = 0
+
     # ----- voice selection ------------------------------------------
-    def _pick_voice1(self, chord_tones, last_pitch):
-        """Melody: 70% chord tones + 30% scale (passing notes), weighted
-        by proximity to the previous note so leaps are rare (classic
-        smooth voice leading)."""
+    def _pick_voice1_markov(self, chord_tones, last_pitch):
+        """Markov-style: 70% chord tones + 30% scale passing notes,
+        weighted toward proximity to the previous note."""
         pool = chord_tones if self.rng.random() < 0.70 else self.SCALE
         weights = [1.0 / (1.0 + abs(p - last_pitch) * 0.40) for p in pool]
         return self.rng.choices(pool, weights=weights, k=1)[0]
+
+    def _pick_voice1_motif(self, chord_tones, last_pitch):
+        """Advance by the current motif step through the scale, snapping
+        to a nearby chord tone when close."""
+        step = self.motif[self.motif_pos]
+        self.motif_pos = (self.motif_pos + 1) % len(self.motif)
+        if self.motif_pos == 0:
+            self.motif_cycles += 1
+            if self.motif_cycles >= 3:   # evolve every 3 cycles
+                self._evolve_motif()
+                self.motif_cycles = 0
+        # Find last_pitch's nearest position in the scale
+        scale = self.SCALE
+        idx = min(range(len(scale)),
+                  key=lambda i: abs(scale[i] - last_pitch))
+        new_idx = max(0, min(len(scale) - 1, idx + step))
+        cand = scale[new_idx]
+        # Snap to a chord tone if one is within a tone of the candidate
+        chord_near = min(chord_tones, key=lambda p: abs(p - cand))
+        if abs(chord_near - cand) <= 2:
+            return chord_near
+        return cand
+
+    def _pick_voice1(self, chord_tones, last_pitch):
+        """Blend motif + Markov: 60% motif, 40% Markov. Produces a line
+        that feels thematically coherent but never fully deterministic."""
+        if self.rng.random() < 0.60:
+            return self._pick_voice1_motif(chord_tones, last_pitch)
+        return self._pick_voice1_markov(chord_tones, last_pitch)
 
     def _pick_voice2(self, chord_tones, voice1_pitch, voice2_last,
                      voice1_motion):
@@ -843,52 +996,58 @@ class MinimalPianoPlayer:
         rng = self.rng
         wait = self.stop_event.wait
         bsec = self.beat_sec
-        active_bass = None  # (pitch, release_beat)
 
         while not self.stop_event.is_set():
             chord_idx = (beat // self.BEATS_PER_CHORD) % len(self.CHORDS)
             _name, chord_tones, bass_pitch = self.CHORDS[chord_idx]
             beat_in_chord = beat % self.BEATS_PER_CHORD
 
-            # Bass pedal: fire at chord boundaries, hold through the chord
+            # Bass pedal (strings): at chord start, fire a very smooth
+            # swell that holds through most of the chord and releases
+            # just before the next one. The 2.5s attack / 3s release
+            # means adjacent bass pedals crossfade softly.
             if beat_in_chord == 0:
-                if active_bass is not None:
-                    self._safe_noteoff(2, active_bass[0])
-                self._fire_note(2, bass_pitch, velocity=34,
-                                hold_sec=bsec * self.BEATS_PER_CHORD,
-                                echo_scale=0.55)
-                active_bass = (bass_pitch, beat + self.BEATS_PER_CHORD)
+                bass_sustain = bsec * (self.BEATS_PER_CHORD - 2) - \
+                               self.STR_BASS_ATTACK
+                if bass_sustain < 0.3:
+                    bass_sustain = 0.3
+                self._fire_strings(
+                    self.CH_BASS, bass_pitch, velocity=68,
+                    sustain_sec=bass_sustain,
+                    attack_sec=self.STR_BASS_ATTACK,
+                    release_sec=self.STR_BASS_RELEASE,
+                )
 
-            # Voice 1 (melody) — fires on ~55% of beats, softer than before
+            # Counterpoint (strings): fire at beats 0 and 4 of each chord
+            # with probability — gives a slow harmonic-support voice.
+            if beat_in_chord in (0, 4) and rng.random() < 0.70:
+                v2_pitch = self._pick_voice2(
+                    chord_tones, v1_last, v2_last, v1_motion,
+                )
+                if v2_pitch is not None:
+                    v2_last = v2_pitch
+                    self._fire_strings(
+                        self.CH_CP, v2_pitch, velocity=64,
+                        sustain_sec=bsec * 2.0,
+                        attack_sec=self.STR_ATTACK_DEFAULT,
+                        release_sec=self.STR_RELEASE_DEFAULT,
+                    )
+
+            # Melody (Rhodes): fires on ~55% of beats, driven by the
+            # motif+Markov blend. Rhodes keeps its natural envelope —
+            # that's what gives the piece its attack character.
             if rng.random() < 0.55:
                 v1_pitch = self._pick_voice1(chord_tones, v1_last)
                 v1_motion = (0 if v1_pitch == v1_last
                              else (1 if v1_pitch > v1_last else -1))
-                velocity = 40 + rng.randint(0, 20)
-                hold_beats = rng.choice([1, 2, 2, 3, 4])
-                self._fire_note(0, v1_pitch, velocity,
-                                hold_sec=bsec * hold_beats)
-
-                # Voice 2 (counterpoint) — fires on ~45% of the notes
-                # where voice 1 did. Fewer events than voice 1 so the
-                # two lines don't pulse in lock-step.
-                if rng.random() < 0.45:
-                    v2_pitch = self._pick_voice2(
-                        chord_tones, v1_pitch, v2_last, v1_motion,
-                    )
-                    if v2_pitch is not None:
-                        v2_last = v2_pitch
-                        v2_vel = 28 + rng.randint(0, 15)
-                        v2_hold_beats = rng.choice([2, 3, 4])
-                        self._fire_note(1, v2_pitch, v2_vel,
-                                        hold_sec=bsec * v2_hold_beats,
-                                        echo_scale=0.6)
-
+                velocity = 46 + rng.randint(0, 22)
+                hold_beats = rng.choice([1, 2, 2, 3])
+                self._fire_rhodes(v1_pitch, velocity,
+                                  hold_sec=bsec * hold_beats)
                 v1_last = v1_pitch
 
-            # Phrase breath: occasional extra silence at the seam
-            # between chords for the atmospheric feel.
-            if beat_in_chord == self.BEATS_PER_CHORD - 1 and rng.random() < 0.35:
+            # Phrase breath at chord boundaries
+            if beat_in_chord == self.BEATS_PER_CHORD - 1 and rng.random() < 0.30:
                 if wait(bsec * 1.5):
                     break
 
@@ -896,12 +1055,18 @@ class MinimalPianoPlayer:
                 break
             beat += 1
 
-        # Shutdown: release anything still held
-        for ch in (0, 1, 2):
+        # Shutdown: release anything still held and mute all channels
+        for ch in (self.CH_MELODY, self.CH_CP, self.CH_BASS):
             try:
                 self.fs.all_notes_off(ch)
+                self._safe_cc(ch, 11, 0)
             except Exception:
                 pass
+
+
+# Back-compat alias for the older name used before the Rhodes + strings
+# upgrade.
+MinimalPianoPlayer = MinimalEnsemblePlayer
 
 
 # --- Lens flare (sprite-based, canonical approach: sun→center ghost chain
@@ -2666,11 +2831,13 @@ def main():
             else:
                 time_to_strike = 1.0
 
-        # Weather-driven ambient mix: rain gates by storm × (1 - frost)
-        # so only actual rain zones hiss; wind grows with camera speed,
-        # with open biomes (plain / mountain / frost), and with storm.
+        # Weather-driven ambient mix. Volumes here are the *targets* —
+        # the mixer's callback low-passes them with a ~2.5 s time
+        # constant so rain and wind fade in and out gradually rather
+        # than snapping. Levels are ~50% of the previous scale so the
+        # weather sits under the music, not on top of it.
         if audio_player is not None:
-            rain_vol = storm_i * (1.0 - frost_i) * 0.34
+            rain_vol = storm_i * (1.0 - frost_i) * 0.17
             wL_now = biome_weights_vec(
                 np.array([s_car], dtype=np.float32), -1)[0]
             wR_now = biome_weights_vec(
@@ -2680,10 +2847,10 @@ def main():
                 + wR_now[BIOME_PLAIN] + wR_now[BIOME_MOUNTAIN] + wR_now[BIOME_FROST]
             )
             speed_ratio = speed / SPEED
-            wind_vol = (0.03
-                        + speed_ratio * 0.05
-                        + open_exp * 0.08
-                        + storm_i * 0.07)
+            wind_vol = (0.015
+                        + speed_ratio * 0.025
+                        + open_exp * 0.040
+                        + storm_i * 0.035)
             audio_player.set_volumes(rain=rain_vol, wind=wind_vol)
 
         draw_sky(sky_state, cx, cy, cz, t_time, t_day, storm_i, flash)
