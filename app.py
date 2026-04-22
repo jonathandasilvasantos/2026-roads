@@ -835,19 +835,45 @@ def make_cloud_texture(w=1024, h=512):
 
 
 def make_stars_texture(w=1024, h=512):
-    """Sparse star field with varying brightness. u wraps horizontally."""
+    """Sparse star field with varying brightness. u wraps horizontally.
+
+    Each star is splatted as a radial Gaussian so larger/brighter ones
+    stay visibly round instead of turning into square pixel blocks.
+    """
     rng = np.random.default_rng(19)
     tex = np.zeros((h, w), dtype=np.float32)
+
+    def splat(cx, cy, brightness, sigma):
+        # 3-sigma footprint covers essentially all of the Gaussian
+        extent = max(1, int(math.ceil(sigma * 3.0)))
+        y0, y1 = max(0, cy - extent), min(h, cy + extent + 1)
+        x0, x1 = max(0, cx - extent), min(w, cx + extent + 1)
+        if y1 <= y0 or x1 <= x0:
+            return
+        ys = np.arange(y0, y1)[:, None] - cy
+        xs = np.arange(x0, x1)[None, :] - cx
+        d2 = ys * ys + xs * xs
+        falloff = np.exp(-d2 / (2.0 * sigma * sigma))
+        tex[y0:y1, x0:x1] = np.maximum(
+            tex[y0:y1, x0:x1], brightness * falloff
+        )
+
     for _ in range(2400):
-        y = int(rng.integers(0, h))
-        x = int(rng.integers(0, w))
+        cy = int(rng.integers(3, h - 3))
+        cx = int(rng.integers(3, w - 3))
         brightness = float(rng.random() ** 2.5)
         if rng.random() < 0.15:
             brightness *= 2.0
-        size = 1 if rng.random() < 0.82 else 2
-        y0, y1 = max(0, y - size + 1), min(h, y + size)
-        x0, x1 = max(0, x - size + 1), min(w, x + size)
-        tex[y0:y1, x0:x1] = np.maximum(tex[y0:y1, x0:x1], brightness)
+        # Mostly pinprick stars; some stars bigger; a few are prominent.
+        roll = rng.random()
+        if roll < 0.80:
+            sigma = 0.55
+        elif roll < 0.96:
+            sigma = 0.95
+        else:
+            sigma = 1.45
+        splat(cx, cy, brightness, sigma)
+
     tex = np.clip(tex, 0, 1)
     # fewer stars near horizon (atmospheric extinction)
     v = np.linspace(0, 1, h)
