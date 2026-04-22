@@ -1231,6 +1231,197 @@ class MinimalEnsemblePlayer:
 MinimalPianoPlayer = MinimalEnsemblePlayer
 
 
+# --- Lens weather overlay: droplets + snowflakes on the "camera lens" ---
+# Screen-space post-process overlay — a pool of alpha-blended sprites
+# drawn in a 2D ortho layer *after* all 3D rendering, so they sit on the
+# framebuffer as if stuck to the lens. Only active during rain or snow,
+# and they're deliberately partially transparent and sparse — realism
+# comes from seeing *through* them, not from them dominating the view.
+#
+# Physics model (simplified from Tatarchuk 2006 "Rain Rendering" + the
+# Unity / Unreal "raindrop FX" body of work):
+#   * Each drop has a random size, position, and life.
+#   * Rain drops slide downward over their life (surface-tension pull
+#     plus oblate-spheroid streaking), snowflakes drift slightly and
+#     mostly sit.
+#   * Alpha ramps up quickly at birth, plateaus, then fades out — so
+#     drops don't pop in or out.
+#   * Population is capped, spawn rate is modulated by weather intensity
+#     so the effect tracks the storm envelope cleanly.
+
+LENS_MAX_DROPS = 34
+LENS_RAIN_SPAWN_RATE = 10.0        # drops/sec at full rain
+LENS_SNOW_SPAWN_RATE = 5.5         # flakes/sec at full frost
+
+
+def make_lens_drop_texture(size=64):
+    """Soft water-drop blob with a highlight on the upper-left, simulating
+    the way refraction scatters a window light into each drop."""
+    ys, xs = np.mgrid[0:size, 0:size].astype(np.float32)
+    c = (size - 1) / 2.0
+    d = np.sqrt((xs - c) ** 2 + (ys - c) ** 2) / c
+    alpha = np.clip(1.0 - d, 0.0, 1.0) ** 1.4
+
+    # Highlight ~a quarter from top-left
+    hx = c - size * 0.22
+    hy = c - size * 0.22
+    hd = np.sqrt((xs - hx) ** 2 + (ys - hy) ** 2) / (size * 0.18)
+    highlight = np.clip(1.0 - hd, 0.0, 1.0) ** 2.5
+
+    rgba = np.zeros((size, size, 4), dtype=np.float32)
+    rgba[..., 0] = 0.60 + 0.35 * highlight
+    rgba[..., 1] = 0.70 + 0.28 * highlight
+    rgba[..., 2] = 0.85 + 0.14 * highlight
+    # Drops are partially translucent — real water on glass lets the
+    # background through, distorted. Cap alpha so we never occlude.
+    rgba[..., 3] = alpha * 0.55
+    return (rgba * 255).clip(0, 255).astype(np.uint8)
+
+
+def make_lens_flake_texture(size=64):
+    """White snowflake: soft disc plus six radial spokes (hexagonal
+    symmetry, like an actual snow crystal)."""
+    ys, xs = np.mgrid[0:size, 0:size].astype(np.float32)
+    c = (size - 1) / 2.0
+    dx = xs - c
+    dy = ys - c
+    r = np.sqrt(dx * dx + dy * dy) / c
+
+    disc = np.clip(1.0 - r, 0.0, 1.0) ** 1.3
+    # Spokes: minimum distance to the nearest of 6 axis angles
+    angle = np.arctan2(dy, dx)
+    mod = np.mod(angle, np.pi / 3.0)
+    spoke_dist = np.minimum(mod, np.pi / 3.0 - mod)
+    spoke = np.exp(-(spoke_dist * 11.0) ** 2)
+    spoke *= np.clip(1.0 - r, 0.0, 1.0)
+
+    total = np.maximum(disc * 0.55, spoke * 0.95)
+    rgba = np.zeros((size, size, 4), dtype=np.float32)
+    rgba[..., 0] = 0.96
+    rgba[..., 1] = 0.98
+    rgba[..., 2] = 1.00
+    rgba[..., 3] = total * 0.80
+    return (rgba * 255).clip(0, 255).astype(np.uint8)
+
+
+class LensWeatherOverlay:
+    """Fixed-pool of droplets/flakes with life management. Update happens
+    once per frame with current rain/snow intensity and the viewport size;
+    draw is a single 2D ortho pass called after everything else."""
+
+    def __init__(self):
+        self.drops = []
+        self.rng = np.random.default_rng(911)
+
+    def _spawn(self, kind, W, H):
+        if kind == "rain":
+            return {
+                "kind": "rain",
+                "x": float(self.rng.uniform(W * 0.05, W * 0.95)),
+                "y": float(self.rng.uniform(H * 0.28, H * 0.92)),
+                "vx": float(self.rng.uniform(-3.0, 3.0)),
+                "vy": float(self.rng.uniform(8.0, 28.0)),  # slide down
+                "size": float(self.rng.uniform(14.0, 30.0)),
+                "age": 0.0,
+                "life": float(self.rng.uniform(3.5, 6.5)),
+            }
+        return {
+            "kind": "snow",
+            "x": float(self.rng.uniform(W * 0.05, W * 0.95)),
+            "y": float(self.rng.uniform(H * 0.20, H * 0.90)),
+            "vx": float(self.rng.uniform(-1.5, 1.5)),
+            "vy": float(self.rng.uniform(1.5, 5.0)),
+            "size": float(self.rng.uniform(16.0, 32.0)),
+            "age": 0.0,
+            "life": float(self.rng.uniform(5.5, 9.5)),
+        }
+
+    def update(self, dt, rain_i, snow_i, W, H):
+        # Spawn new drops/flakes, capped at pool size
+        if rain_i > 0.04:
+            expected = rain_i * LENS_RAIN_SPAWN_RATE * dt
+            n = int(self.rng.poisson(max(0.0, expected)))
+            for _ in range(n):
+                if len(self.drops) >= LENS_MAX_DROPS:
+                    break
+                self.drops.append(self._spawn("rain", W, H))
+        if snow_i > 0.04:
+            expected = snow_i * LENS_SNOW_SPAWN_RATE * dt
+            n = int(self.rng.poisson(max(0.0, expected)))
+            for _ in range(n):
+                if len(self.drops) >= LENS_MAX_DROPS:
+                    break
+                self.drops.append(self._spawn("snow", W, H))
+
+        # Advance and cull
+        alive = []
+        for d in self.drops:
+            d["age"] += dt
+            if d["age"] >= d["life"]:
+                continue
+            # ortho maps y=0 to bottom, y=H to top. vy is positive when we
+            # want screen-down motion, so subtract it from y.
+            d["x"] += d["vx"] * dt
+            d["y"] -= d["vy"] * dt
+            if d["y"] < -40.0:
+                continue  # slid off the bottom of the lens
+            alive.append(d)
+        self.drops = alive
+
+    def draw(self, drop_tex, flake_tex, W, H):
+        if not self.drops:
+            return
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, W, 0, H, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_FOG)
+        glDisable(GL_LIGHTING)
+        glEnable(GL_TEXTURE_2D)
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDepthMask(GL_FALSE)
+
+        last_tex = None
+        for d in self.drops:
+            # Alpha envelope — quick attack, plateau, longer release
+            age_frac = d["age"] / d["life"]
+            if age_frac < 0.12:
+                a = age_frac / 0.12
+            elif age_frac < 0.72:
+                a = 1.0
+            else:
+                a = max(0.0, (1.0 - age_frac) / 0.28)
+            tex = drop_tex if d["kind"] == "rain" else flake_tex
+            if tex != last_tex:
+                glBindTexture(GL_TEXTURE_2D, tex)
+                last_tex = tex
+            glColor4f(1.0, 1.0, 1.0, a * 0.75)
+            x, y, s = d["x"], d["y"], d["size"]
+            glBegin(GL_QUADS)
+            glTexCoord2f(0.0, 0.0); glVertex2f(x - s / 2, y - s / 2)
+            glTexCoord2f(1.0, 0.0); glVertex2f(x + s / 2, y - s / 2)
+            glTexCoord2f(1.0, 1.0); glVertex2f(x + s / 2, y + s / 2)
+            glTexCoord2f(0.0, 1.0); glVertex2f(x - s / 2, y + s / 2)
+            glEnd()
+
+        glDepthMask(GL_TRUE)
+        glDisable(GL_BLEND)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_FOG)
+
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+        glPopMatrix()
+
+
 # --- Lens flare (sprite-based, canonical approach: sun→center ghost chain
 # + anamorphic horizontal streak + main burst). Only fires when the view
 # is roughly pointing at the sun and the sun sits well above the horizon;
@@ -3811,6 +4002,12 @@ def main():
     pond_tex = upload_texture(make_pond_texture(), internal=GL_RGBA, src=GL_RGBA)
     flare_tex = upload_texture(make_flare_disc_texture(), internal=GL_RGBA, src=GL_RGBA)
     flare_smoothed = 0.0
+    # Lens weather overlay — droplets + snowflakes on the "camera lens".
+    lens_drop_tex = upload_texture(make_lens_drop_texture(),
+                                    internal=GL_RGBA, src=GL_RGBA)
+    lens_flake_tex = upload_texture(make_lens_flake_texture(),
+                                     internal=GL_RGBA, src=GL_RGBA)
+    lens_overlay = LensWeatherOverlay()
 
     # Ambient audio mixer: brown-noise engine rumble + rain + wind +
     # thunder one-shots. Disabled silently if the platform doesn't have a
@@ -4140,6 +4337,13 @@ def main():
         flare_smoothed += (flare_target - flare_smoothed) * min(1.0, dt / 0.5)
         draw_lens_flare(flare_tex, sun_d, cx, cy, cz, lx, ly, lz,
                         W, H, flare_smoothed)
+
+        # Lens weather drops: spawn + advance + draw, gated by rain/snow
+        # intensity so they only appear in their respective weather.
+        rain_lens_i = storm_i * (1.0 - frost_i)
+        snow_lens_i = frost_i
+        lens_overlay.update(dt, rain_lens_i, snow_lens_i, W, H)
+        lens_overlay.draw(lens_drop_tex, lens_flake_tex, W, H)
 
         pygame.display.flip()
 
