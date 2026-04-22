@@ -447,18 +447,118 @@ def generate_brown_noise_buffer(duration_s=_AUDIO_BUFFER_SEC,
     return brown
 
 
-class BrownNoisePlayer:
-    """Continuous looping brown noise played through sounddevice, with a
-    smoothly-interpolated variable playback speed. The audio callback runs
-    on sounddevice's internal thread; speed_target is read lock-free (plain
-    Python float writes are atomic under the GIL)."""
+def generate_rain_noise_buffer(duration_s=15.0,
+                               sample_rate=_AUDIO_SAMPLE_RATE, seed=101):
+    """Rain hiss: white noise FFT-shaped to emphasise the 2-5 kHz band,
+    with slow amplitude modulation so density varies over time."""
+    n = int(duration_s * sample_rate)
+    rng = np.random.default_rng(seed)
+    spectrum = np.fft.rfft(rng.standard_normal(n).astype(np.float32))
+    freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
+    curve = np.exp(-((freqs - 4000.0) / 2500.0) ** 2)
+    curve += 0.35 * np.exp(-((freqs - 1500.0) / 700.0) ** 2)
+    rain = np.fft.irfft(spectrum * curve.astype(np.complex64), n).astype(np.float32)
+    rain /= (np.max(np.abs(rain)) + 1e-9)
+    # density variation — slow block-level modulation
+    block = 512
+    mod = 1.0 + 0.22 * rng.standard_normal(n // block + 1).astype(np.float32)
+    mod = np.clip(np.repeat(mod, block)[:n], 0.55, 1.55)
+    rain *= mod
+    return np.tanh(rain * 1.1).astype(np.float32)
 
-    def __init__(self, duration_s=_AUDIO_BUFFER_SEC):
-        self.buffer = generate_brown_noise_buffer(duration_s)
-        self.buffer_len = len(self.buffer)
-        self.phase = 0.0            # float read-index into buffer
-        self.speed_current = 1.0    # active playback rate
-        self.speed_target = 1.0     # target rate set from main thread
+
+def generate_wind_noise_buffer(duration_s=25.0,
+                               sample_rate=_AUDIO_SAMPLE_RATE, seed=103):
+    """Wind: pink-tilted low-pass noise modulated by several slow LFOs
+    for gusts. Strong on the low-mids, nothing above ~900 Hz."""
+    n = int(duration_s * sample_rate)
+    rng = np.random.default_rng(seed)
+    re = rng.standard_normal(n // 2 + 1).astype(np.float32)
+    im = rng.standard_normal(n // 2 + 1).astype(np.float32)
+    spectrum = (re + 1j * im).astype(np.complex64)
+    freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
+    scale = np.zeros_like(freqs, dtype=np.float32)
+    scale[1:] = 1.0 / (freqs[1:] ** 0.6)
+    scale *= np.exp(-(freqs / 900.0) ** 1.8)
+    wind = np.fft.irfft(spectrum * scale.astype(np.complex64), n).astype(np.float32)
+    wind /= (np.max(np.abs(wind)) + 1e-9)
+    # gust envelope — three detuned LFOs so gusts don't repeat exactly
+    t = np.arange(n, dtype=np.float32) / sample_rate
+    gust = (1.0
+            + 0.40 * np.sin(t * 2 * math.pi / 5.3)
+            + 0.30 * np.sin(t * 2 * math.pi / 7.8 + 1.2)
+            + 0.20 * np.sin(t * 2 * math.pi / 3.1 + 0.5))
+    wind *= np.clip(gust, 0.15, 2.1)
+    wind /= (np.max(np.abs(wind)) + 1e-9)
+    return np.tanh(wind * 1.1).astype(np.float32)
+
+
+def generate_thunder_clip(duration_s=3.8,
+                          sample_rate=_AUDIO_SAMPLE_RATE, seed=107):
+    """Thunder one-shot: heavy sub-bass rumble with a sharp attack, a
+    long exponential decay, and two secondary rolls so it sounds like a
+    distant boom with after-rumbles rather than a single pop."""
+    n = int(duration_s * sample_rate)
+    rng = np.random.default_rng(seed)
+    re = rng.standard_normal(n // 2 + 1).astype(np.float32)
+    im = rng.standard_normal(n // 2 + 1).astype(np.float32)
+    spectrum = (re + 1j * im).astype(np.complex64)
+    freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
+    scale = np.zeros_like(freqs, dtype=np.float32)
+    scale[1:] = np.exp(-(freqs[1:] / 130.0) ** 1.3)
+    rumble = np.fft.irfft(spectrum * scale.astype(np.complex64), n).astype(np.float32)
+    t = np.arange(n, dtype=np.float32) / sample_rate
+    env_main = (1.0 - np.exp(-t * 35.0)) * np.exp(-t * 1.2)
+    env_sec1 = 0.45 * np.exp(-np.maximum(t - 0.7, 0.0) * 0.9) * (t > 0.3)
+    env_sec2 = 0.28 * np.exp(-np.maximum(t - 1.6, 0.0) * 0.7) * (t > 1.2)
+    env = np.clip(env_main + env_sec1 + env_sec2, 0.0, None).astype(np.float32)
+    rumble *= env
+    rumble /= (np.max(np.abs(rumble)) + 1e-9)
+    return np.tanh(rumble * 0.9).astype(np.float32)
+
+
+class AmbientAudioMixer:
+    """Single sounddevice output stream mixing four layers:
+
+        * brown-noise engine rumble at variable playback speed
+        * rain hiss (looped), volume tracks storm × (1 - frost)
+        * wind gusts (looped), volume tracks camera speed + open-terrain
+          exposure + storm
+        * thunder one-shots, triggered by lightning strikes
+
+    All target volumes and the brown-noise speed are set from the main
+    thread (atomic float writes) and low-passed inside the callback so
+    parameter changes don't produce clicks. Thunder events are queued in
+    a lock-protected list."""
+
+    def __init__(self, brown_duration_s=_AUDIO_BUFFER_SEC):
+        self.brown = generate_brown_noise_buffer(brown_duration_s)
+        self.rain = generate_rain_noise_buffer()
+        self.wind = generate_wind_noise_buffer()
+        self.thunder = generate_thunder_clip()
+
+        # target volumes written from main thread
+        self.brown_vol_target = 0.085
+        self.rain_vol_target = 0.0
+        self.wind_vol_target = 0.04
+        # smoothed inside callback
+        self.brown_vol = self.brown_vol_target
+        self.rain_vol = self.rain_vol_target
+        self.wind_vol = self.wind_vol_target
+
+        # brown noise playback speed
+        self.speed_target = 1.0
+        self.speed_current = 1.0
+
+        # loop read phases
+        self.brown_phase = 0.0
+        self.rain_phase = 0
+        self.wind_phase = 0
+
+        # thunder events: each entry = [clip_sample_index, volume]
+        self.thunder_lock = threading.Lock()
+        self.thunder_events = []
+
         self.stream = None
 
     def start(self):
@@ -481,26 +581,79 @@ class BrownNoisePlayer:
             self.stream = None
 
     def set_speed(self, speed_factor):
-        # Clamp to a sane range: below 0.2x the noise starts to click on
-        # loop joins, above 1.8x the rumble loses its brown-noise feel.
         self.speed_target = float(max(0.2, min(1.8, speed_factor)))
 
-    def _callback(self, outdata, frames, time_info, status):
-        # Smooth speed inside the callback so large changes don't click
-        alpha = 0.04
-        self.speed_current += (self.speed_target - self.speed_current) * alpha
-        sp = self.speed_current
-        buf = self.buffer
-        n = self.buffer_len
+    def set_volumes(self, rain=None, wind=None, brown=None):
+        if rain is not None:
+            self.rain_vol_target = float(max(0.0, min(0.55, rain)))
+        if wind is not None:
+            self.wind_vol_target = float(max(0.0, min(0.40, wind)))
+        if brown is not None:
+            self.brown_vol_target = float(max(0.0, min(0.30, brown)))
 
-        # Vectorised variable-speed resampling with linear interpolation
-        idxs = (self.phase + np.arange(frames, dtype=np.float64) * sp) % n
+    def trigger_thunder(self, volume=0.55):
+        with self.thunder_lock:
+            # cap at 3 concurrent thunder events so repeated lightning
+            # doesn't snowball volume
+            if len(self.thunder_events) < 3:
+                self.thunder_events.append([0, float(volume)])
+
+    @staticmethod
+    def _read_loop(buf, phase, frames):
+        n = len(buf)
+        if phase + frames <= n:
+            return buf[phase:phase + frames]
+        head = buf[phase:]
+        rem = frames - len(head)
+        return np.concatenate([head, buf[:rem]])
+
+    def _callback(self, outdata, frames, time_info, status):
+        alpha = 0.035
+        self.speed_current += (self.speed_target - self.speed_current) * alpha
+        self.brown_vol += (self.brown_vol_target - self.brown_vol) * alpha
+        self.rain_vol += (self.rain_vol_target - self.rain_vol) * alpha
+        self.wind_vol += (self.wind_vol_target - self.wind_vol) * alpha
+
+        # brown noise with variable speed + linear interpolation
+        sp = self.speed_current
+        bn = len(self.brown)
+        idxs = (self.brown_phase
+                + np.arange(frames, dtype=np.float64) * sp) % bn
         i0 = idxs.astype(np.int64)
-        i1 = (i0 + 1) % n
+        i1 = (i0 + 1) % bn
         frac = (idxs - i0).astype(np.float32)
-        samples = buf[i0] * (1.0 - frac) + buf[i1] * frac
-        outdata[:, 0] = samples * _AUDIO_VOLUME
-        self.phase = float((self.phase + frames * sp) % n)
+        brown_s = self.brown[i0] * (1.0 - frac) + self.brown[i1] * frac
+        self.brown_phase = float((self.brown_phase + frames * sp) % bn)
+
+        rain_s = self._read_loop(self.rain, self.rain_phase, frames)
+        self.rain_phase = (self.rain_phase + frames) % len(self.rain)
+        wind_s = self._read_loop(self.wind, self.wind_phase, frames)
+        self.wind_phase = (self.wind_phase + frames) % len(self.wind)
+
+        thunder_s = np.zeros(frames, dtype=np.float32)
+        with self.thunder_lock:
+            still_running = []
+            for ev in self.thunder_events:
+                start_idx, vol = ev
+                clip_len = len(self.thunder)
+                if start_idx < clip_len:
+                    end_idx = min(start_idx + frames, clip_len)
+                    chunk = self.thunder[start_idx:end_idx]
+                    thunder_s[:len(chunk)] += chunk * vol
+                    ev[0] = start_idx + frames
+                    if ev[0] < clip_len:
+                        still_running.append(ev)
+            self.thunder_events = still_running
+
+        outdata[:, 0] = (brown_s * self.brown_vol
+                         + rain_s * self.rain_vol
+                         + wind_s * self.wind_vol
+                         + thunder_s)
+
+
+# Back-compat alias so older code paths referencing BrownNoisePlayer
+# keep working (the mixer subsumes its functionality).
+BrownNoisePlayer = AmbientAudioMixer
 
 
 # --- Minimalist procedural piano ---------------------------------------
@@ -2359,12 +2512,13 @@ def main():
     flare_tex = upload_texture(make_flare_disc_texture(), internal=GL_RGBA, src=GL_RGBA)
     flare_smoothed = 0.0
 
-    # Ambient brown-noise engine rumble. Disabled silently if the platform
-    # doesn't have a usable audio output (e.g. headless runs).
+    # Ambient audio mixer: brown-noise engine rumble + rain + wind +
+    # thunder one-shots. Disabled silently if the platform doesn't have a
+    # usable audio output (e.g. headless runs).
     audio_player = None
     if _AUDIO_AVAILABLE:
         try:
-            audio_player = BrownNoisePlayer()
+            audio_player = AmbientAudioMixer()
             audio_player.start()
         except Exception as exc:
             print(f"[audio] disabled: {exc}", file=sys.stderr)
@@ -2427,9 +2581,9 @@ def main():
         t_time += dt
         t_day = (t_day + dt / DAY_PERIOD) % 1.0
 
-        # Brown noise playback rate tracks the camera speed. At default
-        # cruise (SPEED) the noise plays at 1.0x; stopped it idles at 0.25x
-        # (low rumble), at top speed it climbs to ~1.55x (fast rush).
+        # Audio mix: brown noise speed tracks camera speed; rain and wind
+        # volumes track the weather/biome state. Set once per frame —
+        # the callback smooths the targets internally.
         if audio_player is not None:
             audio_player.set_speed(0.25 + (speed / SPEED) * 0.75)
 
@@ -2501,8 +2655,36 @@ def main():
                 active_bolt = generate_bolt(bolt_rng, cx, cy, cz)
                 bolt_age = 0.0
                 time_to_strike = float(bolt_rng.uniform(5.0, 12.0))
+                # Thunder clap: louder when the storm is heavier, with a
+                # little random variation per strike so they don't sound
+                # identical.
+                if audio_player is not None:
+                    audio_player.trigger_thunder(
+                        volume=0.40 + storm_i * 0.40
+                               + float(bolt_rng.uniform(-0.05, 0.15)),
+                    )
             else:
                 time_to_strike = 1.0
+
+        # Weather-driven ambient mix: rain gates by storm × (1 - frost)
+        # so only actual rain zones hiss; wind grows with camera speed,
+        # with open biomes (plain / mountain / frost), and with storm.
+        if audio_player is not None:
+            rain_vol = storm_i * (1.0 - frost_i) * 0.34
+            wL_now = biome_weights_vec(
+                np.array([s_car], dtype=np.float32), -1)[0]
+            wR_now = biome_weights_vec(
+                np.array([s_car], dtype=np.float32), +1)[0]
+            open_exp = 0.5 * (
+                wL_now[BIOME_PLAIN] + wL_now[BIOME_MOUNTAIN] + wL_now[BIOME_FROST]
+                + wR_now[BIOME_PLAIN] + wR_now[BIOME_MOUNTAIN] + wR_now[BIOME_FROST]
+            )
+            speed_ratio = speed / SPEED
+            wind_vol = (0.03
+                        + speed_ratio * 0.05
+                        + open_exp * 0.08
+                        + storm_i * 0.07)
+            audio_player.set_volumes(rain=rain_vol, wind=wind_vol)
 
         draw_sky(sky_state, cx, cy, cz, t_time, t_day, storm_i, flash)
 
