@@ -4235,7 +4235,7 @@ def draw_city(s_car, building_lists, facade_tex, emission_tex,
 # (cars drift away), right lane is oncoming (cars close toward the camera).
 CAR_LANE_HALF = 2.5
 N_CAR_VARIANTS = 18
-N_CARS_PER_LANE = 10
+N_CARS_PER_LANE = 5
 # Same-direction (player's left) cars enter from behind the camera, pass
 # through, and recede into the distance. So their spawn range is *behind*
 # s_car, and they're despawned only when they drift off the far horizon.
@@ -4918,18 +4918,19 @@ def _car_respawn_s(lane, s_car, rng):
                                      CAR_SPAWN_AHEAD_MAX))
 
 
-def init_cars(seed=303, s_car=0.0, player_speed=0.0):
+def init_cars(seed=303, s_car=0.0, player_speed=0.0,
+              n_variants=N_CAR_VARIANTS, n_per_lane=N_CARS_PER_LANE):
     rng = np.random.default_rng(seed)
     cars = []
     for lane in (-1, +1):
-        for _ in range(N_CARS_PER_LANE):
+        for _ in range(n_per_lane):
             cars.append({
-                'variant': int(rng.integers(0, N_CAR_VARIANTS)),
+                'variant': int(rng.integers(0, n_variants)),
                 'lane': lane,
                 's': _car_respawn_s(lane, s_car, rng),
                 'speed': _car_speed_for(lane, player_speed, rng),
             })
-    return {'cars': cars, 'rng': rng}
+    return {'cars': cars, 'rng': rng, 'n_variants': n_variants}
 
 
 def update_cars(state, dt, s_car, player_speed):
@@ -4950,14 +4951,14 @@ def update_cars(state, dt, s_car, player_speed):
             # they *live* behind until they pass the camera.)
             if c['s'] > s_car + CAR_DESPAWN_AHEAD:
                 c['s'] = _car_respawn_s(-1, s_car, rng)
-                c['variant'] = int(rng.integers(0, N_CAR_VARIANTS))
+                c['variant'] = int(rng.integers(0, state['n_variants']))
                 c['speed'] = _car_speed_for(-1, player_speed, rng)
         else:
             # Oncoming: closing on the camera.
             c['s'] -= c['speed'] * dt
             if c['s'] < s_car - CAR_DESPAWN_BEHIND:
                 c['s'] = _car_respawn_s(+1, s_car, rng)
-                c['variant'] = int(rng.integers(0, N_CAR_VARIANTS))
+                c['variant'] = int(rng.integers(0, state['n_variants']))
                 c['speed'] = _car_speed_for(+1, player_speed, rng)
 
 
@@ -5146,6 +5147,599 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
     glDisable(GL_TEXTURE_2D)
 
 
+# --- Procedural trucks ---
+# Ported from the sibling trucks/ project. Shares the car module's loft,
+# cabin extrusion, wheel, materials, and paint texture — a truck is just a
+# bigger, boxier car with an extra cargo section (pickup bed / box / semi
+# fifth-wheel / flatbed deck / dump hopper) and a few extra hardpoints
+# (exhaust stacks, mud flaps, beacon, tow hitch). Traffic logic reuses
+# `_car_respawn_s` and `_car_speed_for` so trucks follow the same flow as
+# cars: left lane spawns behind the camera and overtakes it, right lane
+# spawns far ahead and closes on the camera. Density is ~1/4 of cars.
+N_TRUCK_VARIANTS = 10
+N_TRUCKS_PER_LANE = 2   # halved — trucks are rare compared to cars
+TRUCK_STYLES = ['pickup', 'box_truck', 'semi', 'flatbed', 'dump']
+
+TRUCK_PALETTE = [
+    (0.85, 0.10, 0.10), (0.10, 0.22, 0.70), (0.93, 0.93, 0.95),
+    (0.07, 0.07, 0.09), (0.18, 0.18, 0.22), (0.72, 0.72, 0.74),
+    (0.20, 0.55, 0.28), (0.92, 0.76, 0.12), (0.32, 0.24, 0.56),
+    (0.75, 0.38, 0.08), (0.08, 0.50, 0.55), (0.55, 0.15, 0.08),
+]
+
+
+def _truck_draw_box(x0, x1, y0, y1, z0, z1):
+    cx = (x0 + x1) / 2
+    cy = (y0 + y1) / 2
+    cz = (z0 + z1) / 2
+    glPushMatrix()
+    glTranslatef(cx, cy, cz)
+    glScalef(x1 - x0, y1 - y0, z1 - z0)
+    _car_unit_cube()
+    glPopMatrix()
+
+
+def _generate_truck_params(rng):
+    style = TRUCK_STYLES[int(rng.integers(0, len(TRUCK_STYLES)))]
+    L = float(rng.uniform(5.2, 7.8))
+    W = float(rng.uniform(1.90, 2.25))
+    WR = float(rng.uniform(0.46, 0.60))
+    LBH = float(rng.uniform(0.70, 0.95))
+    CH = float(rng.uniform(0.85, 1.15))
+    HL = float(rng.uniform(0.35, 0.55))
+    cab_frac = float(rng.uniform(0.32, 0.45))
+    dual_rear = False
+    stacks = False
+    beacon = False
+    bed_rails = False
+    mud_flaps = True
+    trailer_plate = False
+
+    if style == 'pickup':
+        L = float(rng.uniform(5.2, 6.2))
+        W = float(rng.uniform(1.90, 2.05))
+        WR = float(rng.uniform(0.44, 0.54))
+        LBH = float(rng.uniform(0.68, 0.86))
+        CH = float(rng.uniform(0.82, 1.00))
+        cab_frac = float(rng.uniform(0.38, 0.48))
+        dual_rear = rng.random() < 0.30
+        bed_rails = rng.random() < 0.35
+    elif style == 'box_truck':
+        L = float(rng.uniform(6.4, 7.8))
+        W = float(rng.uniform(2.00, 2.25))
+        WR = float(rng.uniform(0.48, 0.58))
+        LBH = float(rng.uniform(0.78, 0.95))
+        CH = float(rng.uniform(0.92, 1.15))
+        cab_frac = float(rng.uniform(0.28, 0.36))
+        dual_rear = True
+        beacon = rng.random() < 0.40
+    elif style == 'semi':
+        L = float(rng.uniform(5.8, 6.8))
+        W = float(rng.uniform(2.05, 2.25))
+        WR = float(rng.uniform(0.50, 0.60))
+        LBH = float(rng.uniform(0.82, 0.98))
+        CH = float(rng.uniform(1.05, 1.30))
+        cab_frac = float(rng.uniform(0.55, 0.72))
+        HL = float(rng.uniform(0.45, 0.70))
+        dual_rear = True
+        stacks = True
+        trailer_plate = True
+        beacon = rng.random() < 0.25
+    elif style == 'flatbed':
+        L = float(rng.uniform(5.8, 7.2))
+        W = float(rng.uniform(1.95, 2.15))
+        WR = float(rng.uniform(0.46, 0.56))
+        LBH = float(rng.uniform(0.74, 0.90))
+        CH = float(rng.uniform(0.88, 1.05))
+        cab_frac = float(rng.uniform(0.32, 0.42))
+        dual_rear = rng.random() < 0.55
+    elif style == 'dump':
+        L = float(rng.uniform(6.0, 7.2))
+        W = float(rng.uniform(2.05, 2.25))
+        WR = float(rng.uniform(0.50, 0.60))
+        LBH = float(rng.uniform(0.82, 0.98))
+        CH = float(rng.uniform(0.92, 1.10))
+        cab_frac = float(rng.uniform(0.30, 0.38))
+        dual_rear = True
+        beacon = rng.random() < 0.60
+
+    spoke_count = int(rng.choice([5, 6, 8, 10]))
+
+    BH = WR * 0.85
+    body_top_y = BH + LBH
+    roof_y = body_top_y + CH
+
+    rear_x = -L / 2
+    front_x = L / 2
+
+    cab_len = L * cab_frac
+    cab_front_bot = front_x - HL
+    cab_front_top = cab_front_bot - float(rng.uniform(0.08, 0.22))
+    cab_rear_bot = cab_front_bot - cab_len
+    cab_rear_top = cab_rear_bot + float(rng.uniform(0.05, 0.18))
+
+    cargo_front_x = cab_rear_bot - 0.05
+    cargo_rear_x = rear_x + 0.05
+
+    if style == 'box_truck':
+        cargo_top_y = roof_y + float(rng.uniform(0.05, 0.20))
+    elif style == 'semi':
+        cargo_top_y = body_top_y + float(rng.uniform(0.05, 0.15))
+    elif style == 'pickup':
+        cargo_top_y = body_top_y + float(rng.uniform(0.22, 0.38))
+    elif style == 'flatbed':
+        cargo_top_y = body_top_y + float(rng.uniform(0.02, 0.08))
+    else:  # dump
+        cargo_top_y = body_top_y + float(rng.uniform(0.55, 0.85))
+
+    W_cabin = W * float(rng.uniform(0.88, 0.96))
+    color = TRUCK_PALETTE[int(rng.integers(0, len(TRUCK_PALETTE)))]
+
+    zh = W / 2
+    hood_mid = (front_x + cab_front_bot) / 2
+    station_defs = [
+        (rear_x,              0.60, BH * 0.55, body_top_y * 0.60, 3.5, 3.8),
+        (rear_x + 0.22,       0.94, BH * 0.50, body_top_y * 0.90, 5.0, 6.0),
+        (rear_x + 0.55,       1.00, BH * 0.48, body_top_y,        7.5, 7.5),
+        (cargo_rear_x,        1.00, BH * 0.48, body_top_y,        8.0, 8.0),
+        (cargo_front_x,       1.00, BH * 0.48, body_top_y,        8.0, 8.0),
+        (cab_rear_bot,        1.00, BH * 0.48, body_top_y,        7.5, 7.5),
+        (cab_front_bot,       1.00, BH * 0.48, body_top_y * 0.98, 7.0, 7.0),
+        (hood_mid,            0.98, BH * 0.52, body_top_y * 0.92, 5.5, 6.0),
+        (front_x - 0.08,      0.92, BH * 0.58, body_top_y * 0.80, 4.2, 4.5),
+        (front_x,             0.62, BH * 0.60, body_top_y * 0.58, 3.2, 3.5),
+    ]
+    K = 36
+    stations = []
+    for (x, z_scale, y_bot, y_top, et, eb) in station_defs:
+        pts2d = _car_superellipse_section(zh * z_scale, y_bot, y_top,
+                                          et, eb, K)
+        stations.append({'x': x, 'pts': [(x, y, z) for (z, y) in pts2d]})
+
+    cabin = [
+        (cab_rear_bot,  body_top_y),
+        (cab_rear_top,  roof_y),
+        (cab_front_top, roof_y),
+        (cab_front_bot, body_top_y),
+    ]
+
+    front_ax = front_x - HL - float(rng.uniform(0.10, 0.25))
+    if style == 'semi':
+        rear_ax = cab_rear_bot + float(rng.uniform(0.10, 0.35))
+    elif style in ('box_truck', 'dump'):
+        rear_ax = cargo_rear_x + float(rng.uniform(0.35, 0.70))
+    else:
+        rear_ax = cargo_rear_x + float(rng.uniform(0.55, 0.95))
+    rear_ax = max(rear_x + WR + 0.12, min(cargo_front_x - 0.15, rear_ax))
+
+    inset = 0.02
+    wheels = []
+    wheels.append((front_ax, WR,  W / 2 - inset))
+    wheels.append((front_ax, WR, -W / 2 + inset))
+    if dual_rear:
+        tire_w = WR * 0.56
+        offset = tire_w * 1.02
+        wheels.append((rear_ax, WR,  W / 2 - inset))
+        wheels.append((rear_ax, WR,  W / 2 - inset - offset))
+        wheels.append((rear_ax, WR, -W / 2 + inset))
+        wheels.append((rear_ax, WR, -W / 2 + inset + offset))
+        if style in ('semi', 'box_truck', 'dump'):
+            rear_ax2 = rear_ax - WR * 2.25
+            rear_ax2 = max(rear_x + WR + 0.12, rear_ax2)
+            wheels.append((rear_ax2, WR,  W / 2 - inset))
+            wheels.append((rear_ax2, WR,  W / 2 - inset - offset))
+            wheels.append((rear_ax2, WR, -W / 2 + inset))
+            wheels.append((rear_ax2, WR, -W / 2 + inset + offset))
+    else:
+        wheels.append((rear_ax, WR,  W / 2 - inset))
+        wheels.append((rear_ax, WR, -W / 2 + inset))
+
+    # Stash a small static dump-hopper tilt (mirrors the original
+    # truck.py randomization so each variant bakes a consistent shape).
+    dump_lift = float(rng.uniform(0.00, 0.15))
+
+    return {
+        'style': style, 'L': L, 'W': W, 'W_cabin': W_cabin, 'WR': WR,
+        'stations': stations, 'K': K, 'cabin': cabin, 'wheels': wheels,
+        'color': color, 'spoke_count': spoke_count,
+        'body_top_y': body_top_y, 'roof_y': roof_y,
+        'cab_rear_bot': cab_rear_bot, 'cab_front_bot': cab_front_bot,
+        'cab_rear_top': cab_rear_top, 'cab_front_top': cab_front_top,
+        'cargo_front_x': cargo_front_x, 'cargo_rear_x': cargo_rear_x,
+        'cargo_top_y': cargo_top_y,
+        'rear_x': rear_x, 'front_x': front_x, 'BH': BH, 'HL': HL,
+        'dual_rear': dual_rear, 'stacks': stacks, 'beacon': beacon,
+        'bed_rails': bed_rails, 'mud_flaps': mud_flaps,
+        'trailer_plate': trailer_plate,
+        'dump_lift': dump_lift,
+    }
+
+
+def _truck_draw_cargo(truck, paint_tex):
+    style = truck['style']
+    color = truck['color']
+    W = truck['W']
+    x0 = truck['cargo_rear_x']
+    x1 = truck['cargo_front_x']
+    y0 = truck['body_top_y']
+    yt = truck['cargo_top_y']
+
+    if style == 'pickup':
+        wall_h = yt - y0
+        wall_t = 0.06
+        zw = W * 0.48
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, paint_tex)
+        _car_mat_paint(color)
+        _truck_draw_box(x0, x1, y0 - 0.02, y0, -zw, zw)
+        _truck_draw_box(x0, x1, y0, y0 + wall_h, zw - wall_t, zw)
+        _truck_draw_box(x0, x1, y0, y0 + wall_h, -zw, -zw + wall_t)
+        _truck_draw_box(x0, x0 + wall_t, y0, y0 + wall_h, -zw, zw)
+        glDisable(GL_TEXTURE_2D)
+        # Bed-liner interior (matte plastic)
+        _car_mat(((0.05, 0.05, 0.06)), (0.11, 0.11, 0.12),
+                 (0.15, 0.15, 0.18), 10.0)
+        _truck_draw_box(x0 + wall_t + 0.01, x1 - 0.02,
+                        y0 + 0.001, y0 + 0.02,
+                        -zw + wall_t + 0.01, zw - wall_t - 0.01)
+        if truck['bed_rails']:
+            _car_mat_chrome()
+            for zs in (zw - wall_t * 0.5, -(zw - wall_t * 0.5)):
+                _truck_draw_box(x0 + 0.05, x1 - 0.05,
+                                y0 + wall_h + 0.02, y0 + wall_h + 0.08,
+                                zs - 0.025, zs + 0.025)
+
+    elif style == 'box_truck':
+        zw = W * 0.52
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, paint_tex)
+        _car_mat_paint((0.93, 0.93, 0.95))  # white box regardless of cab
+        _truck_draw_box(x0, x1, y0 + 0.02, yt, -zw, zw)
+        glDisable(GL_TEXTURE_2D)
+        _car_mat_dark()
+        _truck_draw_box(x0 - 0.01, x0 + 0.005, y0 + 0.08, yt - 0.06,
+                        -zw + 0.08, zw - 0.08)
+        _car_mat_chrome()
+        for frac in (0.28, 0.55, 0.82):
+            ys = y0 + 0.02 + (yt - y0 - 0.02) * frac
+            _truck_draw_box(x0 + 0.01, x1 - 0.01, ys - 0.012, ys + 0.012,
+                            zw - 0.005, zw + 0.005)
+            _truck_draw_box(x0 + 0.01, x1 - 0.01, ys - 0.012, ys + 0.012,
+                            -zw - 0.005, -zw + 0.005)
+
+    elif style == 'semi':
+        _car_mat_dark()
+        plate_z = W * 0.40
+        _truck_draw_box(x0 + 0.10, x1 - 0.05, y0 + 0.02, y0 + 0.12,
+                        -plate_z, plate_z)
+        _car_mat_chrome()
+        _truck_draw_box(x0 + 0.45, x0 + 0.75, y0 + 0.12, y0 + 0.16,
+                        -0.25, 0.25)
+        q = gluNewQuadric()
+        _car_mat_chrome()
+        tank_r = 0.22
+        tank_len = min(1.2, (x1 - x0) * 0.6)
+        tx = (x0 + x1) / 2 - tank_len / 2
+        for side in (1, -1):
+            glPushMatrix()
+            glTranslatef(tx, y0 - tank_r * 0.3, side * (W / 2 + 0.02))
+            glRotatef(-90, 0, 1, 0)
+            gluCylinder(q, tank_r, tank_r, tank_len, 18, 1)
+            gluDisk(q, 0, tank_r, 16, 1)
+            glTranslatef(0, 0, tank_len)
+            gluDisk(q, 0, tank_r, 16, 1)
+            glPopMatrix()
+        gluDeleteQuadric(q)
+
+    elif style == 'flatbed':
+        zw = W * 0.52
+        _car_mat_dark()
+        _truck_draw_box(x0, x1, y0 + 0.01, yt, -zw, zw)
+        _car_mat_chrome()
+        rail_h = 0.08
+        for zs in (zw - 0.02, -(zw - 0.02)):
+            _truck_draw_box(x0 + 0.02, x1 - 0.02,
+                            yt, yt + rail_h,
+                            zs - 0.02, zs + 0.02)
+        _car_mat_dark()
+        n = 5
+        for i in range(n):
+            t = (i + 0.5) / n
+            xs = x0 + (x1 - x0) * t
+            for zs in (zw - 0.02, -(zw - 0.02)):
+                _truck_draw_box(xs - 0.03, xs + 0.03,
+                                yt, yt + rail_h + 0.04,
+                                zs - 0.025, zs + 0.025)
+
+    elif style == 'dump':
+        zw = W * 0.52
+        floor_y = y0 + 0.02
+        lift = truck['dump_lift']
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, paint_tex)
+        _car_mat_paint(color)
+        glBegin(GL_QUADS)
+        glNormal3f(0, 1, 0)
+        glVertex3f(x0, floor_y,        -zw)
+        glVertex3f(x1, floor_y + lift, -zw)
+        glVertex3f(x1, floor_y + lift,  zw)
+        glVertex3f(x0, floor_y,         zw)
+        glEnd()
+        for zs, nz in ((zw, 1), (-zw, -1)):
+            glBegin(GL_QUADS)
+            glNormal3f(0, 0, nz)
+            glVertex3f(x0, floor_y,        zs)
+            glVertex3f(x1, floor_y + lift, zs)
+            glVertex3f(x1, yt + lift,      zs)
+            glVertex3f(x0, yt,             zs)
+            glEnd()
+        glBegin(GL_QUADS)
+        glNormal3f(1, 0, 0)
+        glVertex3f(x1, floor_y + lift, -zw)
+        glVertex3f(x1, yt + lift,      -zw)
+        glVertex3f(x1, yt + lift,       zw)
+        glVertex3f(x1, floor_y + lift,  zw)
+        glEnd()
+        glBegin(GL_QUADS)
+        glNormal3f(-1, 0, 0)
+        glVertex3f(x0, floor_y,    zw)
+        glVertex3f(x0, yt - 0.15,  zw)
+        glVertex3f(x0, yt - 0.15, -zw)
+        glVertex3f(x0, floor_y,   -zw)
+        glEnd()
+        glDisable(GL_TEXTURE_2D)
+        _car_mat_chrome()
+        q = gluNewQuadric()
+        glPushMatrix()
+        glTranslatef(truck['cab_rear_bot'] + 0.05, y0 + 0.10, 0)
+        glRotatef(-70, 0, 0, 1)
+        gluCylinder(q, 0.06, 0.06, 0.45, 12, 1)
+        glPopMatrix()
+        gluDeleteQuadric(q)
+
+
+def _truck_draw_details(truck):
+    W = truck['W']
+    Wc = truck['W_cabin']
+    color = truck['color']
+
+    # Mirrors: truck-style extended arms + large housing
+    mirror_x = truck['cab_front_bot'] - 0.05
+    mirror_y = truck['body_top_y'] + 0.35
+    _car_mat_paint(color)
+    for sign in (1, -1):
+        glPushMatrix()
+        glTranslatef(mirror_x, mirror_y, sign * (Wc / 2 + 0.10))
+        glScalef(0.08, 0.08, 0.20)
+        _car_unit_cube()
+        glPopMatrix()
+        glPushMatrix()
+        glTranslatef(mirror_x, mirror_y, sign * (Wc / 2 + 0.22))
+        glScalef(0.12, 0.28, 0.10)
+        _car_unit_cube()
+        glPopMatrix()
+        _car_mat_chrome()
+        glPushMatrix()
+        glTranslatef(mirror_x + 0.01, mirror_y, sign * (Wc / 2 + 0.28))
+        glBegin(GL_QUADS)
+        glNormal3f(0, 0, sign)
+        glVertex3f(-0.05, -0.13, 0)
+        glVertex3f( 0.05, -0.13, 0)
+        glVertex3f( 0.05,  0.13, 0)
+        glVertex3f(-0.05,  0.13, 0)
+        glEnd()
+        glPopMatrix()
+        _car_mat_paint(color)
+
+    # Exhaust stacks behind the cab (semi only).
+    if truck['stacks']:
+        _car_mat_chrome()
+        q = gluNewQuadric()
+        stack_r = 0.07
+        stack_h = 1.3
+        for sign in (1, -1):
+            sx = truck['cab_rear_bot'] + 0.08
+            sz = sign * (Wc / 2 + 0.03)
+            sy = truck['body_top_y'] + 0.02
+            glPushMatrix()
+            glTranslatef(sx, sy, sz)
+            glRotatef(-90, 1, 0, 0)
+            gluCylinder(q, stack_r, stack_r, stack_h, 14, 2)
+            glTranslatef(0, 0, stack_h)
+            gluDisk(q, 0, stack_r, 14, 1)
+            glPopMatrix()
+        gluDeleteQuadric(q)
+
+    # Roof beacon (amber).
+    if truck['beacon']:
+        _car_mat_emit((1.0, 0.55, 0.05))
+        q = gluNewQuadric()
+        bx = (truck['cab_rear_top'] + truck['cab_front_top']) / 2
+        by = truck['roof_y'] + 0.06
+        glPushMatrix()
+        glTranslatef(bx, by, 0)
+        glScalef(0.12, 0.06, 0.20)
+        gluSphere(q, 1.0, 14, 10)
+        glPopMatrix()
+        gluDeleteQuadric(q)
+        _car_mat_clear()
+
+    # Grille with horizontal chrome bars + chrome bumper.
+    _car_mat_grille()
+    fx = truck['front_x'] - 0.01
+    gy_top = truck['body_top_y'] * 0.80
+    gy_bot = truck['BH'] * 0.85
+    gz = W * 0.32
+    glBegin(GL_QUADS)
+    glNormal3f(1, 0, 0)
+    glVertex3f(fx, gy_bot,  gz)
+    glVertex3f(fx, gy_bot, -gz)
+    glVertex3f(fx, gy_top, -gz)
+    glVertex3f(fx, gy_top,  gz)
+    glEnd()
+    _car_mat_chrome()
+    nb = 4
+    for i in range(nb):
+        t = (i + 0.5) / nb
+        ys = gy_bot + (gy_top - gy_bot) * t
+        glBegin(GL_QUADS)
+        glNormal3f(1, 0, 0)
+        glVertex3f(fx + 0.005, ys - 0.015,  gz)
+        glVertex3f(fx + 0.005, ys - 0.015, -gz)
+        glVertex3f(fx + 0.005, ys + 0.015, -gz)
+        glVertex3f(fx + 0.005, ys + 0.015,  gz)
+        glEnd()
+    _car_mat_chrome()
+    bs_top = truck['BH'] * 0.80
+    bs_bot = truck['BH'] * 0.30
+    glBegin(GL_QUADS)
+    glNormal3f(1, 0, 0)
+    glVertex3f(fx + 0.008, bs_bot,  W * 0.46)
+    glVertex3f(fx + 0.008, bs_bot, -W * 0.46)
+    glVertex3f(fx + 0.008, bs_top, -W * 0.46)
+    glVertex3f(fx + 0.008, bs_top,  W * 0.46)
+    glEnd()
+
+    # Headlights: large rectangular lenses on the front face.
+    head_y = truck['body_top_y'] * 0.72
+    head_half_w = W * 0.12
+    head_half_h = 0.10
+    head_center_z = W * 0.36
+    fx2 = truck['front_x']
+    for zc in (head_center_z, -head_center_z):
+        _car_mat_dark()
+        bz = head_half_w + 0.018
+        by = head_half_h + 0.014
+        glBegin(GL_QUADS)
+        glNormal3f(1, 0, 0)
+        glVertex3f(fx2 + 0.008, head_y - by, zc - bz)
+        glVertex3f(fx2 + 0.008, head_y - by, zc + bz)
+        glVertex3f(fx2 + 0.008, head_y + by, zc + bz)
+        glVertex3f(fx2 + 0.008, head_y + by, zc - bz)
+        glEnd()
+        _car_mat_emit((1.0, 0.97, 0.82))
+        glBegin(GL_QUADS)
+        glNormal3f(1, 0, 0)
+        glVertex3f(fx2 + 0.014, head_y - head_half_h, zc - head_half_w)
+        glVertex3f(fx2 + 0.014, head_y - head_half_h, zc + head_half_w)
+        glVertex3f(fx2 + 0.014, head_y + head_half_h, zc + head_half_w)
+        glVertex3f(fx2 + 0.014, head_y + head_half_h, zc - head_half_w)
+        glEnd()
+        _car_mat_clear()
+
+    # Taillights: larger proportional red lenses on the rear face.
+    tail_y = truck['body_top_y'] * 0.70
+    tail_half_w = W * 0.13
+    tail_half_h = 0.085
+    tail_center_z = W * 0.36
+    rx = truck['rear_x']
+    for zc in (tail_center_z, -tail_center_z):
+        _car_mat_dark()
+        bz = tail_half_w + 0.022
+        by = tail_half_h + 0.018
+        glBegin(GL_QUADS)
+        glNormal3f(-1, 0, 0)
+        glVertex3f(rx - 0.008, tail_y - by, zc + bz)
+        glVertex3f(rx - 0.008, tail_y - by, zc - bz)
+        glVertex3f(rx - 0.008, tail_y + by, zc - bz)
+        glVertex3f(rx - 0.008, tail_y + by, zc + bz)
+        glEnd()
+        _car_mat_emit((1.0, 0.08, 0.06))
+        glBegin(GL_QUADS)
+        glNormal3f(-1, 0, 0)
+        glVertex3f(rx - 0.014, tail_y - tail_half_h, zc + tail_half_w)
+        glVertex3f(rx - 0.014, tail_y - tail_half_h, zc - tail_half_w)
+        glVertex3f(rx - 0.014, tail_y + tail_half_h, zc - tail_half_w)
+        glVertex3f(rx - 0.014, tail_y + tail_half_h, zc + tail_half_w)
+        glEnd()
+        _car_mat_clear()
+    # High-mount centre brake strip on the back of the cab / cargo top.
+    _car_mat_emit((1.0, 0.12, 0.08))
+    strip_half_w = W * 0.22
+    strip_half_h = 0.025
+    strip_y = truck['body_top_y'] * 0.92
+    glBegin(GL_QUADS)
+    glNormal3f(-1, 0, 0)
+    glVertex3f(rx - 0.014, strip_y - strip_half_h,  strip_half_w)
+    glVertex3f(rx - 0.014, strip_y - strip_half_h, -strip_half_w)
+    glVertex3f(rx - 0.014, strip_y + strip_half_h, -strip_half_w)
+    glVertex3f(rx - 0.014, strip_y + strip_half_h,  strip_half_w)
+    glEnd()
+    _car_mat_clear()
+
+    # Mud flaps behind the rearmost axle.
+    if truck['mud_flaps']:
+        _car_mat_dark()
+        rear_axle_x = min(w[0] for w in truck['wheels'])
+        flap_x = rear_axle_x - truck['WR'] * 0.95
+        for sign in (1, -1):
+            glPushMatrix()
+            glTranslatef(flap_x, truck['WR'] * 0.55,
+                         sign * (W / 2 - 0.05))
+            glScalef(0.03, truck['WR'] * 1.1, 0.28)
+            _car_unit_cube()
+            glPopMatrix()
+
+    # Tow hitch (chrome ball + dark bar).
+    _car_mat_chrome()
+    q = gluNewQuadric()
+    glPushMatrix()
+    glTranslatef(truck['rear_x'] - 0.05, truck['BH'] * 0.55, 0)
+    gluSphere(q, 0.055, 12, 10)
+    glPopMatrix()
+    gluDeleteQuadric(q)
+    _car_mat_dark()
+    _truck_draw_box(truck['rear_x'] - 0.10, truck['rear_x'] + 0.02,
+                    truck['BH'] * 0.45, truck['BH'] * 0.60,
+                    -0.05, 0.05)
+
+
+def build_truck_variant(seed):
+    rng = np.random.default_rng(seed)
+    truck = _generate_truck_params(rng)
+    paint_tex = make_car_paint_texture(truck['color'], rng)
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    _car_draw_lower_body(truck, paint_tex)
+    _car_draw_cabin(truck, paint_tex)
+    _truck_draw_cargo(truck, paint_tex)
+    _truck_draw_details(truck)
+    for (wx, wy, wz) in truck['wheels']:
+        _car_draw_wheel(wx, wy, wz, truck['WR'],
+                        1 if wz > 0 else -1, truck['spoke_count'])
+    glEndList()
+    return {
+        'list': list_id, 'paint_tex': paint_tex,
+        'L': truck['L'], 'W': truck['W'],
+        'head_x': truck['front_x'] + 0.015,
+        'tail_x': truck['rear_x'] - 0.015,
+        'head_y': truck['body_top_y'] * 0.72,
+        'tail_y': truck['body_top_y'] * 0.70,
+        'head_zoff': truck['W'] * 0.36,
+        'tail_zoff': truck['W'] * 0.36,
+    }
+
+
+def build_truck_variants(n=N_TRUCK_VARIANTS):
+    return [build_truck_variant(7000 + i) for i in range(n)]
+
+
+def init_trucks(seed=707, s_car=0.0, player_speed=0.0):
+    return init_cars(seed=seed, s_car=s_car, player_speed=player_speed,
+                     n_variants=N_TRUCK_VARIANTS,
+                     n_per_lane=N_TRUCKS_PER_LANE)
+
+
+def draw_trucks(state, truck_variants, s_car, amb_rgb, sun_dir,
+                night_a, flare_tex):
+    # draw_cars is vehicle-agnostic: it just iterates state['cars'] and
+    # calls `variants[c['variant']]['list']`. We pass the truck state and
+    # truck variant pool and reuse it verbatim — including the night
+    # headlight/taillight billboard pass.
+    draw_cars(state, truck_variants, s_car, amb_rgb, sun_dir,
+              night_a, flare_tex)
+
+
 # --- Main ---
 def main():
     pygame.init()
@@ -5218,6 +5812,12 @@ def main():
     # by index per frame.
     car_variants = build_car_variants()
     car_state = init_cars(player_speed=SPEED)
+    # Trucks share the traffic logic but run ~1/4 the density of cars and
+    # spawn from their own pool of lofted variants (pickup / box / semi /
+    # flatbed / dump). Same two-lane flow: left side overtakes, right is
+    # oncoming.
+    truck_variants = build_truck_variants()
+    truck_state = init_trucks(player_speed=SPEED)
     # Flowers: six colour palettes, each compiled as a crossed-quad
     # billboard display list.
     flower_variants = []
@@ -5593,6 +6193,9 @@ def main():
         update_cars(car_state, dt, s_car, speed)
         draw_cars(car_state, car_variants, s_car, amb, sun_d,
                   night_a, flare_tex)
+        update_cars(truck_state, dt, s_car, speed)
+        draw_trucks(truck_state, truck_variants, s_car, amb, sun_d,
+                    night_a, flare_tex)
 
         # snowfall: per-side gating. Flakes only fall where that side of
         # the road is in a frost biome; if left is frost and right isn't,
