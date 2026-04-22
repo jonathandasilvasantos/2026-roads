@@ -4703,30 +4703,81 @@ def _car_draw_details(car):
     glVertex3f(fx + 0.004, bs_top,  W * 0.40)
     glEnd()
 
-    _car_mat_emit((1.0, 0.97, 0.82))
-    head_x = car['front_x'] - 0.06
+    # --- Head- and taillights ---
+    # Real car lamps are rectangular lenses mounted flush on the rear/front
+    # panels, not dome spheres, and at distance the shape + brightness is
+    # what reads. So we draw a thin dark bezel quad for the housing and a
+    # strongly emissive red (tail) / warm-white (head) lens quad on top,
+    # nudged out along the body normal to avoid z-fighting with the end cap.
+    # Emission is applied via GL_EMISSION so the lamps stay the correct
+    # colour regardless of scene lighting — they always glow.
     head_y = car['body_top_y'] * 0.55
-    for zh in (W * 0.33, -W * 0.33):
-        glPushMatrix()
-        glTranslatef(head_x, head_y, zh)
-        glScalef(0.10, 0.07, 0.10)
-        q = gluNewQuadric()
-        gluSphere(q, 1.0, 16, 16)
-        gluDeleteQuadric(q)
-        glPopMatrix()
+    head_half_w = W * 0.11          # horizontal half-extent (centre-to-edge)
+    head_half_h = 0.06              # vertical half-extent
+    head_center_z = W * 0.33
+    for zc in (head_center_z, -head_center_z):
+        fx = car['front_x']
+        _car_mat_dark()
+        glBegin(GL_QUADS)
+        glNormal3f(1, 0, 0)
+        bz = head_half_w + 0.015
+        by = head_half_h + 0.012
+        glVertex3f(fx + 0.008, head_y - by, zc - bz)
+        glVertex3f(fx + 0.008, head_y - by, zc + bz)
+        glVertex3f(fx + 0.008, head_y + by, zc + bz)
+        glVertex3f(fx + 0.008, head_y + by, zc - bz)
+        glEnd()
+        _car_mat_emit((1.0, 0.97, 0.82))
+        glBegin(GL_QUADS)
+        glNormal3f(1, 0, 0)
+        glVertex3f(fx + 0.014, head_y - head_half_h, zc - head_half_w)
+        glVertex3f(fx + 0.014, head_y - head_half_h, zc + head_half_w)
+        glVertex3f(fx + 0.014, head_y + head_half_h, zc + head_half_w)
+        glVertex3f(fx + 0.014, head_y + head_half_h, zc - head_half_w)
+        glEnd()
+        _car_mat_clear()
 
-    _car_mat_emit((0.88, 0.06, 0.06))
-    tail_x = car['rear_x'] + 0.06
-    tail_y = car['body_top_y'] * 0.80
-    for zh in (W * 0.34, -W * 0.34):
-        glPushMatrix()
-        glTranslatef(tail_x, tail_y, zh)
-        glScalef(0.14, 0.06, 0.09)
-        q = gluNewQuadric()
-        gluSphere(q, 1.0, 16, 16)
-        gluDeleteQuadric(q)
-        glPopMatrix()
+    # Taillights: wider, more prominent horizontal bars so they read clearly
+    # from behind even at distance. Saturated red with strong emission.
+    tail_y = car['body_top_y'] * 0.72
+    tail_half_w = W * 0.13
+    tail_half_h = 0.065
+    tail_center_z = W * 0.33
+    rx = car['rear_x']
+    for zc in (tail_center_z, -tail_center_z):
+        _car_mat_dark()
+        glBegin(GL_QUADS)
+        glNormal3f(-1, 0, 0)
+        bz = tail_half_w + 0.018
+        by = tail_half_h + 0.014
+        glVertex3f(rx - 0.008, tail_y - by, zc + bz)
+        glVertex3f(rx - 0.008, tail_y - by, zc - bz)
+        glVertex3f(rx - 0.008, tail_y + by, zc - bz)
+        glVertex3f(rx - 0.008, tail_y + by, zc + bz)
+        glEnd()
+        _car_mat_emit((1.0, 0.08, 0.06))
+        glBegin(GL_QUADS)
+        glNormal3f(-1, 0, 0)
+        glVertex3f(rx - 0.014, tail_y - tail_half_h, zc + tail_half_w)
+        glVertex3f(rx - 0.014, tail_y - tail_half_h, zc - tail_half_w)
+        glVertex3f(rx - 0.014, tail_y + tail_half_h, zc - tail_half_w)
+        glVertex3f(rx - 0.014, tail_y + tail_half_h, zc + tail_half_w)
+        glEnd()
+        _car_mat_clear()
 
+    # Centre brake-light strip — narrower, slightly higher, optional
+    # visual anchor that helps the rear read as a car silhouette from far.
+    _car_mat_emit((1.0, 0.12, 0.08))
+    strip_half_w = W * 0.18
+    strip_half_h = 0.02
+    strip_y = car['body_top_y'] * 0.88
+    glBegin(GL_QUADS)
+    glNormal3f(-1, 0, 0)
+    glVertex3f(rx - 0.014, strip_y - strip_half_h,  strip_half_w)
+    glVertex3f(rx - 0.014, strip_y - strip_half_h, -strip_half_w)
+    glVertex3f(rx - 0.014, strip_y + strip_half_h, -strip_half_w)
+    glVertex3f(rx - 0.014, strip_y + strip_half_h,  strip_half_w)
+    glEnd()
     _car_mat_clear()
 
 
@@ -4834,12 +4885,12 @@ def build_car_variant(seed):
     return {
         'list': list_id, 'paint_tex': paint_tex,
         'L': car['L'], 'W': car['W'],
-        'head_x': car['front_x'] - 0.06,
-        'tail_x': car['rear_x'] + 0.06,
+        'head_x': car['front_x'] + 0.015,
+        'tail_x': car['rear_x'] - 0.015,
         'head_y': car['body_top_y'] * 0.55,
-        'tail_y': car['body_top_y'] * 0.80,
+        'tail_y': car['body_top_y'] * 0.72,
         'head_zoff': car['W'] * 0.33,
-        'tail_zoff': car['W'] * 0.34,
+        'tail_zoff': car['W'] * 0.33,
     }
 
 
@@ -4995,9 +5046,15 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
     cam_up = (float(mv[0][1]), float(mv[1][1]), float(mv[2][1]))
 
     head_col = (1.0 * night_a, 0.96 * night_a, 0.78 * night_a)
-    tail_col = (0.95 * night_a, 0.10 * night_a, 0.08 * night_a)
+    # Taillights get +50% additive intensity at night (user request) —
+    # the halo reads much brighter than headlights around the rear lens
+    # without touching the baked daytime emission.
+    tail_boost = 1.5
+    tail_col = (min(1.0, 0.95 * night_a * tail_boost),
+                min(1.0, 0.10 * night_a * tail_boost),
+                min(1.0, 0.08 * night_a * tail_boost))
     head_size = 0.55
-    tail_size = 0.45
+    tail_size = 0.60
 
     for c in state['cars']:
         s = c['s']
