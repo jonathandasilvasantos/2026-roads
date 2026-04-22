@@ -1064,42 +1064,48 @@ def make_cloud_texture(w=1024, h=512):
 def make_stars_texture(w=1024, h=512):
     """Sparse star field with varying brightness. u wraps horizontally.
 
-    Each star is splatted as a radial Gaussian so larger/brighter ones
-    stay visibly round instead of turning into square pixel blocks.
+    Sharp pin-prick stars, not blurry Gaussian blobs: most stars occupy
+    exactly one pixel, a minority a 2x2 sharp cluster, and a rare few a
+    2x2 core with a faint 1-pixel cross halo (diffraction-spike feel).
+    Uploaded without mipmaps so single-pixel peaks survive rendering.
     """
     rng = np.random.default_rng(19)
     tex = np.zeros((h, w), dtype=np.float32)
 
-    def splat(cx, cy, brightness, sigma):
-        # 3-sigma footprint covers essentially all of the Gaussian
-        extent = max(1, int(math.ceil(sigma * 3.0)))
-        y0, y1 = max(0, cy - extent), min(h, cy + extent + 1)
-        x0, x1 = max(0, cx - extent), min(w, cx + extent + 1)
-        if y1 <= y0 or x1 <= x0:
-            return
-        ys = np.arange(y0, y1)[:, None] - cy
-        xs = np.arange(x0, x1)[None, :] - cx
-        d2 = ys * ys + xs * xs
-        falloff = np.exp(-d2 / (2.0 * sigma * sigma))
-        tex[y0:y1, x0:x1] = np.maximum(
-            tex[y0:y1, x0:x1], brightness * falloff
-        )
+    def _peak(y, x, b):
+        if 0 <= y < h and 0 <= x < w and tex[y, x] < b:
+            tex[y, x] = b
 
-    for _ in range(2400):
-        cy = int(rng.integers(3, h - 3))
-        cx = int(rng.integers(3, w - 3))
+    for _ in range(3200):
+        cy = int(rng.integers(2, h - 2))
+        cx = int(rng.integers(2, w - 2))
         brightness = float(rng.random() ** 2.5)
-        if rng.random() < 0.15:
-            brightness *= 2.0
-        # Mostly pinprick stars; some stars bigger; a few are prominent.
+        if rng.random() < 0.12:
+            brightness *= 2.2
+
         roll = rng.random()
-        if roll < 0.80:
-            sigma = 0.55
-        elif roll < 0.96:
-            sigma = 0.95
+        if roll < 0.88:
+            # pinprick — single pixel, crisp
+            _peak(cy, cx, brightness)
+        elif roll < 0.975:
+            # 2x2 sharp cluster, slightly dimmer per-pixel so the cluster
+            # totals a bit brighter than a pinprick without the edge fade
+            for dy in (0, 1):
+                for dx in (0, 1):
+                    _peak(cy + dy, cx + dx, brightness * 0.92)
         else:
-            sigma = 1.45
-        splat(cx, cy, brightness, sigma)
+            # prominent star: bright 2x2 core with a faint 1-pixel-wide
+            # cross halo so the edges read crisp
+            for dy in (0, 1):
+                for dx in (0, 1):
+                    _peak(cy + dy, cx + dx, brightness)
+            halo = brightness * 0.18
+            for dy in (0, 1):
+                _peak(cy + dy, cx - 1, halo)
+                _peak(cy + dy, cx + 2, halo)
+            for dx in (0, 1):
+                _peak(cy - 1, cx + dx, halo)
+                _peak(cy + 2, cx + dx, halo)
 
     tex = np.clip(tex, 0, 1)
     # fewer stars near horizon (atmospheric extinction)
@@ -2198,7 +2204,9 @@ def main():
     road_tex = upload_texture(make_road_texture())
     terrain_tex = upload_texture(make_terrain_texture())
     cloud_tex = upload_texture(make_cloud_texture(), internal=GL_RGBA, src=GL_RGBA)
-    stars_tex = upload_texture(make_stars_texture())
+    # No mipmaps on the stars texture — mipmap averaging blurs the
+    # single-pixel star peaks into soft patches at distance.
+    stars_tex = upload_texture(make_stars_texture(), mipmaps=False)
     bark_rgb = load_texture_file("textures/Bark001_1K-JPG_Color.jpg")
     bark_tex = upload_texture(bark_rgb)
     snow_bark_tex = upload_texture(make_snow_bark_texture(bark_rgb))
