@@ -55,6 +55,23 @@ Press **Esc** to quit. Runs fullscreen at the native display resolution.
   alpha-cutout quads). Six variants baked once into display lists at
   startup, instanced across forest zones via a deterministic per-slot hash
   for placement, yaw, scale, and variant.
+- **Storms** — independent weather cycle (~90s period) drives storm
+  intensity 0..1. Sky zenith and horizon darken toward neutral gray, cloud
+  tint shifts to storm gray, ambient brightness drops up to 55%, fog
+  thickens +30% at full storm.
+- **Rain** — 1,400 streak particles drawn as `GL_LINES`. Each drop's tail
+  is `pos - velocity * streak_dt`, so the streak direction and length
+  match its motion (a cheap motion-blur approximation). Fall velocity is
+  17–25 m/s with a slight wind-driven X component for slant. Alpha fades
+  with storm intensity; particles never appear outside a storm.
+- **Lightning** — procedural bolts via 6-level recursive midpoint
+  displacement (start at cloud altitude, end near ground, midpoint of
+  each segment perpendicularly displaced with displacement shrinking at
+  each iteration). Produces a 65-vertex jagged main line plus 1–3
+  branching forks subdivided 4 levels. Two-pass draw: wide additive glow
+  underneath, thin bright core on top. Lightning life ~0.22s, briefly
+  whites out the sky and boosts ambient so the whole scene flashes. Strike
+  probability scales with storm intensity.
 - **City skyline** — rectangular-prism buildings tiled with a procedural
   facade texture (8-wide × 16-tall window grid on a concrete base). 12
   variants baked into display lists at startup with varied widths, depths,

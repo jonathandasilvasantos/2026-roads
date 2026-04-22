@@ -212,30 +212,50 @@ def _lerp3(a, b, t):
             a[2] * (1 - t) + b[2] * t)
 
 
-def sky_colors_at(t_day):
+def sky_colors_at(t_day, storm=0.0, flash=0.0):
     t = t_day % 1.0
+    zen = horz = None
     for i in range(len(SKY_KEYS) - 1):
         t0, z0, h0 = SKY_KEYS[i]
         t1, z1, h1 = SKY_KEYS[i + 1]
         if t0 <= t <= t1:
             a = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
-            return _lerp3(z0, z1, a), _lerp3(h0, h1, a)
-    return SKY_KEYS[0][1], SKY_KEYS[0][2]
+            zen = _lerp3(z0, z1, a)
+            horz = _lerp3(h0, h1, a)
+            break
+    if zen is None:
+        zen, horz = SKY_KEYS[0][1], SKY_KEYS[0][2]
+    # storm darkens the whole dome toward neutral gray
+    if storm > 0.001:
+        sz = (0.12, 0.13, 0.17)
+        sh = (0.22, 0.22, 0.26)
+        zen = _lerp3(zen, sz, storm * 0.75)
+        horz = _lerp3(horz, sh, storm * 0.75)
+    # lightning flash briefly whites out the sky
+    if flash > 0.001:
+        zen = (min(1.0, zen[0] + flash * 0.45),
+               min(1.0, zen[1] + flash * 0.45),
+               min(1.0, zen[2] + flash * 0.50))
+        horz = (min(1.0, horz[0] + flash * 0.55),
+                min(1.0, horz[1] + flash * 0.55),
+                min(1.0, horz[2] + flash * 0.60))
+    return zen, horz
 
 
-def ambient_at(t_day):
+def ambient_at(t_day, storm=0.0, flash=0.0):
     """Returns (brightness scalar, RGB tint) affecting terrain/road."""
     el = sun_dir_at(t_day)[1]
-    # brightness ramps from 0.20 (deep night) to 1.0 at sun_el >= 0.35
     day = _smooth((el + 0.15) / 0.50)
     bright = 0.22 + 0.78 * day
-    # Warm tint near sunrise/sunset, neutral at noon, cool-blue at night
     warm = _smooth(1.0 - abs(el) / 0.25) * (1.0 if el > -0.25 else 0.0)
-    # cold factor at night
     cold = _smooth((-el - 0.10) / 0.60)
     r = 1.0 + 0.20 * warm - 0.25 * cold
     g = 1.0 + 0.05 * warm - 0.18 * cold
     b = 1.0 - 0.15 * warm + 0.15 * cold
+    # storm dims the scene
+    bright *= (1.0 - 0.55 * storm)
+    # lightning flash briefly overpowers everything
+    bright = min(1.6, bright + flash * 0.85)
     return bright, (r, g, b)
 
 
@@ -245,18 +265,208 @@ def night_factor_at(t_day):
     return _smooth((-el + 0.05) / 0.35)
 
 
-def cloud_tint_at(t_day):
+def cloud_tint_at(t_day, storm=0.0):
     el = sun_dir_at(t_day)[1]
     day = _smooth((el + 0.15) / 0.50)
     warm = _smooth(1.0 - abs(el) / 0.25) * (1.0 if el > -0.25 else 0.0)
-    # base: dim gray at night, white noon, orange at sunrise/sunset
     base_r = 0.35 + 0.65 * day
     base_g = 0.38 + 0.60 * day
     base_b = 0.45 + 0.55 * day
     r = base_r + 0.30 * warm
     g = base_g + 0.10 * warm
     b = base_b - 0.05 * warm
+    if storm > 0.001:
+        dark = (0.22, 0.22, 0.26)
+        r = r * (1 - storm) + dark[0] * storm
+        g = g * (1 - storm) + dark[1] * storm
+        b = b * (1 - storm) + dark[2] * storm
     return (min(1.0, r), min(1.0, g), min(1.0, b))
+
+
+# --- Storm / rain / lightning ---
+# Storm cycles on a double-sine so they don't feel metronomic. Peaks push
+# intensity into [0, 1] via a soft threshold. Ambient, sky, and fog all
+# consume the intensity to darken the scene and thicken the atmosphere.
+
+STORM_PERIOD = 90.0  # seconds per primary cycle
+
+# Rain particle system
+RAIN_N = 1400
+RAIN_BOX_X = 32.0
+RAIN_BOX_Z = 55.0
+RAIN_Y_TOP = 22.0
+RAIN_Y_BOTTOM = -2.0
+RAIN_STREAK_DT = 0.08  # streak length in seconds of motion
+
+# Lightning
+BOLT_LIFE = 0.22  # seconds each bolt is visible
+
+
+def storm_intensity_at(t_time):
+    """0 in clear weather, 1 in the middle of a storm. Transitions are
+    naturally gradual because the two sines combine smoothly."""
+    a = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / STORM_PERIOD)
+    b = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 33.7 + 1.3)
+    raw = a * b
+    x = max(0.0, (raw - 0.30) / 0.55)
+    x = min(1.0, x)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def init_rain(seed=91):
+    rng = np.random.default_rng(seed)
+    pos = np.zeros((RAIN_N, 3), dtype=np.float32)
+    pos[:, 0] = rng.uniform(-RAIN_BOX_X, RAIN_BOX_X, RAIN_N)
+    pos[:, 1] = rng.uniform(RAIN_Y_BOTTOM, RAIN_Y_TOP, RAIN_N)
+    pos[:, 2] = rng.uniform(-RAIN_BOX_Z, RAIN_BOX_Z * 0.25, RAIN_N)
+    vel = np.zeros((RAIN_N, 3), dtype=np.float32)
+    vel[:, 0] = 2.2 + rng.uniform(-0.8, 0.8, RAIN_N)   # wind drift on X
+    vel[:, 1] = rng.uniform(-25.0, -17.0, RAIN_N)       # hard fall
+    vel[:, 2] = rng.uniform(-0.6, 0.6, RAIN_N)
+    return pos, vel
+
+
+def update_rain(state, dt):
+    pos, vel = state
+    pos += vel * dt
+    below = pos[:, 1] < RAIN_Y_BOTTOM
+    outX = np.abs(pos[:, 0]) > RAIN_BOX_X
+    outZ = np.abs(pos[:, 2]) > RAIN_BOX_Z
+    respawn = below | outX | outZ
+    n = int(respawn.sum())
+    if n > 0:
+        rng = np.random.default_rng()
+        pos[respawn, 0] = rng.uniform(-RAIN_BOX_X, RAIN_BOX_X, n).astype(np.float32)
+        pos[respawn, 1] = RAIN_Y_TOP
+        pos[respawn, 2] = rng.uniform(-RAIN_BOX_Z, RAIN_BOX_Z * 0.3, n).astype(np.float32)
+
+
+def draw_rain(state, intensity, cam_x, cam_y, cam_z):
+    """Render rain as short GL_LINES streaks. Each drop draws a line from
+    its current position to pos - velocity * streak_dt — direction of the
+    streak matches the motion, length approximates motion blur."""
+    if intensity < 0.04:
+        return
+    pos, vel = state
+    # streak ends: tail trails behind the head by streak_dt of motion
+    tails = pos - vel * RAIN_STREAK_DT
+    lines = np.empty((RAIN_N * 2, 3), dtype=np.float32)
+    lines[0::2] = pos
+    lines[1::2] = tails
+
+    glDisable(GL_TEXTURE_2D)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glDepthMask(GL_FALSE)
+    glLineWidth(1.3)
+    glPushMatrix()
+    glTranslatef(cam_x, cam_y, cam_z)
+    # cool-blue rain with alpha tied to storm intensity
+    glColor4f(0.60, 0.72, 0.90, min(1.0, intensity * 0.75))
+    glEnableClientState(GL_VERTEX_ARRAY)
+    glVertexPointer(3, GL_FLOAT, 0, lines)
+    glDrawArrays(GL_LINES, 0, RAIN_N * 2)
+    glDisableClientState(GL_VERTEX_ARRAY)
+    glPopMatrix()
+    glLineWidth(1.0)
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+
+
+def generate_bolt(rng, cam_x, cam_y, cam_z):
+    """Fractal lightning via recursive midpoint displacement (Wonka-style
+    lightning from the 1986 paper by Reed & Wyvill; extended with random
+    branch forks). Starts high in the clouds, ends near the ground at a
+    random horizontal offset from the camera.
+    """
+    angle = rng.uniform(0, 2 * math.pi)
+    dist = rng.uniform(70.0, 180.0)
+    end = np.array([cam_x + math.cos(angle) * dist,
+                    cam_y - 4.0,
+                    cam_z + math.sin(angle) * dist], dtype=np.float32)
+    start = np.array([end[0] + rng.uniform(-22, 22),
+                      cam_y + 110.0,
+                      end[2] + rng.uniform(-22, 22)], dtype=np.float32)
+
+    pts = [start, end]
+    for it in range(6):  # 6 subdivisions → 65 segments
+        new_pts = [pts[0]]
+        for i in range(len(pts) - 1):
+            a = pts[i]
+            b = pts[i + 1]
+            mid = (a + b) * 0.5
+            seg_len = float(np.linalg.norm(b - a))
+            disp_scale = seg_len * 0.30 * (0.58 ** it)  # shrinking
+            # displace roughly perpendicular-horizontal (X,Z) + small Y wobble
+            disp = np.array([rng.uniform(-1, 1), rng.uniform(-0.25, 0.25),
+                             rng.uniform(-1, 1)], dtype=np.float32) * disp_scale
+            new_pts.append(mid + disp)
+            new_pts.append(b)
+        pts = new_pts
+
+    main_line = np.stack(pts).astype(np.float32)
+
+    # Optional forks — a couple of short tributaries
+    forks = []
+    for _ in range(rng.integers(1, 4)):
+        i = int(rng.integers(2, len(pts) - 4))
+        origin = pts[i]
+        # tributary target: angle off the main direction, shorter
+        tgt = origin + np.array([rng.uniform(-35, 35),
+                                 rng.uniform(-25, -5),
+                                 rng.uniform(-35, 35)], dtype=np.float32)
+        fpts = [origin, tgt]
+        for it in range(4):
+            n_new = [fpts[0]]
+            for j in range(len(fpts) - 1):
+                a = fpts[j]; b = fpts[j + 1]
+                mid = (a + b) * 0.5
+                sl = float(np.linalg.norm(b - a))
+                ds = sl * 0.28 * (0.55 ** it)
+                d = np.array([rng.uniform(-1, 1), rng.uniform(-0.2, 0.2),
+                              rng.uniform(-1, 1)], dtype=np.float32) * ds
+                n_new.append(mid + d)
+                n_new.append(b)
+            fpts = n_new
+        forks.append(np.stack(fpts).astype(np.float32))
+
+    return main_line, forks
+
+
+def draw_bolt(bolt, age):
+    """Two-pass line rendering: thick dim glow beneath, thin bright core on
+    top. Additive blending makes the bolt pop against the dark storm sky."""
+    if bolt is None or age > BOLT_LIFE:
+        return
+    main_line, forks = bolt
+    life_t = 1.0 - age / BOLT_LIFE
+    # tweak curve so bolt stays bright for first half, fades in the second
+    vis = life_t ** 0.6
+
+    glDisable(GL_TEXTURE_2D)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE)  # additive
+    glDepthMask(GL_FALSE)
+
+    for line_pts in (main_line, *forks):
+        # glow pass
+        glLineWidth(6.0)
+        glColor4f(0.60, 0.78, 1.0, vis * 0.35)
+        glBegin(GL_LINE_STRIP)
+        for p in line_pts:
+            glVertex3f(float(p[0]), float(p[1]), float(p[2]))
+        glEnd()
+        # core pass
+        glLineWidth(2.0)
+        glColor4f(1.0, 1.0, 1.0, vis)
+        glBegin(GL_LINE_STRIP)
+        for p in line_pts:
+            glVertex3f(float(p[0]), float(p[1]), float(p[2]))
+        glEnd()
+
+    glLineWidth(1.0)
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
 
 
 # --- Textures ---
@@ -438,12 +648,13 @@ def compute_dome_colors(vfrac, zenith, horizon):
     return (h[None, :] * (1.0 - ev[:, None]) + z[None, :] * ev[:, None]).astype(np.float32)
 
 
-def draw_sky(sky_state, cam_x, cam_y, cam_z, t_time, t_day):
+def draw_sky(sky_state, cam_x, cam_y, cam_z, t_time, t_day,
+             storm=0.0, flash=0.0):
     verts, tcs, vfrac, idx, cloud_tex, stars_tex = sky_state
-    zenith, horizon = sky_colors_at(t_day)
+    zenith, horizon = sky_colors_at(t_day, storm, flash)
     colors = compute_dome_colors(vfrac, zenith, horizon)
     night_a = night_factor_at(t_day)
-    cloud_tint = cloud_tint_at(t_day)
+    cloud_tint = cloud_tint_at(t_day, storm)
 
     glDepthMask(GL_FALSE)
     glDisable(GL_DEPTH_TEST)
@@ -1432,6 +1643,11 @@ def main():
     facade_tex = upload_texture(make_facade_texture())
     emission_tex = upload_texture(make_facade_emission_texture(), internal=GL_RGBA, src=GL_RGBA)
     building_lists = build_building_variants()
+    rain_state = init_rain()
+    bolt_rng = np.random.default_rng(613)
+    active_bolt = None
+    bolt_age = 0.0
+    time_to_strike = 3.0
     sv, stc, sfr, sidx = build_sky_dome()
     sky_state = (sv, stc, sfr, sidx, cloud_tex, stars_tex)
 
@@ -1466,9 +1682,21 @@ def main():
         t_time += dt
         t_day = (t_day + dt / DAY_PERIOD) % 1.0
 
-        # day/night derived values
-        zenith, horizon = sky_colors_at(t_day)
-        bright, tint = ambient_at(t_day)
+        # weather tick: storm intensity and lightning lifecycle
+        storm_i = storm_intensity_at(t_time)
+        if active_bolt is not None:
+            bolt_age += dt
+            if bolt_age > BOLT_LIFE:
+                active_bolt = None
+                bolt_age = 0.0
+
+        flash = 0.0
+        if active_bolt is not None:
+            flash = (1.0 - bolt_age / BOLT_LIFE) ** 0.6
+
+        # day/night + weather derived values
+        zenith, horizon = sky_colors_at(t_day, storm_i, flash)
+        bright, tint = ambient_at(t_day, storm_i, flash)
         amb = (tint[0] * bright, tint[1] * bright, tint[2] * bright)
         night_a = night_factor_at(t_day)
         sun_d = sun_dir_at(t_day)
@@ -1483,7 +1711,8 @@ def main():
         # frost_intensity_at returns the smoothstep-blended biome weight so
         # density eases in/out at zone transitions rather than snapping.
         frost_i = frost_intensity_at(s_car)
-        glFogf(GL_FOG_DENSITY, 0.0055 * (1.0 + 0.10 * frost_i))
+        # +10% fog in frost, +30% more in heavy storm (rain reduces visibility)
+        glFogf(GL_FOG_DENSITY, 0.0055 * (1.0 + 0.10 * frost_i + 0.30 * storm_i))
         glClearColor(horizon[0], horizon[1], horizon[2], 1.0)
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -1499,7 +1728,17 @@ def main():
         lz = -(s_look - s_car)
         gluLookAt(cx, cy, cz, lx, ly, lz, 0.0, 1.0, 0.0)
 
-        draw_sky(sky_state, cx, cy, cz, t_time, t_day)
+        # Try to trigger a new bolt now that we have the camera position
+        time_to_strike -= dt
+        if active_bolt is None and time_to_strike <= 0.0:
+            if storm_i > 0.40 and bolt_rng.random() < storm_i * 0.7:
+                active_bolt = generate_bolt(bolt_rng, cx, cy, cz)
+                bolt_age = 0.0
+                time_to_strike = float(bolt_rng.uniform(1.8, 5.0)) / max(0.4, storm_i)
+            else:
+                time_to_strike = 0.35
+
+        draw_sky(sky_state, cx, cy, cz, t_time, t_day, storm_i, flash)
 
         # sun + moon sit on top of the sky pass but behind terrain
         sc = sun_color(t_day)
@@ -1528,6 +1767,13 @@ def main():
         wR_frost = frost_weight_at(s_car, +1)
         update_snow(snow_state, dt, t_time)
         draw_snow(snow_state, snowflake_tex, wL_frost, wR_frost, cx, cy, cz)
+
+        # rain: everywhere a storm is active. Fades with storm intensity.
+        update_rain(rain_state, dt)
+        draw_rain(rain_state, storm_i, cx, cy, cz)
+
+        # lightning bolt (if one is currently active)
+        draw_bolt(active_bolt, bolt_age)
 
         pygame.display.flip()
 
