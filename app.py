@@ -2435,15 +2435,44 @@ def build_tree_variants(bark_tex, leaf_tex, n=N_TREE_VARIANTS):
     return [build_tree_variant(101 + i * 37, bark_tex, leaf_tex) for i in range(n)]
 
 
-def draw_forest(s_car, tree_lists, frost_tree_lists, amb_rgb):
+def draw_forest(s_car, tree_lists, frost_tree_lists, amb_rgb,
+                t_time=0.0, wind_strength=0.0):
     """Instance baked tree lists across positions in forest/frost biome zones.
     Picks the frost (snow-covered) variant set where the slot is in a frost
     zone; forest zones get the normal green variants.
+
+    Wind sway (NVIDIA GPU Gems 3 Ch. 6 / Crytek Chapter 16 approach,
+    adapted for fixed-function / baked display lists):
+
+      * `wind_strength` (0-1) drives a small rotation applied to every
+        tree before its display list is called. The rotation happens
+        around the tree's base (local origin of the display list) so
+        the canopy sways while the trunk's base stays planted.
+      * Two axes (pitch + roll) at different frequencies and phases so
+        the motion doesn't look like a 2D pendulum.
+      * A global gust LFO multiplies the amplitude — all trees sync
+        subtly to the same gust cycle.
+      * Per-tree phase from the same deterministic slot hash so
+        neighbouring trees don't move in unison.
     """
     s_start = math.floor(s_car / TREE_SPACING) * TREE_SPACING
     max_s = s_car + N_SEG * SEG_LEN
     n_steps = int((max_s - s_start) / TREE_SPACING) + 1
     nvar = len(tree_lists)
+
+    # Wind terms computed once per frame
+    sway_active = wind_strength > 0.02
+    if sway_active:
+        gust = 0.55 + 0.45 * math.sin(t_time * 0.32)
+        amp_deg = wind_strength * gust * 5.0   # max ~3.5° per axis
+        omega = 1.2 + wind_strength * 1.8      # sway rate grows with wind
+        # "Base lean" — wind pushes trees consistently, oscillation rides
+        # on top so trees lean into the wind then wobble around it
+        lean_deg = wind_strength * 1.8
+    else:
+        amp_deg = 0.0
+        omega = 0.0
+        lean_deg = 0.0
 
     glEnable(GL_TEXTURE_2D)
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
@@ -2482,6 +2511,18 @@ def draw_forest(s_car, tree_lists, frost_tree_lists, amb_rgb):
             glPushMatrix()
             glTranslatef(tx, ty, tz)
             glRotatef(yaw, 0, 1, 0)
+
+            # Wind sway — rotate around the tree's base (local origin)
+            if sway_active:
+                # Per-tree phase from the same hash, spread across [0, 2π)
+                phase = ((key >> 12) & 0x3FFF) * (2.0 * math.pi / 0x3FFF)
+                sx = lean_deg + amp_deg * math.sin(t_time * omega + phase)
+                sz = amp_deg * 0.6 * math.sin(
+                    t_time * omega * 1.25 + phase + 0.7
+                )
+                glRotatef(sx, 1.0, 0.0, 0.0)
+                glRotatef(sz, 0.0, 0.0, 1.0)
+
             glScalef(scale, scale, scale)
             glCallList(lst)
             glPopMatrix()
@@ -3139,7 +3180,24 @@ def main():
 
         draw_terrain(terrain_tex, snow_ground_tex, s_car, t_time, amb)
         draw_city(s_car, building_lists, facade_tex, emission_tex, amb, night_a)
-        draw_forest(s_car, tree_lists, frost_tree_lists, amb)
+        # Wind strength drives tree sway. Built from the same ingredients as
+        # wind audio: storm intensity dominates, open biomes add exposure,
+        # camera speed a touch. Clamped so peak sway stays around 3-4°.
+        wL_c = biome_weights_vec(
+            np.array([s_car], dtype=np.float32), -1)[0]
+        wR_c = biome_weights_vec(
+            np.array([s_car], dtype=np.float32), +1)[0]
+        open_exp_trees = 0.5 * (
+            wL_c[BIOME_PLAIN] + wL_c[BIOME_MOUNTAIN] + wL_c[BIOME_FROST]
+            + wR_c[BIOME_PLAIN] + wR_c[BIOME_MOUNTAIN] + wR_c[BIOME_FROST]
+        )
+        wind_strength = min(
+            0.8,
+            0.10 + 0.30 * storm_i + 0.18 * open_exp_trees
+                 + 0.05 * (speed / SPEED),
+        )
+        draw_forest(s_car, tree_lists, frost_tree_lists, amb,
+                    t_time, wind_strength)
         draw_ponds(pond_tex, s_car, storm_i, horizon, amb, t_time)
         draw_road(road_tex, s_car, amb)
         # Bridges + tunnels: placed where biomes dictate (river / mountain)
