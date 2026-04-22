@@ -7,3 +7,5 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+soundfonts/*.sf2
+soundfonts/*.7z

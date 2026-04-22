@@ -2,3 +2,4 @@ numpy==2.4.4
 pygame==2.6.1
 PyOpenGL==3.1.10
 sounddevice==0.5.5
+pyfluidsynth==1.3.4

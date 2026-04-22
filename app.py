@@ -13,6 +13,16 @@ try:
 except Exception:
     _AUDIO_AVAILABLE = False
 
+try:
+    import fluidsynth as _fluidsynth
+    _FLUIDSYNTH_AVAILABLE = True
+except Exception:
+    _FLUIDSYNTH_AVAILABLE = False
+
+import os
+import threading
+import time as _time_mod
+
 from OpenGL.GL import *
 from OpenGL.GLU import (
     gluPerspective, gluLookAt, gluNewQuadric, gluQuadricTexture,
@@ -491,6 +501,120 @@ class BrownNoisePlayer:
         samples = buf[i0] * (1.0 - frac) + buf[i1] * frac
         outdata[:, 0] = samples * _AUDIO_VOLUME
         self.phase = float((self.phase + frames * sp) % n)
+
+
+# --- Minimalist procedural piano ---------------------------------------
+# Generative strategy drawn from the minimalism research lineage:
+#   * Scale-constrained random walk (Markov-style transitions biased by
+#     pitch proximity — neighbouring notes are far more likely than
+#     leaps). This is the simplest generative grammar that yields
+#     melodically coherent lines (Kiesow & Fadiga / Jacob 2021 Markov
+#     chains for computer music).
+#   * Arvo Pärt's *tintinnabuli* overlay: a second voice that plays only
+#     notes of the tonic triad at a lower octave, synchronised with the
+#     melody. Creates the signature spare, sacred sound.
+#   * Slow tempo (~45 BPM) with a generous rest probability (Erik Satie
+#     / Brian Eno generative ambient approach).
+#   * Dynamics (velocity) kept soft (40-70 of 127) so the piano sits as
+#     an ambient layer under the brown-noise rush.
+#
+# Rendering goes through FluidSynth (C library) playing a CC0 Upright
+# Piano KW SoundFont. The synth runs its own real-time audio thread via
+# CoreAudio; the scheduler thread just issues noteon/noteoff events.
+
+SOUNDFONT_PATH = "soundfonts/UprightPianoKW.sf2"
+
+
+class MinimalPianoPlayer:
+    # A-minor pentatonic-plus across ~3 octaves (MIDI note numbers)
+    SCALE = [57, 60, 62, 64, 67, 69, 72, 74, 76, 79, 81, 84]
+    # Tonic triad notes used by the tintinnabuli accompaniment
+    TRIAD = [57, 60, 64, 69, 72, 76, 81]
+    BPM = 45.0
+
+    def __init__(self, sf2_path=SOUNDFONT_PATH, gain=0.32):
+        self.beat_sec = 60.0 / self.BPM
+        self.fs = _fluidsynth.Synth(samplerate=44100, gain=gain)
+        # CoreAudio driver on macOS; fluidsynth picks the default if the
+        # named driver isn't available on other platforms.
+        try:
+            self.fs.start(driver="coreaudio")
+        except Exception:
+            self.fs.start()
+        sfid = self.fs.sfload(sf2_path)
+        if sfid == -1:
+            raise RuntimeError(f"failed to load SoundFont at {sf2_path}")
+        # Channel 0 = melody, channel 1 = tintinnabuli triad
+        self.fs.program_select(0, sfid, 0, 0)
+        self.fs.program_select(1, sfid, 0, 0)
+        self.rng = random.Random(2024)
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+        try:
+            self.fs.all_notes_off(0)
+            self.fs.all_notes_off(1)
+            self.fs.delete()
+        except Exception:
+            pass
+
+    def _loop(self):
+        """Main scheduler: alternates rests, melody notes, and tintinnabuli
+        overlays. Uses Event.wait(seconds) for all timing so shutdown
+        interrupts any in-flight sleep immediately."""
+        scale = self.SCALE
+        triad = self.TRIAD
+        last_pitch = 69  # A4 starting point
+        rng = self.rng
+        wait = self.stop_event.wait
+        beat = self.beat_sec
+
+        while not self.stop_event.is_set():
+            # Rests are as much of the composition as the notes
+            if rng.random() < 0.35:
+                if wait(beat):
+                    break
+                continue
+
+            # Markov-ish transition: weight by proximity to last pitch
+            weights = [1.0 / (1.0 + abs(s - last_pitch) * 0.40) for s in scale]
+            pitch = rng.choices(scale, weights=weights, k=1)[0]
+            last_pitch = pitch
+
+            velocity = 40 + rng.randint(0, 25)          # soft dynamics
+            hold_beats = rng.choice([1, 2, 2, 3, 4])
+            gap_beats = rng.choice([0.5, 1.0, 1.0, 1.5])
+            duration = beat * hold_beats
+
+            # Fire the melody note
+            self.fs.noteon(0, pitch, velocity)
+
+            # Tintinnabuli voice: lower-octave tonic triad note, ~45% of notes
+            triad_pitch = None
+            if rng.random() < 0.45:
+                cand = rng.choice(triad)
+                while cand >= pitch:
+                    cand -= 12
+                if cand >= 24:
+                    triad_pitch = cand
+                    self.fs.noteon(1, triad_pitch, max(20, velocity - 15))
+
+            if wait(duration):
+                break
+            self.fs.noteoff(0, pitch)
+            if triad_pitch is not None:
+                self.fs.noteoff(1, triad_pitch)
+
+            if wait(beat * gap_beats):
+                break
 
 
 # --- Lens flare (sprite-based, canonical approach: sun→center ghost chain
@@ -2103,6 +2227,24 @@ def main():
         except Exception as exc:
             print(f"[audio] disabled: {exc}", file=sys.stderr)
             audio_player = None
+
+    # Procedural minimalist piano over the brown-noise bed. Needs
+    # fluidsynth (system library) + pyfluidsynth + the CC0 SoundFont.
+    # Silently skipped if any part is missing.
+    piano_player = None
+    if _FLUIDSYNTH_AVAILABLE and os.path.exists(SOUNDFONT_PATH):
+        try:
+            piano_player = MinimalPianoPlayer()
+            piano_player.start()
+        except Exception as exc:
+            print(f"[piano] disabled: {exc}", file=sys.stderr)
+            piano_player = None
+    elif not os.path.exists(SOUNDFONT_PATH):
+        print(
+            f"[piano] SoundFont missing at {SOUNDFONT_PATH} — "
+            "run setup_soundfonts.py to enable generative piano",
+            file=sys.stderr,
+        )
     bolt_rng = np.random.default_rng(613)
     active_bolt = None
     bolt_age = 0.0
@@ -2280,6 +2422,8 @@ def main():
 
         pygame.display.flip()
 
+    if piano_player is not None:
+        piano_player.stop()
     if audio_player is not None:
         audio_player.stop()
     pygame.quit()

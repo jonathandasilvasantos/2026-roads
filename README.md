@@ -13,10 +13,22 @@ Everything is generated at runtime — no scene files, no pre-baked meshes.
 ```bash
 python3.12 -m venv env
 ./env/bin/python -m pip install -r requirements.txt
+./env/bin/python setup_soundfonts.py    # one-time: fetch the piano SF2
 ./env/bin/python app.py
 ```
 
 Press **Esc** to quit. Runs fullscreen at the native display resolution.
+
+### Audio
+
+- Continuous ambient **brown noise** (1/f² spectrum, FFT-synthesised) plays
+  under the scene. Its playback speed tracks the camera speed so
+  accelerating raises the rumble pitch; stopping drops it into a deep idle.
+- A procedural **minimalist piano** layer plays CC0 *Upright Piano KW*
+  samples through FluidSynth. Requires the `fluidsynth` system library:
+  `brew install fluidsynth` (macOS) or `apt install fluidsynth` (Debian).
+  The SoundFont is 57 MB and downloaded on demand by `setup_soundfonts.py`
+  — kept out of the repo via `.gitignore`.
 
 ## What's in the scene
 
