@@ -25,8 +25,8 @@ Press **Esc** to quit. Runs fullscreen at the native display resolution.
   sits behind the "car" and pitches into climbs and descents by sampling the
   path ahead.
 - **Biomes** — per-side, zone-based. Each ~240m zone on each side of the road
-  independently rolls one of: plain, hill, mountain, river, forest, frost.
-  45m smoothstep transitions blend heights and colors between zones.
+  independently rolls one of: plain, hill, mountain, river, forest, frost,
+  city. 45m smoothstep transitions blend heights and colors between zones.
 - **Frost zones** — real ambientCG Snow001 ground texture overlaid on the
   terrain mesh (second alpha-blended pass), drifts piled against the road
   edge, snow-covered trees (separate tree template set built with a snow-
@@ -55,6 +55,15 @@ Press **Esc** to quit. Runs fullscreen at the native display resolution.
   alpha-cutout quads). Six variants baked once into display lists at
   startup, instanced across forest zones via a deterministic per-slot hash
   for placement, yaw, scale, and variant.
+- **City skyline** — rectangular-prism buildings tiled with a procedural
+  facade texture (8-wide × 16-tall window grid on a concrete base). 12
+  variants baked into display lists at startup with varied widths, depths,
+  and heights (22–78m). UV repetition is baked per-variant so real-world
+  window size stays consistent across building sizes. A second additive
+  emission pass at night uses a matching emission texture where only ~45%
+  of windows are lit with warm-jitter colors, producing a glowing urban
+  skyline. Buildings are placed at 92–175m perpendicular distance so they
+  read as a skyline beyond the terrain mesh and fog hides edges.
 
 ## Textures
 

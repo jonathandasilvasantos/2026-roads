@@ -33,8 +33,8 @@ TERRAIN_EDGE_D = 0.1
 ZONE_LEN = 240.0
 TRANS_LEN = 45.0
 (BIOME_PLAIN, BIOME_HILL, BIOME_MOUNTAIN, BIOME_RIVER,
- BIOME_FOREST, BIOME_FROST) = 0, 1, 2, 3, 4, 5
-BIOME_COUNT = 6
+ BIOME_FOREST, BIOME_FROST, BIOME_CITY) = 0, 1, 2, 3, 4, 5, 6
+BIOME_COUNT = 7
 
 BIOME_COLOR = np.array([
     [0.46, 0.70, 0.26],   # plain grass
@@ -43,6 +43,7 @@ BIOME_COLOR = np.array([
     [0.26, 0.48, 0.68],   # river water
     [0.20, 0.36, 0.14],   # forest floor (dark undergrowth)
     [0.88, 0.92, 1.00],   # frost (snow field, cold blue-white)
+    [0.30, 0.30, 0.33],   # city (concrete/asphalt near-ground)
 ], dtype=np.float32)
 
 # --- Forest / trees ---
@@ -86,7 +87,9 @@ def curve_y_np(s):
 
 # --- Biomes ---
 def biome_at(zone_idx, side):
-    key = (zone_idx * 2654435761 + (0 if side < 0 else 9277) + 1013904223) & 0xFFFFFFFF
+    # offset chosen so the first city zone lands at zone 2 — visible within
+    # ~15 seconds of the start rather than minutes in.
+    key = (zone_idx * 2654435761 + (0 if side < 0 else 9277)) & 0xFFFFFFFF
     return key % BIOME_COUNT
 
 
@@ -162,7 +165,9 @@ def terrain_heights(s, d, t_time):
              + 0.35 * np.exp(-d / 6.0)              # snow pile near road edge
              + 0.45 * np.sin(s * 0.07 + d * 0.09)   # rolling drifts
              + 0.20 * np.sin(s * 0.19))
-    return plain, hill, mountain, river, forest, frost
+    # city: flat paved ground with tiny variation (sidewalks + pavement)
+    city = -0.22 + 0.05 * np.sin(s * 0.35 + d * 0.25)
+    return plain, hill, mountain, river, forest, frost, city
 
 
 # --- Day/Night model ---
@@ -615,10 +620,11 @@ def build_side_arrays(s_arr, s_car, side, t_time, amb_rgb):
     weights = biome_weights_vec(s_arr, side)
     s2 = s_arr[:, None]
     d2 = d[None, :]
-    plain, hill, mnt, river, forest, frost = terrain_heights(s2, d2, t_time)
+    plain, hill, mnt, river, forest, frost, city = terrain_heights(s2, d2, t_time)
     off = (weights[:, 0:1] * plain + weights[:, 1:2] * hill
            + weights[:, 2:3] * mnt + weights[:, 3:4] * river
-           + weights[:, 4:5] * forest + weights[:, 5:6] * frost)
+           + weights[:, 4:5] * forest + weights[:, 5:6] * frost
+           + weights[:, 6:7] * city)
     x = rx[:, None] + side * (ROAD_WIDTH / 2 + d[None, :])
     y = ry[:, None] + off
     z = np.broadcast_to(rz[:, None], (NS, K))
@@ -1152,6 +1158,218 @@ def draw_snow(state, snow_tex, intensity, cam_x, cam_y, cam_z):
     glDisable(GL_POINT_SPRITE)
 
 
+# --- Cityscape biome ---
+# Approach (drawing on Wonka 2003 / Müller 2006 split-grammar ideas but far
+# simpler): each building is a rectangular prism with one tiled "facade"
+# texture on its four sides. UVs are baked at variant-compile time so the
+# window grid keeps a consistent real-world window size across buildings of
+# different sizes. At night, a second additive pass samples a second
+# emission texture at the same UVs — only a random subset of windows are
+# lit, producing a warm urban skyline glow that fades in with night_factor.
+#
+# Buildings are placed far from the road (~90-170m perpendicular) so that
+# detail imperfections and the seam where terrain ends both disappear into
+# atmospheric fog. Placement is deterministic via a per-slot hash, identical
+# between the day and emission passes, so lights line up with windows.
+
+CITY_SLOT_SPACING = 8.0      # stride along road for candidate building slots
+CITY_MIN_D = 92.0            # min perpendicular distance from road edge
+CITY_MAX_D = 175.0
+N_BUILDING_VARIANTS = 12
+
+WINDOW_H_M = 1.7             # world-space size of one window
+FLOOR_H_M = 3.2              # world-space height of one floor
+
+
+def city_weight_at(s, side):
+    return biome_weights_vec(np.array([s], dtype=np.float32), side)[0, BIOME_CITY]
+
+
+def make_facade_texture(size=512, cols=8, rows=16, seed=51):
+    """Base facade: concrete walls with a regular window grid, windows
+    rendered as darker-reflective panels with a lighter frame highlight."""
+    rng = np.random.default_rng(seed)
+    rgb = np.full((size, size, 3), [62, 63, 72], dtype=np.int16)
+    noise = rng.integers(-10, 10, (size, size, 1), dtype=np.int16)
+    rgb = np.clip(rgb + noise, 28, 95).astype(np.uint8)
+
+    cw = size / cols
+    rh = size / rows
+    for c in range(cols):
+        for r in range(rows):
+            x0 = int(c * cw + cw * 0.18)
+            x1 = int(c * cw + cw * 0.82)
+            y0 = int(r * rh + rh * 0.20)
+            y1 = int(r * rh + rh * 0.78)
+            # window pane (darker slightly-blue glass)
+            rgb[y0:y1, x0:x1] = (28, 32, 44)
+            # sill/lintel highlights
+            rgb[y0:y0 + 1, x0:x1] = (112, 112, 120)
+            rgb[y1 - 1:y1, x0:x1] = (22, 22, 28)
+    return rgb
+
+
+def make_facade_emission_texture(size=512, cols=8, rows=16, seed=73):
+    """Sparse lit windows on fully-transparent background. Same UV layout
+    as the base facade so lights land exactly on window panes.
+    ~45% of windows lit, each with slight warm-color jitter."""
+    rng = np.random.default_rng(seed)
+    rgba = np.zeros((size, size, 4), dtype=np.uint8)
+    cw = size / cols
+    rh = size / rows
+    for c in range(cols):
+        for r in range(rows):
+            if rng.random() > 0.45:
+                continue
+            x0 = int(c * cw + cw * 0.18)
+            x1 = int(c * cw + cw * 0.82)
+            y0 = int(r * rh + rh * 0.20)
+            y1 = int(r * rh + rh * 0.78)
+            warm = float(rng.uniform(0.80, 1.0))
+            hue_shift = float(rng.uniform(-0.10, 0.15))  # small cool/warm mix
+            rr = int(np.clip(255 * warm, 40, 255))
+            gg = int(np.clip(225 * warm * (1.0 - hue_shift * 0.4), 40, 255))
+            bb = int(np.clip(150 * warm * (1.0 - hue_shift), 20, 255))
+            rgba[y0:y1, x0:x1, 0] = rr
+            rgba[y0:y1, x0:x1, 1] = gg
+            rgba[y0:y1, x0:x1, 2] = bb
+            rgba[y0:y1, x0:x1, 3] = 255
+    return rgba
+
+
+def build_building_variant(seed):
+    """Compile one building (prism, 4 facade quads) into a display list.
+
+    UV repetition is baked so windows tile consistently with real-world
+    dimensions: one window per WINDOW_H_M horizontally, one floor per
+    FLOOR_H_M vertically. The base matches the number of window *columns*
+    in the facade texture (8) so a complete grid fits every `cols` windows.
+    """
+    rng = random.Random(seed)
+    w = rng.uniform(7.0, 14.0)
+    d = rng.uniform(7.0, 14.0)
+    h = rng.uniform(22.0, 78.0)
+
+    # one texture tile == 8 windows wide × 16 floors tall; build's UV repeats
+    # per world distance chosen so window proportions stay constant.
+    u_front = (w / WINDOW_H_M) / 8.0
+    u_side = (d / WINDOW_H_M) / 8.0
+    v_up = (h / FLOOR_H_M) / 16.0
+
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    glBegin(GL_QUADS)
+    # -Z face (front)
+    glTexCoord2f(0, 0); glVertex3f(-w / 2, 0, -d / 2)
+    glTexCoord2f(u_front, 0); glVertex3f(w / 2, 0, -d / 2)
+    glTexCoord2f(u_front, v_up); glVertex3f(w / 2, h, -d / 2)
+    glTexCoord2f(0, v_up); glVertex3f(-w / 2, h, -d / 2)
+    # +Z face (back)
+    glTexCoord2f(0, 0); glVertex3f(w / 2, 0, d / 2)
+    glTexCoord2f(u_front, 0); glVertex3f(-w / 2, 0, d / 2)
+    glTexCoord2f(u_front, v_up); glVertex3f(-w / 2, h, d / 2)
+    glTexCoord2f(0, v_up); glVertex3f(w / 2, h, d / 2)
+    # -X face (left)
+    glTexCoord2f(0, 0); glVertex3f(-w / 2, 0, d / 2)
+    glTexCoord2f(u_side, 0); glVertex3f(-w / 2, 0, -d / 2)
+    glTexCoord2f(u_side, v_up); glVertex3f(-w / 2, h, -d / 2)
+    glTexCoord2f(0, v_up); glVertex3f(-w / 2, h, d / 2)
+    # +X face (right)
+    glTexCoord2f(0, 0); glVertex3f(w / 2, 0, -d / 2)
+    glTexCoord2f(u_side, 0); glVertex3f(w / 2, 0, d / 2)
+    glTexCoord2f(u_side, v_up); glVertex3f(w / 2, h, d / 2)
+    glTexCoord2f(0, v_up); glVertex3f(w / 2, h, -d / 2)
+    glEnd()
+    glEndList()
+    return list_id, (w, h, d)
+
+
+def build_building_variants(n=N_BUILDING_VARIANTS):
+    return [build_building_variant(701 + i * 41) for i in range(n)]
+
+
+def _iter_city_slots(s_car):
+    """Yield (s, side, key, tx, ty, tz, yaw, variant) for each building slot
+    in visible city zones. Used identically by day and emission passes so
+    geometry lines up perfectly between them."""
+    s_start = math.floor(s_car / CITY_SLOT_SPACING) * CITY_SLOT_SPACING
+    max_s = s_car + N_SEG * SEG_LEN
+    n_steps = int((max_s - s_start) / CITY_SLOT_SPACING) + 1
+    s_arr = np.arange(n_steps, dtype=np.float32) * CITY_SLOT_SPACING + s_start
+    wL = biome_weights_vec(s_arr, -1)[:, BIOME_CITY]
+    wR = biome_weights_vec(s_arr, +1)[:, BIOME_CITY]
+    for i in range(n_steps):
+        s = float(s_arr[i])
+        if s < s_car - 2.0:
+            continue
+        for side, weights in ((-1, wL), (+1, wR)):
+            w = float(weights[i])
+            if w < 0.30:
+                continue
+            key = (int(s * 53) * 2654435761
+                   + (0 if side < 0 else 5099)
+                   + 1013904223) & 0xFFFFFFFF
+            # density gate: more buildings the deeper you're inside the zone
+            if ((key & 0xFFFF) / 65535.0) > w * 0.9:
+                continue
+            d_off = CITY_MIN_D + ((key >> 16) & 0xFF) / 255.0 * (CITY_MAX_D - CITY_MIN_D)
+            variant = ((key >> 24) & 0x0F) % N_BUILDING_VARIANTS
+            yaw = ((key >> 4) & 0x3F) / 63.0 * 360.0
+            tx = curve_x(s) + side * (ROAD_WIDTH / 2 + d_off)
+            ty = curve_y(s) - 0.3
+            tz = -(s - s_car)
+            yield s, side, key, tx, ty, tz, yaw, variant
+
+
+def draw_city(s_car, building_lists, facade_tex, emission_tex,
+              amb_rgb, night_a):
+    """Two-pass render: tinted facade, then additive emission at night."""
+    slots = list(_iter_city_slots(s_car))
+    if not slots:
+        return
+
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, facade_tex)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    # day tint — a bit darker than ambient so buildings read as shaded
+    tint = (min(1.0, amb_rgb[0] * 0.85),
+            min(1.0, amb_rgb[1] * 0.85),
+            min(1.0, amb_rgb[2] * 0.90))
+    glColor3f(*tint)
+
+    for s, side, key, tx, ty, tz, yaw, variant in slots:
+        list_id, _dims = building_lists[variant]
+        glPushMatrix()
+        glTranslatef(tx, ty, tz)
+        glRotatef(yaw, 0, 1, 0)
+        glCallList(list_id)
+        glPopMatrix()
+
+    if night_a < 0.03:
+        return
+
+    # Emission pass: additive blend, warm tint scaled by night factor.
+    glBindTexture(GL_TEXTURE_2D, emission_tex)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+    glDepthMask(GL_FALSE)
+    glColor4f(min(1.0, night_a * 1.1),
+              min(1.0, night_a * 1.02),
+              min(1.0, night_a * 0.85),
+              1.0)
+
+    for s, side, key, tx, ty, tz, yaw, variant in slots:
+        list_id, _dims = building_lists[variant]
+        glPushMatrix()
+        glTranslatef(tx, ty, tz)
+        glRotatef(yaw, 0, 1, 0)
+        glCallList(list_id)
+        glPopMatrix()
+
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+
+
 # --- Main ---
 def main():
     pygame.init()
@@ -1188,6 +1406,9 @@ def main():
     snow_ground_tex = upload_texture(load_texture_file("textures/Snow001_1K-JPG_Color.jpg"))
     snowflake_tex = upload_texture(make_snowflake_texture(), internal=GL_RGBA, src=GL_RGBA)
     snow_state = init_snow()
+    facade_tex = upload_texture(make_facade_texture())
+    emission_tex = upload_texture(make_facade_emission_texture(), internal=GL_RGBA, src=GL_RGBA)
+    building_lists = build_building_variants()
     sv, stc, sfr, sidx = build_sky_dome()
     sky_state = (sv, stc, sfr, sidx, cloud_tex, stars_tex)
 
@@ -1258,6 +1479,7 @@ def main():
                            core_alpha=moon_alpha)
 
         draw_terrain(terrain_tex, snow_ground_tex, s_car, t_time, amb)
+        draw_city(s_car, building_lists, facade_tex, emission_tex, amb, night_a)
         draw_forest(s_car, tree_lists, frost_tree_lists, amb)
         draw_road(road_tex, s_car, amb)
         draw_snow_shoulders(snow_ground_tex, s_car, amb)
