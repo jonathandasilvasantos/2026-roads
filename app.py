@@ -4,7 +4,7 @@ import numpy as np
 import pygame
 from pygame.locals import (
     DOUBLEBUF, OPENGL, FULLSCREEN, QUIT, KEYDOWN, K_ESCAPE,
-    K_UP, K_DOWN, K_LEFT, K_RIGHT, K_SPACE,
+    K_UP, K_DOWN, K_LEFT, K_RIGHT, K_SPACE, K_t,
 )
 import random
 import os
@@ -1254,17 +1254,25 @@ LENS_RAIN_SPAWN_RATE = 10.0        # drops/sec at full rain
 LENS_SNOW_SPAWN_RATE = 5.5         # flakes/sec at full frost
 
 
-def make_lens_drop_texture(size=64):
-    """Soft water-drop blob with a highlight on the upper-left, simulating
-    the way refraction scatters a window light into each drop."""
+def make_lens_drop_texture(size=128):
+    """Soft water-drop blob with a refraction highlight. Alpha is
+    *forced to zero outside the unit circle* (np.where mask), so the
+    square quad's corners are guaranteed fully transparent — this is
+    what makes the drop read as round rather than square regardless of
+    the sprite's aspect ratio."""
     ys, xs = np.mgrid[0:size, 0:size].astype(np.float32)
     c = (size - 1) / 2.0
     d = np.sqrt((xs - c) ** 2 + (ys - c) ** 2) / c
-    alpha = np.clip(1.0 - d, 0.0, 1.0) ** 1.4
 
-    # Highlight ~a quarter from top-left
-    hx = c - size * 0.22
-    hy = c - size * 0.22
+    # Hard circular mask: alpha clipped to 0 past the unit circle and
+    # softly ramping down to zero inside (computed on clipped values so
+    # the power never sees a negative).
+    inside_factor = np.clip(1.0 - d, 0.0, 1.0)
+    alpha_shape = inside_factor ** 0.9
+
+    # Specular highlight (refraction scatter) in the upper-left
+    hx = c - size * 0.24
+    hy = c - size * 0.24
     hd = np.sqrt((xs - hx) ** 2 + (ys - hy) ** 2) / (size * 0.18)
     highlight = np.clip(1.0 - hd, 0.0, 1.0) ** 2.5
 
@@ -1272,35 +1280,36 @@ def make_lens_drop_texture(size=64):
     rgba[..., 0] = 0.60 + 0.35 * highlight
     rgba[..., 1] = 0.70 + 0.28 * highlight
     rgba[..., 2] = 0.85 + 0.14 * highlight
-    # Drops are partially translucent — real water on glass lets the
-    # background through, distorted. Cap alpha so we never occlude.
-    rgba[..., 3] = alpha * 0.55
+    # Translucent, so the background still shows through — real water
+    # on glass doesn't fully occlude.
+    rgba[..., 3] = alpha_shape * 0.62
     return (rgba * 255).clip(0, 255).astype(np.uint8)
 
 
-def make_lens_flake_texture(size=64):
-    """White snowflake: soft disc plus six radial spokes (hexagonal
-    symmetry, like an actual snow crystal)."""
+def make_lens_flake_texture(size=128):
+    """White snowflake: radial disc + six spokes (hexagonal symmetry).
+    Alpha zeroed outside the unit circle so the sprite is truly round."""
     ys, xs = np.mgrid[0:size, 0:size].astype(np.float32)
     c = (size - 1) / 2.0
     dx = xs - c
     dy = ys - c
     r = np.sqrt(dx * dx + dy * dy) / c
 
-    disc = np.clip(1.0 - r, 0.0, 1.0) ** 1.3
+    inside_factor = np.clip(1.0 - r, 0.0, 1.0)
+    disc = inside_factor ** 1.3
     # Spokes: minimum distance to the nearest of 6 axis angles
     angle = np.arctan2(dy, dx)
     mod = np.mod(angle, np.pi / 3.0)
     spoke_dist = np.minimum(mod, np.pi / 3.0 - mod)
     spoke = np.exp(-(spoke_dist * 11.0) ** 2)
-    spoke *= np.clip(1.0 - r, 0.0, 1.0)
+    spoke *= inside_factor
 
     total = np.maximum(disc * 0.55, spoke * 0.95)
     rgba = np.zeros((size, size, 4), dtype=np.float32)
     rgba[..., 0] = 0.96
     rgba[..., 1] = 0.98
     rgba[..., 2] = 1.00
-    rgba[..., 3] = total * 0.80
+    rgba[..., 3] = total * 0.85
     return (rgba * 255).clip(0, 255).astype(np.uint8)
 
 
@@ -1382,6 +1391,10 @@ class LensWeatherOverlay:
         glDisable(GL_DEPTH_TEST)
         glDisable(GL_FOG)
         glDisable(GL_LIGHTING)
+        # Force alpha test off — any earlier pass that left it enabled
+        # (trees, flowers with their cutout state) would otherwise make
+        # these sprites hard-edged and look square.
+        glDisable(GL_ALPHA_TEST)
         glEnable(GL_TEXTURE_2D)
         glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
         glEnable(GL_BLEND)
@@ -1645,18 +1658,23 @@ def draw_ponds(pond_tex, s_car, storm_i, horizon_rgb, amb_rgb, t_time):
             glPushMatrix()
             glTranslatef(px, py, pz)
             glRotatef(yaw, 0, 1, 0)
-            # draw as triangle fan ellipse with world-space UVs so the
-            # ripple texture tiles consistently across pond sizes
+            # Ellipse triangle fan. UVs span the *full* [0, 1] radially
+            # so the pond texture's edge-alpha (zero past r=1) kills
+            # every ring vertex to full transparency — this is what
+            # hides the 28-gon outline and makes the puddle read as a
+            # smooth natural shape instead of an obvious polygon.
             glBegin(GL_TRIANGLE_FAN)
             glNormal3f(0.0, 1.0, 0.0)
             glTexCoord2f(0.5, 0.5); glVertex3f(0.0, 0.0, 0.0)
-            steps = 16
+            steps = 28
             for k in range(steps + 1):
                 t = 2 * math.pi * k / steps
-                x = math.cos(t) * radius
-                z = math.sin(t) * radius * aspect
-                u = 0.5 + (x / (radius * 2.2))
-                v = 0.5 + (z / (radius * 2.2))
+                ctx = math.cos(t)
+                ctz = math.sin(t)
+                x = ctx * radius
+                z = ctz * radius * aspect
+                u = 0.5 + 0.5 * ctx   # full [0, 1] range across ellipse
+                v = 0.5 + 0.5 * ctz
                 glTexCoord2f(u, v); glVertex3f(x, 0.0, z)
             glEnd()
             glPopMatrix()
@@ -4195,6 +4213,7 @@ def main():
     t_day = 0.18
     speed = SPEED
     camera_yaw = 0.0    # degrees; + rotates view right, - rotates left
+    manual_strike_queued = False
     running = True
     while running:
         dt = clock.tick(60) / 1000.0
@@ -4207,6 +4226,11 @@ def main():
                 elif e.key == K_SPACE:
                     # Re-center the camera. Snap back to forward view.
                     camera_yaw = 0.0
+                elif e.key == K_t:
+                    # Manual lightning trigger — convenient while
+                    # exploring; still goes through the normal bolt +
+                    # flash pipeline + thunder clap.
+                    manual_strike_queued = True
 
         # Up/Down + Left/Right: held-key polling so changes feel
         # proportional to how long the key is held.
@@ -4314,24 +4338,36 @@ def main():
 
         # Try to trigger a new bolt now that we have the camera position.
         # Strikes are deliberately rare: poll once per second, low success
-        # probability even at peak storm, and a mandatory gap of several
-        # seconds between consecutive strikes so they feel like events.
+        # Target: a strike roughly every ~50 s of active rain (so about
+        # 2 % of wall-clock time during a storm lights up with a bolt).
+        # With the 1-second polling cadence below, probability per roll
+        # scales with storm_i so light showers barely strike while heavy
+        # storms strike almost every minute. Mandatory 3-8 s gap between
+        # consecutive bolts so they still feel like events.
         time_to_strike -= dt
-        if active_bolt is None and time_to_strike <= 0.0:
-            if storm_i > 0.45 and bolt_rng.random() < storm_i * 0.12:
+        triggered_bolt = False
+        if active_bolt is None and manual_strike_queued:
+            active_bolt = generate_bolt(bolt_rng, cx, cy, cz)
+            bolt_age = 0.0
+            time_to_strike = float(bolt_rng.uniform(3.0, 6.0))
+            triggered_bolt = True
+            manual_strike_queued = False
+        elif active_bolt is None and time_to_strike <= 0.0:
+            if storm_i > 0.25 and bolt_rng.random() < storm_i * 0.35:
                 active_bolt = generate_bolt(bolt_rng, cx, cy, cz)
                 bolt_age = 0.0
-                time_to_strike = float(bolt_rng.uniform(5.0, 12.0))
-                # Thunder clap: louder when the storm is heavier, with a
-                # little random variation per strike so they don't sound
-                # identical.
-                if audio_player is not None:
-                    audio_player.trigger_thunder(
-                        volume=0.40 + storm_i * 0.40
-                               + float(bolt_rng.uniform(-0.05, 0.15)),
-                    )
+                time_to_strike = float(bolt_rng.uniform(3.0, 8.0))
+                triggered_bolt = True
             else:
                 time_to_strike = 1.0
+
+        if triggered_bolt and audio_player is not None:
+            # Thunder clap: louder when the storm is heavier, with a
+            # little random variation per strike so they don't sound
+            # identical. Manual strikes get a standard volume.
+            thunder_vol = 0.40 + max(storm_i, 0.5) * 0.40 \
+                          + float(bolt_rng.uniform(-0.05, 0.15))
+            audio_player.trigger_thunder(volume=thunder_vol)
 
         # Weather-driven ambient mix. Volumes here are the *targets* —
         # the mixer's callback low-passes them with a ~2.5 s time

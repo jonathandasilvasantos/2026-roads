@@ -169,6 +169,7 @@ tree, so the forest is stable across frames without any storage.
 | **Left** | rotate camera left (up to −90°) |
 | **Right** | rotate camera right (up to +90°) |
 | **Space** | re-center the camera to the forward view |
+| **T** | trigger a lightning strike (and thunder clap) |
 | **Esc** | quit |
 
 ## Status
