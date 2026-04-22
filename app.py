@@ -1688,32 +1688,27 @@ def draw_ponds(pond_tex, s_car, storm_i, horizon_rgb, amb_rgb, t_time):
 
 
 def generate_bolt(rng, cam_x, cam_y, cam_z):
-    """Fractal lightning via recursive midpoint displacement (Reed & Wyvill
-    1986; Kim & Lin 2007 for branches). Starts high in the clouds, drops
-    steeply to ground. Horizontal displacement per subdivision decays
-    geometrically so the bolt keeps a recognisably vertical trunk with
-    smaller zigzags layered on. Vertical displacement is kept small so
-    segments don't double back or stall.
-    """
-    angle = rng.uniform(0, 2 * math.pi)
-    dist = rng.uniform(80.0, 200.0)
+    """Classic storm bolt via recursive midpoint displacement (Reed &
+    Wyvill 1986). Horizontal displacement decays geometrically per
+    subdivision so the trunk stays vertical with jagged zigzag layered
+    on top. Life ~0.22 s, triggered by storm events or the T key.
+    Separate from generate_ca_charge (see below), which is the CA-based
+    1–4 frame electric-charge flash."""
+    angle = float(rng.uniform(0, 2 * math.pi))
+    dist = float(rng.uniform(80.0, 200.0))
     end = np.array([cam_x + math.cos(angle) * dist,
                     cam_y - 4.0,
                     cam_z + math.sin(angle) * dist], dtype=np.float32)
-    # Start almost directly above the strike point (small cloud wander only)
     start = np.array([end[0] + rng.uniform(-12, 12),
                       cam_y + 130.0,
                       end[2] + rng.uniform(-12, 12)], dtype=np.float32)
-
     pts = [start, end]
-    for it in range(7):  # 7 subdivisions → 129 segments
+    for it in range(7):
         new_pts = [pts[0]]
         for i in range(len(pts) - 1):
-            a = pts[i]
-            b = pts[i + 1]
+            a = pts[i]; b = pts[i + 1]
             mid = (a + b) * 0.5
             seg_len = float(np.linalg.norm(b - a))
-            # horizontal displacement shrinks fast → crisp mostly-vertical bolt
             dh = seg_len * 0.22 * (0.55 ** it)
             dv = seg_len * 0.05 * (0.55 ** it)
             disp = np.array([rng.uniform(-1, 1) * dh,
@@ -1722,12 +1717,8 @@ def generate_bolt(rng, cam_x, cam_y, cam_z):
             new_pts.append(mid + disp)
             new_pts.append(b)
         pts = new_pts
-
     main_line = np.stack(pts).astype(np.float32)
 
-    # Branch forks — 1 or 2, starting high and peeling off horizontally.
-    # Real bolts rarely fork at the bottom, so pick origins from the top
-    # half of the trunk.
     n_forks = int(rng.integers(1, 3))
     forks = []
     for _ in range(n_forks):
@@ -1752,6 +1743,151 @@ def generate_bolt(rng, cam_x, cam_y, cam_z):
                 n_new.append(b)
             fpts = n_new
         forks.append(np.stack(fpts).astype(np.float32))
+    return main_line, forks
+
+
+def generate_ca_charge(rng, cam_x, cam_y, cam_z, eta=1.6):
+    """Cellular-automaton *electric charge* — a separate, very brief
+    flash (1–4 frames) that complements the main bolt. Grown via a
+    simplified Dielectric Breakdown Model (Niemeyer, Pietronero &
+    Weismann 1984; Kim & Lin 2007 for the full Laplace-solve
+    extension, which we skip for speed). Each iteration adds exactly
+    one cell to a voxel grid; the next cell is chosen from boundary
+    candidates with probability proportional to potential^η, where
+    potential is approximated by grid depth toward ground. η>1 gives
+    the sparse, dendritic structure characteristic of real lightning.
+    """
+    angle = float(rng.uniform(0, 2 * math.pi))
+    dist = float(rng.uniform(80.0, 200.0))
+    ground_x = cam_x + math.cos(angle) * dist
+    ground_z = cam_z + math.sin(angle) * dist
+    ground_y = cam_y - 4.0
+    cloud_y = cam_y + 130.0
+
+    GW_HALF = 9          # horizontal half-width in cells → grid 19 × 19
+    GH = 26              # vertical cells
+    X_PER_CELL = 2.2     # metres per horizontal cell
+    y_per_cell = (cloud_y - ground_y) / GH
+
+    def cell_to_world(ix, iy, iz):
+        wx = ground_x + (ix - GW_HALF) * X_PER_CELL
+        wz = ground_z + (iz - GW_HALF) * X_PER_CELL
+        wy = cloud_y - iy * y_per_cell
+        return (wx, wy, wz)
+
+    # CA seed at top center, with a small cloud-wander offset baked in
+    seed = (GW_HALF, 0, GW_HALF)
+    filled = {seed: None}  # cell -> parent cell
+    max_size_x = 2 * GW_HALF
+    max_size_z = 2 * GW_HALF
+    target_y = GH - 1
+    max_cells = GH * 2 + 12
+
+    # Growth loop — each iteration adds exactly one cell to `filled`
+    while len(filled) < max_cells:
+        boundary = {}  # cell -> (weight, parent)
+        for fcell in filled:
+            cx, cy, cz = fcell
+            # 18 candidate neighbours: 3×2×3 Moore neighbourhood with
+            # dy ∈ {0, 1} (no upward growth — bolts move toward ground)
+            for dx in (-1, 0, 1):
+                for dy in (0, 1):
+                    for dz in (-1, 0, 1):
+                        if dx == 0 and dy == 0 and dz == 0:
+                            continue
+                        nx, ny, nz = cx + dx, cy + dy, cz + dz
+                        if not (0 <= nx <= max_size_x
+                                and 0 <= ny <= target_y
+                                and 0 <= nz <= max_size_z):
+                            continue
+                        ncell = (nx, ny, nz)
+                        if ncell in filled:
+                            continue
+                        # DBM weight: potential^η, with potential
+                        # approximated by depth (0..1 along y)
+                        potential = (ny + 1) / (GH + 1)
+                        w = potential ** eta
+                        if dy == 1:      # vertical preference
+                            w *= 1.9
+                        # Keep the strongest parent claim on this cell
+                        prev = boundary.get(ncell)
+                        if prev is None or w > prev[0]:
+                            boundary[ncell] = (w, fcell)
+
+        if not boundary:
+            break
+
+        # Weighted random choice
+        cells_list = list(boundary.items())
+        weights = [entry[1][0] for entry in cells_list]
+        total_w = sum(weights)
+        if total_w <= 0.0:
+            break
+        r = float(rng.random()) * total_w
+        acc = 0.0
+        new_cell = cells_list[-1][0]
+        parent = cells_list[-1][1][1]
+        for ncell, (w, par) in cells_list:
+            acc += w
+            if r <= acc:
+                new_cell = ncell
+                parent = par
+                break
+        filled[new_cell] = parent
+
+        # Stop early once we've made the ground AND produced some
+        # branching — anything more is just embellishment.
+        if new_cell[1] >= target_y and len(filled) > GH * 1.2:
+            break
+
+    # Tip = deepest cell reached
+    tip = max(filled.keys(), key=lambda c: c[1])
+
+    # Main channel: trace tip → seed via parent pointers
+    main_pts = []
+    cur = tip
+    while cur is not None:
+        main_pts.append(cell_to_world(*cur))
+        cur = filled[cur]
+    main_pts.reverse()
+    main_line = np.array(main_pts, dtype=np.float32)
+
+    # Children map for fork discovery
+    children = {}
+    for c, p in filled.items():
+        if p is not None:
+            children.setdefault(p, []).append(c)
+
+    # Main path as a set so we can exclude it when hunting forks
+    main_set = set()
+    cur = tip
+    while cur is not None:
+        main_set.add(cur)
+        cur = filled[cur]
+
+    # Forks: any cell on the main path that has ≥ 2 children spawns a
+    # fork tracing through the child that *isn't* on the main path.
+    forks = []
+    for c in main_set:
+        ch_list = children.get(c, [])
+        if len(ch_list) < 2:
+            continue
+        for child in ch_list:
+            if child in main_set:
+                continue
+            fork_pts = [cell_to_world(*c)]
+            cur = child
+            for _ in range(12):
+                fork_pts.append(cell_to_world(*cur))
+                nxt = children.get(cur)
+                if not nxt:
+                    break
+                cur = nxt[0]
+            if len(fork_pts) >= 3:
+                forks.append(np.array(fork_pts, dtype=np.float32))
+            break
+        if len(forks) >= 3:
+            break
 
     return main_line, forks
 
@@ -1790,6 +1926,36 @@ def draw_bolt(bolt, age):
             glVertex3f(float(p[0]), float(p[1]), float(p[2]))
         glEnd()
 
+    glLineWidth(1.0)
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+
+
+def draw_ca_charge(bolt):
+    """CA electric-charge flash. Life is measured in frames (1–4), not
+    seconds — every frame it's alive it flashes at full brightness.
+    The glow is wider and core slightly thicker than the normal bolt
+    so the flash reads instantly despite its very short lifetime."""
+    if bolt is None:
+        return
+    main_line, forks = bolt
+    glDisable(GL_TEXTURE_2D)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+    glDepthMask(GL_FALSE)
+    for line_pts in (main_line, *forks):
+        glLineWidth(8.0)
+        glColor4f(0.75, 0.90, 1.0, 0.55)
+        glBegin(GL_LINE_STRIP)
+        for p in line_pts:
+            glVertex3f(float(p[0]), float(p[1]), float(p[2]))
+        glEnd()
+        glLineWidth(2.5)
+        glColor4f(1.0, 1.0, 1.0, 1.0)
+        glBegin(GL_LINE_STRIP)
+        for p in line_pts:
+            glVertex3f(float(p[0]), float(p[1]), float(p[2]))
+        glEnd()
     glLineWidth(1.0)
     glDepthMask(GL_TRUE)
     glDisable(GL_BLEND)
@@ -4201,6 +4367,12 @@ def main():
     active_bolt = None
     bolt_age = 0.0
     time_to_strike = 3.0
+    # Separate CA electric-charge state. Life is measured in frames so
+    # the flash is genuinely brief — 1 to 4 frames (about 16-66 ms at
+    # 60 fps), chosen randomly when the charge is spawned.
+    active_ca_charge = None
+    ca_charge_frames_left = 0
+    ca_time_to_strike = 5.0
     # Seed the EMA with the starting storm value so we don't ramp in from 0
     storm_smoothed = storm_intensity_at(0.0)
     sv, stc, sfr, sidx = build_sky_dome()
@@ -4214,6 +4386,7 @@ def main():
     speed = SPEED
     camera_yaw = 0.0    # degrees; + rotates view right, - rotates left
     manual_strike_queued = False
+    manual_ca_queued = False
     running = True
     while running:
         dt = clock.tick(60) / 1000.0
@@ -4338,12 +4511,7 @@ def main():
 
         # Try to trigger a new bolt now that we have the camera position.
         # Strikes are deliberately rare: poll once per second, low success
-        # Target: a strike roughly every ~50 s of active rain (so about
-        # 2 % of wall-clock time during a storm lights up with a bolt).
-        # With the 1-second polling cadence below, probability per roll
-        # scales with storm_i so light showers barely strike while heavy
-        # storms strike almost every minute. Mandatory 3-8 s gap between
-        # consecutive bolts so they still feel like events.
+        # Regular fractal bolt — ~2 % of rain wall-clock
         time_to_strike -= dt
         triggered_bolt = False
         if active_bolt is None and manual_strike_queued:
@@ -4351,6 +4519,8 @@ def main():
             bolt_age = 0.0
             time_to_strike = float(bolt_rng.uniform(3.0, 6.0))
             triggered_bolt = True
+            # T-key also fires a CA electric charge beside the bolt
+            manual_ca_queued = True
             manual_strike_queued = False
         elif active_bolt is None and time_to_strike <= 0.0:
             if storm_i > 0.25 and bolt_rng.random() < storm_i * 0.35:
@@ -4362,12 +4532,45 @@ def main():
                 time_to_strike = 1.0
 
         if triggered_bolt and audio_player is not None:
-            # Thunder clap: louder when the storm is heavier, with a
-            # little random variation per strike so they don't sound
-            # identical. Manual strikes get a standard volume.
             thunder_vol = 0.40 + max(storm_i, 0.5) * 0.40 \
                           + float(bolt_rng.uniform(-0.05, 0.15))
             audio_player.trigger_thunder(volume=thunder_vol)
+
+        # CA electric charge — *separate* flash, 1-4 frames of full
+        # brightness. Fires independently on rare dice rolls during
+        # storms OR alongside a manual T-key trigger. Never lingers
+        # more than 4 frames.
+        if active_ca_charge is not None:
+            ca_charge_frames_left -= 1
+            if ca_charge_frames_left <= 0:
+                active_ca_charge = None
+
+        ca_time_to_strike -= dt
+        fired_ca = False
+        if active_ca_charge is None:
+            if manual_ca_queued:
+                active_ca_charge = generate_ca_charge(bolt_rng, cx, cy, cz)
+                ca_charge_frames_left = int(bolt_rng.integers(1, 5))  # 1-4
+                ca_time_to_strike = float(bolt_rng.uniform(6.0, 14.0))
+                manual_ca_queued = False
+                fired_ca = True
+            elif ca_time_to_strike <= 0.0:
+                # Rarer than the fractal bolt — about 1/3 the chance so the
+                # flash feels like a special event within a storm.
+                if storm_i > 0.25 and bolt_rng.random() < storm_i * 0.12:
+                    active_ca_charge = generate_ca_charge(bolt_rng, cx, cy, cz)
+                    ca_charge_frames_left = int(bolt_rng.integers(1, 5))
+                    ca_time_to_strike = float(bolt_rng.uniform(10.0, 28.0))
+                    fired_ca = True
+                else:
+                    ca_time_to_strike = 2.0
+
+        if fired_ca and audio_player is not None:
+            # Shorter, tighter clap than a regular bolt — the CA flash
+            # is a quick bright snap, not a sustained rumble.
+            audio_player.trigger_thunder(
+                volume=0.30 + max(storm_i, 0.4) * 0.30
+            )
 
         # Weather-driven ambient mix. Volumes here are the *targets* —
         # the mixer's callback low-passes them with a ~2.5 s time
@@ -4479,6 +4682,8 @@ def main():
 
         # lightning bolt (if one is currently active)
         draw_bolt(active_bolt, bolt_age)
+        # CA electric-charge flash (separate system, frame-counted life)
+        draw_ca_charge(active_ca_charge)
 
         # Lens flare: last pass so it overlays everything like real lens
         # optics. Intensity = sun altitude × view alignment × (1 - storm),
