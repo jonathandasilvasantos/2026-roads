@@ -152,6 +152,11 @@ CAMERA_YAW_LIMIT = 90.0  # ±90° -> 180° total rotation range
 CAM_HEIGHT = 3.4
 CAM_BACK = 5.0
 LOOK_AHEAD = 20.0
+# Road/terrain sheets start this far *behind* s_car so they extend past the
+# camera (which sits at s_car - CAM_BACK). Without this, the near rows would
+# begin at the camera's s and leave a geometry gap below the view, exposing
+# the glClearColor as a horizon-coloured stripe along the bottom of the frame.
+NEAR_EXTEND = CAM_BACK + 2.0 * SEG_LEN
 
 # --- Lamps ---
 LAMP_SPACING = 10.0
@@ -2479,7 +2484,7 @@ def build_side_arrays(s_arr, s_car, side, t_time, amb_rgb):
 
 def draw_terrain(terrain_tex, snow_tex, s_car, t_time, amb_rgb):
     NS = N_SEG + 1
-    s_arr = (np.arange(NS, dtype=np.float32) * SEG_LEN) + s_car
+    s_arr = (np.arange(NS, dtype=np.float32) * SEG_LEN) + (s_car - NEAR_EXTEND)
     idx = grid_indices(NS, K_BANDS)
 
     glEnable(GL_TEXTURE_2D)
@@ -2653,7 +2658,7 @@ def draw_road(tex_id, s_car, amb_rgb, storm_i=0.0):
     glColor3f(r, g, b)
     glBegin(GL_QUAD_STRIP)
     for i in range(N_SEG + 1):
-        s = s_car + i * SEG_LEN
+        s = s_car - NEAR_EXTEND + i * SEG_LEN
         x = curve_x(s)
         y = curve_y(s)
         z = -(s - s_car)
@@ -2673,7 +2678,7 @@ def draw_road_snow_overlay(snow_tex, s_car, amb_rgb):
     Tint is slightly darker than fresh snow (road snow is slushy / tire-
     trafficked, not pristine field snow)."""
     NS = N_SEG + 1
-    s_arr = np.arange(NS, dtype=np.float32) * SEG_LEN + s_car
+    s_arr = np.arange(NS, dtype=np.float32) * SEG_LEN + (s_car - NEAR_EXTEND)
     frost_w = np.maximum(
         biome_weights_vec(s_arr, -1)[:, BIOME_FROST],
         biome_weights_vec(s_arr, +1)[:, BIOME_FROST],
