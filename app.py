@@ -264,6 +264,17 @@ def is_plain(s, side):
     return biome_weights_vec(np.array([s], dtype=np.float32), side)[0, BIOME_PLAIN] > 0.65
 
 
+def is_plain_either_side(s):
+    """Street lamps bracket the road, so a plain/urban zone on *either*
+    side of the road should get lamps on *both* sides (lamps mirror
+    across the carriageway). Previously we gated per-side — if the right
+    side of a zone happened to be another biome, lamps only appeared on
+    the left. Fixes that."""
+    wL = biome_weights_vec(np.array([s], dtype=np.float32), -1)[0, BIOME_PLAIN]
+    wR = biome_weights_vec(np.array([s], dtype=np.float32), +1)[0, BIOME_PLAIN]
+    return max(float(wL), float(wR)) > 0.55
+
+
 def forest_weight_at(s, side):
     return biome_weights_vec(np.array([s], dtype=np.float32), side)[0, BIOME_FOREST]
 
@@ -2134,18 +2145,12 @@ def draw_terrain(terrain_tex, snow_tex, s_car, t_time, amb_rgb):
     glDisableClientState(GL_TEXTURE_COORD_ARRAY)
 
 
-# --- Civil structures: bridges, tunnels ---
-# Placement strategy is biome-driven rather than random:
-#   * Bridge: placed where the road passes a river biome on either side —
-#     the road always crosses water there, so rails fit naturally.
-#   * Tunnel: placed where mountain biome appears on BOTH sides — the
-#     road is in a mountain pass; the tunnel walls occlude the mountain
-#     rise and give the illusion of cutting through rock.
+# --- Civil structures: bridges ---
+# Bridges are placed where the road passes a river biome on either side —
+# the road always crosses water there, so guardrails fit naturally.
 # Collision avoidance is automatic because the biomes are disjoint:
 # trees (forest / frost) and buildings (city) live in different zones
-# from rivers and mountains, so structures never overlap them. Tunnel
-# walls sit just outside the road edge and cover the mountain's
-# steep rise behind.
+# from rivers, so structures never overlap them.
 #
 # Weather reaction is per-vertex: the top edge of rails mixes toward
 # snow-white as frost biome weight rises at the camera, and the whole
@@ -2200,15 +2205,9 @@ def draw_civil_structures(s_car, concrete_tex, amb_rgb, storm_i, frost_i):
     wL = biome_weights_vec(s_arr, -1)
     wR = biome_weights_vec(s_arr, +1)
     bridge_w = np.maximum(wL[:, BIOME_RIVER], wR[:, BIOME_RIVER])
-    # Tunnels need a mountain presence on average — strictly requiring
-    # BOTH sides is too restrictive given the biome distribution (frost
-    # is the only forced-symmetric biome), so we use the mean weight
-    # instead. Practically: a tunnel fires when the road sits in a
-    # mountain pass on at least one side with the other side close.
-    tunnel_w = 0.5 * (wL[:, BIOME_MOUNTAIN] + wR[:, BIOME_MOUNTAIN])
 
-    if bridge_w.max() < 0.25 and tunnel_w.max() < 0.30:
-        return  # nothing to draw in the visible window
+    if bridge_w.max() < 0.25:
+        return  # no bridges in the visible window
 
     base = _structure_tint(amb_rgb, storm_i)
 
@@ -2221,8 +2220,6 @@ def draw_civil_structures(s_car, concrete_tex, amb_rgb, storm_i, frost_i):
 
     if bridge_w.max() >= 0.25:
         _draw_bridges(s_arr, bridge_w, base, frost_i, s_car)
-    if tunnel_w.max() >= 0.30:
-        _draw_tunnels(s_arr, tunnel_w, base, s_car)
 
     glDisable(GL_BLEND)
 
@@ -2266,36 +2263,6 @@ def _draw_bridges(s_arr, bridge_w, base_col, frost_i, s_car):
             glColor4f(base_top[0], base_top[1], base_top[2], alpha)
             glTexCoord2f(u, 1.0); glVertex3f(x, y_base + RAIL_H, z)
         _emit_strip_segments(s_arr, bridge_w, 0.25, emit)
-
-
-def _draw_tunnels(s_arr, tunnel_w, base_col, s_car):
-    WALL_H = 5.6
-    CEIL_Y = 5.4
-    inner = (base_col[0] * 0.55, base_col[1] * 0.55, base_col[2] * 0.58)
-    ceiling = (base_col[0] * 0.40, base_col[1] * 0.40, base_col[2] * 0.44)
-
-    for side in (-1, +1):
-        def emit(i, alpha, side=side):
-            s = float(s_arr[i])
-            x = curve_x(s) + side * (ROAD_WIDTH / 2 + 0.05)
-            y_base = curve_y(s) + 0.03
-            z = -(s - s_car)
-            u = s * 0.18
-            glColor4f(inner[0], inner[1], inner[2], alpha)
-            glTexCoord2f(u, 0.0); glVertex3f(x, y_base, z)
-            glTexCoord2f(u, 1.5); glVertex3f(x, y_base + WALL_H, z)
-        _emit_strip_segments(s_arr, tunnel_w, 0.30, emit)
-
-    def emit_ceil(i, alpha):
-        s = float(s_arr[i])
-        x = curve_x(s)
-        y = curve_y(s) + CEIL_Y
-        z = -(s - s_car)
-        u = s * 0.18
-        glColor4f(ceiling[0], ceiling[1], ceiling[2], alpha)
-        glTexCoord2f(0.0, u); glVertex3f(x - ROAD_WIDTH / 2, y, z)
-        glTexCoord2f(1.0, u); glVertex3f(x + ROAD_WIDTH / 2, y, z)
-    _emit_strip_segments(s_arr, tunnel_w, 0.30, emit_ceil)
 
 
 def draw_road(tex_id, s_car, amb_rgb, storm_i=0.0):
@@ -2382,10 +2349,13 @@ def draw_lamps(s_car, night_a):
     glBegin(GL_LINES)
     for i in range(N_LAMPS):
         s = s_start + i * LAMP_SPACING
+        if not is_plain_either_side(s):
+            continue
         x = curve_x(s); y = curve_y(s); z = -(s - s_car)
+        # Mirror the lamp pair across the road — lights bracket both
+        # sides simultaneously, so the right side always gets the mirror
+        # of whatever the left side gets.
         for side in (-1, 1):
-            if not is_plain(s, side):
-                continue
             px = x + side * (ROAD_WIDTH / 2 + 0.6)
             glVertex3f(px, y, z); glVertex3f(px, y + 3.2, z)
             glVertex3f(px, y + 3.2, z); glVertex3f(px - side * 1.0, y + 3.2, z)
@@ -2399,11 +2369,11 @@ def draw_lamps(s_car, night_a):
         d = s - s_car
         if d < 0:
             continue
+        if not is_plain_either_side(s):
+            continue
         fade = max(0.0, 1.0 - d / (N_LAMPS * LAMP_SPACING * 0.9)) * night_a
         x = curve_x(s); y = curve_y(s); z = -d
         for side in (-1, 1):
-            if not is_plain(s, side):
-                continue
             px = x + side * (ROAD_WIDTH / 2 + 0.6) - side * 1.0
             py = y + 3.15
             for (r, a) in ((1.4, 0.15), (0.7, 0.35), (0.28, 0.9)):
@@ -2862,6 +2832,419 @@ def draw_snow(state, snow_tex, wL, wR, cam_x, cam_y, cam_z):
     glDisable(GL_POINT_SPRITE)
 
 
+# --- Procedural houses ---
+# Rural / suburban dwellings placed far enough from the road that
+# geometric imperfections blur out (50-85 m perpendicular). Each house is
+# a rectangular prism body with a gable roof, with two triangular gable
+# end walls, a front door, and several windows baked in.
+#
+# Diversity: a small library of wall and roof textures is cross-combined
+# into several variants with randomised dimensions. Each variant is
+# compiled once as two display lists:
+#   * body_list — 4 walls (wall tex) + 2 gable triangles + untextured
+#     door + windows. Bakes its own texture bind.
+#   * roof_list — the two slope quads only, leaves no texture bound so
+#     the caller can re-bind snow texture for a progressive roof-snow
+#     overlay during frost zones.
+#
+# Placement:
+#   * Biomes allowed: plain, forest, frost (flat-ground biomes).
+#   * Skipped: mountain (would collide with steep rise), city
+#     (skyscrapers already there), river (water), hill (terrain rises
+#     too much at range 50-85 m to plant a house cleanly).
+#   * Perpendicular distance 50-85 m from the road edge keeps houses
+#     clear of trees (max 47 m) and well clear of city skyscrapers
+#     (which start at 92 m). Result: no collisions with other biome-
+#     placed content.
+#   * Deterministic per-slot hash for position, variant, yaw, scale.
+#   * Roof snow: a second pass of roof_list with snow ground texture
+#     and per-house alpha = frost weight — snow accumulates during
+#     frost biomes and melts away when the biome transitions back.
+
+HOUSE_SPACING = 22.0
+HOUSE_MIN_D = 50.0
+HOUSE_MAX_D = 85.0
+HOUSE_WALL_H_RANGE = (3.2, 4.6)
+HOUSE_ROOF_H_RANGE = (2.0, 3.5)
+
+
+def make_brick_wall_texture(size=256, seed=401):
+    rng = np.random.default_rng(seed)
+    tex = np.zeros((size, size, 3), dtype=np.uint8)
+    # mortar base
+    tex[..., 0] = 200
+    tex[..., 1] = 190
+    tex[..., 2] = 175
+    rows = 10
+    brick_h = size // rows
+    cols = 6
+    brick_w = size // cols
+    for row in range(rows + 1):
+        y0 = row * brick_h + 2
+        y1 = y0 + brick_h - 4
+        offset = 0 if row % 2 == 0 else brick_w // 2
+        for col in range(cols + 1):
+            x0 = (col * brick_w + offset) % size
+            x1 = min(size, x0 + brick_w - 4)
+            if x1 <= x0:
+                continue
+            r = int(rng.integers(140, 190))
+            g = int(rng.integers(55, 85))
+            b = int(rng.integers(40, 65))
+            tex[max(0, y0):min(size, y1), x0:x1, 0] = r
+            tex[max(0, y0):min(size, y1), x0:x1, 1] = g
+            tex[max(0, y0):min(size, y1), x0:x1, 2] = b
+    return tex
+
+
+def make_wood_siding_texture(size=256, seed=403):
+    rng = np.random.default_rng(seed)
+    tex = np.zeros((size, size, 3), dtype=np.uint8)
+    planks = 8
+    plank_w = size // planks
+    for p in range(planks + 1):
+        x0 = p * plank_w
+        x1 = min(size, x0 + plank_w - 2)
+        if x1 <= x0:
+            continue
+        base = int(rng.integers(95, 150))
+        tex[:, x0:x1, 0] = base
+        tex[:, x0:x1, 1] = int(base * 0.72)
+        tex[:, x0:x1, 2] = int(base * 0.45)
+        if x1 < size:
+            tex[:, x1:x1 + 2, :] = [50, 30, 15]
+    noise = rng.integers(-12, 12, (size, 1), dtype=np.int16)
+    tex = np.clip(tex.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    return tex
+
+
+def make_plaster_texture(size=256, seed=405):
+    rng = np.random.default_rng(seed)
+    base = rng.integers(198, 228, (size, size)).astype(np.int16)
+    # small dark mildew spots for realism
+    for _ in range(30):
+        cy, cx = rng.integers(0, size, 2)
+        r = int(rng.integers(3, 9))
+        y0, y1 = max(0, cy - r), min(size, cy + r)
+        x0, x1 = max(0, cx - r), min(size, cx + r)
+        base[y0:y1, x0:x1] -= 25
+    base = np.clip(base, 80, 255).astype(np.uint8)
+    return np.stack([base,
+                     np.clip(base.astype(int) - 8, 0, 255).astype(np.uint8),
+                     np.clip(base.astype(int) - 18, 0, 255).astype(np.uint8)],
+                    axis=-1)
+
+
+def make_stone_wall_texture(size=256, seed=407):
+    rng = np.random.default_rng(seed)
+    base = rng.integers(110, 165, (size, size)).astype(np.int16)
+    for _ in range(60):
+        cy, cx = rng.integers(0, size, 2)
+        r = int(rng.integers(10, 30))
+        y0, y1 = max(0, cy - r), min(size, cy + r)
+        x0, x1 = max(0, cx - r), min(size, cx + r)
+        shade = int(rng.integers(-18, 12))
+        base[y0:y1, x0:x1] = np.clip(base[y0:y1, x0:x1] + shade, 75, 185)
+    base = base.astype(np.uint8)
+    return np.stack([base, base,
+                     np.clip(base.astype(int) + 6, 0, 255).astype(np.uint8)],
+                    axis=-1)
+
+
+def make_tile_roof_texture(size=256, seed=411):
+    rng = np.random.default_rng(seed)
+    tex = np.zeros((size, size, 3), dtype=np.uint8)
+    rows = 9
+    tile_h = size // rows
+    cols = 10
+    tile_w = size // cols
+    for row in range(rows + 1):
+        y0 = row * tile_h
+        y1 = min(size, y0 + tile_h - 2)
+        for col in range(cols + 1):
+            x0 = (col * tile_w + (0 if row % 2 == 0 else tile_w // 2)) % size
+            x1 = min(size, x0 + tile_w - 2)
+            if x1 <= x0:
+                continue
+            r = int(rng.integers(140, 200))
+            g = int(rng.integers(60, 100))
+            b = int(rng.integers(40, 70))
+            tex[y0:y1, x0:x1, 0] = r
+            tex[y0:y1, x0:x1, 1] = g
+            tex[y0:y1, x0:x1, 2] = b
+        if y1 < size:
+            tex[y1:y1 + 2, :, :] = [40, 20, 10]
+    return tex
+
+
+def make_shingle_roof_texture(size=256, seed=413):
+    rng = np.random.default_rng(seed)
+    tex = np.zeros((size, size, 3), dtype=np.uint8)
+    rows = 16
+    shingle_h = size // rows
+    cols = 10
+    shingle_w = size // cols
+    for row in range(rows + 1):
+        y0 = row * shingle_h
+        y1 = min(size, y0 + shingle_h - 1)
+        for col in range(cols + 1):
+            x0 = (col * shingle_w + (0 if row % 2 == 0 else shingle_w // 2)) % size
+            x1 = min(size, x0 + shingle_w - 1)
+            if x1 <= x0:
+                continue
+            base = int(rng.integers(55, 95))
+            tex[y0:y1, x0:x1, 0] = base
+            tex[y0:y1, x0:x1, 1] = int(base * 0.92)
+            tex[y0:y1, x0:x1, 2] = int(base * 0.72)
+        if y1 < size:
+            tex[y1:y1 + 1, :, :] = [22, 16, 10]
+    return tex
+
+
+def make_slate_roof_texture(size=256, seed=415):
+    rng = np.random.default_rng(seed)
+    tex = np.zeros((size, size, 3), dtype=np.uint8)
+    rows = 12
+    slate_h = size // rows
+    cols = 7
+    slate_w = size // cols
+    for row in range(rows + 1):
+        y0 = row * slate_h
+        y1 = min(size, y0 + slate_h - 2)
+        for col in range(cols + 1):
+            x0 = (col * slate_w + (0 if row % 2 == 0 else slate_w // 2)) % size
+            x1 = min(size, x0 + slate_w - 2)
+            if x1 <= x0:
+                continue
+            base = int(rng.integers(55, 95))
+            tex[y0:y1, x0:x1, 0] = int(base * 0.82)
+            tex[y0:y1, x0:x1, 1] = int(base * 0.88)
+            tex[y0:y1, x0:x1, 2] = int(base * 1.05) % 255
+        if y1 < size:
+            tex[y1:y1 + 2, :, :] = [18, 20, 24]
+    return tex
+
+
+def build_house_body_list(wall_tex, w, d, wall_h):
+    """4 walls + 2 gable triangles + untextured door + windows."""
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, wall_tex)
+    glColor3f(1.0, 1.0, 1.0)
+    u_rep = w / 2.5     # wall tex tiles roughly every 2.5 m horizontally
+    u_rep_s = d / 2.5
+    v_rep = wall_h / 2.5
+
+    glBegin(GL_QUADS)
+    # Front wall (-Z)
+    glTexCoord2f(0, 0); glVertex3f(-w / 2, 0, -d / 2)
+    glTexCoord2f(u_rep, 0); glVertex3f(w / 2, 0, -d / 2)
+    glTexCoord2f(u_rep, v_rep); glVertex3f(w / 2, wall_h, -d / 2)
+    glTexCoord2f(0, v_rep); glVertex3f(-w / 2, wall_h, -d / 2)
+    # Back wall (+Z)
+    glTexCoord2f(0, 0); glVertex3f(w / 2, 0, d / 2)
+    glTexCoord2f(u_rep, 0); glVertex3f(-w / 2, 0, d / 2)
+    glTexCoord2f(u_rep, v_rep); glVertex3f(-w / 2, wall_h, d / 2)
+    glTexCoord2f(0, v_rep); glVertex3f(w / 2, wall_h, d / 2)
+    # Left wall (-X)
+    glTexCoord2f(0, 0); glVertex3f(-w / 2, 0, d / 2)
+    glTexCoord2f(u_rep_s, 0); glVertex3f(-w / 2, 0, -d / 2)
+    glTexCoord2f(u_rep_s, v_rep); glVertex3f(-w / 2, wall_h, -d / 2)
+    glTexCoord2f(0, v_rep); glVertex3f(-w / 2, wall_h, d / 2)
+    # Right wall (+X)
+    glTexCoord2f(0, 0); glVertex3f(w / 2, 0, -d / 2)
+    glTexCoord2f(u_rep_s, 0); glVertex3f(w / 2, 0, d / 2)
+    glTexCoord2f(u_rep_s, v_rep); glVertex3f(w / 2, wall_h, d / 2)
+    glTexCoord2f(0, v_rep); glVertex3f(w / 2, wall_h, -d / 2)
+    glEnd()
+
+    # Gable triangles (front + back), shorter aspect on V
+    glBegin(GL_TRIANGLES)
+    for z_face in (-d / 2, d / 2):
+        glTexCoord2f(0, 0); glVertex3f(-w / 2, wall_h, z_face)
+        glTexCoord2f(u_rep, 0); glVertex3f(w / 2, wall_h, z_face)
+        glTexCoord2f(u_rep / 2, v_rep * 0.6); glVertex3f(0.0, wall_h + 0.01, z_face)
+    glEnd()
+
+    # Door + windows — untextured dark quads
+    glDisable(GL_TEXTURE_2D)
+    # Door on front (-Z face), slight outward offset so it doesn't z-fight
+    glColor3f(0.22, 0.13, 0.07)
+    door_w_ = 0.9
+    door_h_ = 2.0
+    eps = 0.015
+    glBegin(GL_QUADS)
+    glVertex3f(-door_w_ / 2, 0.0, -d / 2 - eps)
+    glVertex3f(door_w_ / 2, 0.0, -d / 2 - eps)
+    glVertex3f(door_w_ / 2, door_h_, -d / 2 - eps)
+    glVertex3f(-door_w_ / 2, door_h_, -d / 2 - eps)
+    glEnd()
+
+    # Windows — dark blue glass
+    glColor3f(0.10, 0.14, 0.24)
+    win_w_ = 0.9
+    win_h_ = 1.0
+    win_y = wall_h * 0.55 - win_h_ / 2
+    glBegin(GL_QUADS)
+    # Front: one on each side of the door
+    for xoff in (-w * 0.28, w * 0.28):
+        glVertex3f(xoff - win_w_ / 2, win_y, -d / 2 - eps)
+        glVertex3f(xoff + win_w_ / 2, win_y, -d / 2 - eps)
+        glVertex3f(xoff + win_w_ / 2, win_y + win_h_, -d / 2 - eps)
+        glVertex3f(xoff - win_w_ / 2, win_y + win_h_, -d / 2 - eps)
+    # Back: two symmetric
+    for xoff in (-w * 0.28, w * 0.28):
+        glVertex3f(xoff + win_w_ / 2, win_y, d / 2 + eps)
+        glVertex3f(xoff - win_w_ / 2, win_y, d / 2 + eps)
+        glVertex3f(xoff - win_w_ / 2, win_y + win_h_, d / 2 + eps)
+        glVertex3f(xoff + win_w_ / 2, win_y + win_h_, d / 2 + eps)
+    # Left side (-X)
+    for zoff in (-d * 0.28, d * 0.28):
+        glVertex3f(-w / 2 - eps, win_y, zoff + win_w_ / 2)
+        glVertex3f(-w / 2 - eps, win_y, zoff - win_w_ / 2)
+        glVertex3f(-w / 2 - eps, win_y + win_h_, zoff - win_w_ / 2)
+        glVertex3f(-w / 2 - eps, win_y + win_h_, zoff + win_w_ / 2)
+    # Right side (+X)
+    for zoff in (-d * 0.28, d * 0.28):
+        glVertex3f(w / 2 + eps, win_y, zoff - win_w_ / 2)
+        glVertex3f(w / 2 + eps, win_y, zoff + win_w_ / 2)
+        glVertex3f(w / 2 + eps, win_y + win_h_, zoff + win_w_ / 2)
+        glVertex3f(w / 2 + eps, win_y + win_h_, zoff - win_w_ / 2)
+    glEnd()
+    glColor3f(1.0, 1.0, 1.0)
+    glEnable(GL_TEXTURE_2D)
+    glEndList()
+    return list_id
+
+
+def build_house_roof_list(w, d, wall_h, roof_h):
+    """Two slope quads only — no texture bind, so callers swap for snow."""
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    apex_y = wall_h + roof_h
+    u_rep = d / 2.5
+    v_rep = math.sqrt((w / 2) ** 2 + roof_h ** 2) / 2.5
+    glBegin(GL_QUADS)
+    # Left slope
+    glTexCoord2f(0, 0); glVertex3f(-w / 2, wall_h, -d / 2)
+    glTexCoord2f(u_rep, 0); glVertex3f(-w / 2, wall_h, d / 2)
+    glTexCoord2f(u_rep, v_rep); glVertex3f(0.0, apex_y, d / 2)
+    glTexCoord2f(0, v_rep); glVertex3f(0.0, apex_y, -d / 2)
+    # Right slope
+    glTexCoord2f(0, 0); glVertex3f(0.0, apex_y, -d / 2)
+    glTexCoord2f(u_rep, 0); glVertex3f(0.0, apex_y, d / 2)
+    glTexCoord2f(u_rep, v_rep); glVertex3f(w / 2, wall_h, d / 2)
+    glTexCoord2f(0, v_rep); glVertex3f(w / 2, wall_h, -d / 2)
+    glEnd()
+    glEndList()
+    return list_id
+
+
+def build_house_variants(wall_textures, roof_textures, n=8):
+    """Generate n variants mixing wall+roof texture combinations and
+    randomising dimensions."""
+    variants = []
+    rng = random.Random(1607)
+    for i in range(n):
+        wall_tex = wall_textures[i % len(wall_textures)]
+        roof_tex = roof_textures[(i // 2) % len(roof_textures)]
+        w = rng.uniform(7.5, 11.0)
+        d = rng.uniform(6.5, 9.0)
+        wall_h = rng.uniform(*HOUSE_WALL_H_RANGE)
+        roof_h = rng.uniform(*HOUSE_ROOF_H_RANGE)
+        variants.append({
+            "body": build_house_body_list(wall_tex, w, d, wall_h),
+            "roof": build_house_roof_list(w, d, wall_h, roof_h),
+            "wall_tex": wall_tex,
+            "roof_tex": roof_tex,
+            "dims": (w, d, wall_h + roof_h),
+        })
+    return variants
+
+
+def draw_houses(s_car, house_variants, snow_tex, amb_rgb):
+    """Instance rural houses across flat-ground biomes, with a per-house
+    roof snow pass scaled by the frost weight at that s."""
+    s_start = math.floor(s_car / HOUSE_SPACING) * HOUSE_SPACING
+    max_s = s_car + N_SEG * SEG_LEN
+    n_steps = int((max_s - s_start) / HOUSE_SPACING) + 1
+    nvar = len(house_variants)
+    if nvar == 0:
+        return
+
+    # Precompute biome weights
+    s_arr = np.arange(n_steps, dtype=np.float32) * HOUSE_SPACING + s_start
+
+    glEnable(GL_TEXTURE_2D)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+
+    for i in range(n_steps):
+        s = float(s_arr[i])
+        if s < s_car - 2.0:
+            continue
+        for side in (-1, +1):
+            w_b = biome_weights_vec(
+                np.array([s], dtype=np.float32), side)[0]
+            # allowed: plain, forest, frost. Skip mountain/hill/river/city.
+            ok_w = (w_b[BIOME_PLAIN] + w_b[BIOME_FOREST] + w_b[BIOME_FROST])
+            bad_w = (w_b[BIOME_MOUNTAIN] + w_b[BIOME_HILL]
+                     + w_b[BIOME_RIVER] + w_b[BIOME_CITY])
+            if ok_w < 0.6 or bad_w > 0.3:
+                continue
+            key = (int(s * 23) * 2654435761
+                   + (0 if side < 0 else 6491)
+                   + 7919) & 0xFFFFFFFF
+            if ((key & 0xFF) / 255.0) > 0.22:   # only ~22% of slots get a house
+                continue
+            d_off = HOUSE_MIN_D + ((key >> 8) & 0xFF) / 255.0 \
+                    * (HOUSE_MAX_D - HOUSE_MIN_D)
+            variant = ((key >> 16) & 0x0F) % nvar
+            yaw = ((key >> 4) & 0x3F) / 63.0 * 360.0
+            scale = 0.9 + ((key >> 20) & 0x0F) / 15.0 * 0.35
+
+            tx = curve_x(s) + side * (ROAD_WIDTH / 2 + d_off)
+            ty = curve_y(s) - 0.12
+            tz = -(s - s_car)
+
+            v = house_variants[variant]
+            frost_w_here = float(w_b[BIOME_FROST])
+
+            glPushMatrix()
+            glTranslatef(tx, ty, tz)
+            glRotatef(yaw, 0, 1, 0)
+            glScalef(scale, scale, scale)
+
+            # Body + roof at normal tint
+            glColor3f(min(1.0, amb_rgb[0]),
+                      min(1.0, amb_rgb[1]),
+                      min(1.0, amb_rgb[2]))
+            glCallList(v["body"])
+            glBindTexture(GL_TEXTURE_2D, v["roof_tex"])
+            glCallList(v["roof"])
+
+            # Progressive snow on the roof: fade in/out with frost biome
+            if frost_w_here > 0.04:
+                glBindTexture(GL_TEXTURE_2D, snow_tex)
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                glDepthMask(GL_FALSE)
+                glEnable(GL_POLYGON_OFFSET_FILL)
+                glPolygonOffset(-1.2, -1.2)
+                a = min(1.0, frost_w_here * 0.95)
+                glColor4f(min(1.0, amb_rgb[0] * 0.95),
+                          min(1.0, amb_rgb[1] * 0.97),
+                          min(1.0, amb_rgb[2] * 1.00),
+                          a)
+                glCallList(v["roof"])
+                glDisable(GL_POLYGON_OFFSET_FILL)
+                glDepthMask(GL_TRUE)
+                glDisable(GL_BLEND)
+                glColor3f(1.0, 1.0, 1.0)
+
+            glPopMatrix()
+
+
 # --- Cityscape biome ---
 # Approach (drawing on Wonka 2003 / Müller 2006 split-grammar ideas but far
 # simpler): each building is a rectangular prism with one tiled "facade"
@@ -3156,6 +3539,20 @@ def main():
     emission_tex = upload_texture(make_facade_emission_texture(), internal=GL_RGBA, src=GL_RGBA)
     building_lists = build_building_variants()
     concrete_tex = upload_texture(make_concrete_texture())
+    # Rural houses — four wall textures × three roof textures worth of
+    # material variety, cross-combined into eight baked variants.
+    house_wall_texes = [
+        upload_texture(make_brick_wall_texture()),
+        upload_texture(make_wood_siding_texture()),
+        upload_texture(make_plaster_texture()),
+        upload_texture(make_stone_wall_texture()),
+    ]
+    house_roof_texes = [
+        upload_texture(make_tile_roof_texture()),
+        upload_texture(make_shingle_roof_texture()),
+        upload_texture(make_slate_roof_texture()),
+    ]
+    house_variants = build_house_variants(house_wall_texes, house_roof_texes)
     rain_state = init_rain()
     pond_tex = upload_texture(make_pond_texture(), internal=GL_RGBA, src=GL_RGBA)
     flare_tex = upload_texture(make_flare_disc_texture(), internal=GL_RGBA, src=GL_RGBA)
@@ -3432,6 +3829,10 @@ def main():
         )
         draw_forest(s_car, tree_lists, frost_tree_lists, amb,
                     t_time, wind_strength)
+        # Rural houses: farther than trees, closer than city skyscrapers.
+        # Snow accumulates on roofs during frost biome, melts off when
+        # the biome transitions back to plain/forest.
+        draw_houses(s_car, house_variants, snow_ground_tex, amb)
         # Road pavement with subtle wet darkening during rain, then the
         # snow overlay pass that fades in/out with frost biome transitions.
         draw_road(road_tex, s_car, amb, storm_i)
