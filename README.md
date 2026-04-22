@@ -27,11 +27,15 @@ Press **Esc** to quit. Runs fullscreen at the native display resolution.
 - **Biomes** — per-side, zone-based. Each ~240m zone on each side of the road
   independently rolls one of: plain, hill, mountain, river, forest, frost.
   45m smoothstep transitions blend heights and colors between zones.
-- **Frost zones** — snow-tinted ground, drifts piled against the road edge,
-  snow-covered trees (separate tree template set built with a snow-bark and
-  snowy-leaf texture), and snow shoulders along the pavement. Point-sprite
-  snowfall drifts down with horizontal swirl, gated by the frost weight at
-  the camera so it only appears in frost biomes and fades at transitions.
+- **Frost zones** — real ambientCG Snow001 ground texture overlaid on the
+  terrain mesh (second alpha-blended pass), drifts piled against the road
+  edge, snow-covered trees (separate tree template set built with a snow-
+  bark and snowy-leaf texture), and snow shoulders along the pavement.
+  Mountain peaks above ~11m also pick up the snow overlay as altitude
+  snowcaps regardless of biome. Point-sprite snowfall drifts down with
+  horizontal swirl, gated by the frost weight at the camera so it only
+  appears in frost biomes and fades at transitions. Fog density ramps up
+  to +10% gradually as the camera enters frost zones.
 - **Terrain** — 14-band triangle strip per side (~80m outward) with per-biome
   height profiles: plain flat, hill gentle waves, mountain steep ridged
   rise, river dipped valley with animated water, forest near-flat floor.

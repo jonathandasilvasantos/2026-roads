@@ -597,6 +597,15 @@ def grid_indices(NS, K):
 
 
 def build_side_arrays(s_arr, s_car, side, t_time, amb_rgb):
+    """Returns (verts, col_rgb, tcs, snow_rgba, snow_tcs).
+
+    * col_rgb is the biome-tinted base color for pass 1 (terrain noise tex).
+    * snow_rgba carries ambient RGB + per-vertex snow alpha for pass 2 — the
+      alpha is the max of the frost biome weight at that s (full cover in
+      frost zones) and an altitude-based snowcap factor (mountains get caps
+      everywhere). The snow pass uses a coarser tex-coord scale so the snow
+      photo tiles at a larger world frequency than the ground noise.
+    """
     NS = len(s_arr)
     K = K_BANDS
     d = TERRAIN_EDGE_D + np.arange(K, dtype=np.float32) * D_STEP
@@ -614,32 +623,72 @@ def build_side_arrays(s_arr, s_car, side, t_time, amb_rgb):
     y = ry[:, None] + off
     z = np.broadcast_to(rz[:, None], (NS, K))
     verts = np.stack([x, y, z], axis=-1).reshape(-1, 3).astype(np.float32)
+
     col_s = weights @ BIOME_COLOR
     amb = np.array(amb_rgb, dtype=np.float32)
     col_s = np.clip(col_s * amb[None, :], 0.0, 1.0)
     col = np.broadcast_to(col_s[:, None, :], (NS, K, 3)).reshape(-1, 3).astype(np.float32)
+
     u = (d[None, :] * 0.08).repeat(NS, axis=0)
     v = np.broadcast_to((s_arr * 0.08)[:, None], (NS, K))
     tcs = np.stack([u, v], axis=-1).reshape(-1, 2).astype(np.float32)
-    return verts, col, tcs
+
+    # Snow overlay alpha: full cover in frost biome, altitude cap on mountains
+    frost_cov = np.broadcast_to(weights[:, BIOME_FROST:BIOME_FROST + 1], (NS, K))
+    alt_cap = np.clip((y - 11.0) / 11.0, 0.0, 1.0) ** 1.4 * 0.90
+    snow_a = np.maximum(frost_cov, alt_cap).reshape(-1).astype(np.float32)
+
+    snow_rgba = np.zeros((NS * K, 4), dtype=np.float32)
+    snow_rgba[:, 0] = min(1.0, amb_rgb[0])
+    snow_rgba[:, 1] = min(1.0, amb_rgb[1])
+    snow_rgba[:, 2] = min(1.0, amb_rgb[2])
+    snow_rgba[:, 3] = snow_a
+
+    u_s = (d[None, :] * 0.05).repeat(NS, axis=0)
+    v_s = np.broadcast_to((s_arr * 0.05)[:, None], (NS, K))
+    snow_tcs = np.stack([u_s, v_s], axis=-1).reshape(-1, 2).astype(np.float32)
+
+    return verts, col, tcs, snow_rgba, snow_tcs
 
 
-def draw_terrain(terrain_tex, s_car, t_time, amb_rgb):
+def draw_terrain(terrain_tex, snow_tex, s_car, t_time, amb_rgb):
     NS = N_SEG + 1
     s_arr = (np.arange(NS, dtype=np.float32) * SEG_LEN) + s_car
     idx = grid_indices(NS, K_BANDS)
+
     glEnable(GL_TEXTURE_2D)
-    glBindTexture(GL_TEXTURE_2D, terrain_tex)
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
     glEnableClientState(GL_VERTEX_ARRAY)
     glEnableClientState(GL_COLOR_ARRAY)
     glEnableClientState(GL_TEXTURE_COORD_ARRAY)
+
+    # Build once per side, reuse buffers across both passes
+    sides = []
     for side in (-1, +1):
-        verts, cols, tcs = build_side_arrays(s_arr, s_car, side, t_time, amb_rgb)
+        sides.append(build_side_arrays(s_arr, s_car, side, t_time, amb_rgb))
+
+    # Pass 1: biome-tinted ground
+    glBindTexture(GL_TEXTURE_2D, terrain_tex)
+    for verts, cols, tcs, _snow_rgba, _snow_tcs in sides:
         glVertexPointer(3, GL_FLOAT, 0, verts)
         glColorPointer(3, GL_FLOAT, 0, cols)
         glTexCoordPointer(2, GL_FLOAT, 0, tcs)
         glDrawElements(GL_TRIANGLES, len(idx), GL_UNSIGNED_INT, idx)
+
+    # Pass 2: real snow photo overlaid where frost weight > 0 or altitude is high
+    glBindTexture(GL_TEXTURE_2D, snow_tex)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glEnable(GL_POLYGON_OFFSET_FILL)
+    glPolygonOffset(-1.0, -1.0)  # coplanar with pass 1 — bias forward slightly
+    for verts, _cols, _tcs, snow_rgba, snow_tcs in sides:
+        glVertexPointer(3, GL_FLOAT, 0, verts)
+        glColorPointer(4, GL_FLOAT, 0, snow_rgba)
+        glTexCoordPointer(2, GL_FLOAT, 0, snow_tcs)
+        glDrawElements(GL_TRIANGLES, len(idx), GL_UNSIGNED_INT, idx)
+    glDisable(GL_POLYGON_OFFSET_FILL)
+    glDisable(GL_BLEND)
+
     glDisableClientState(GL_VERTEX_ARRAY)
     glDisableClientState(GL_COLOR_ARRAY)
     glDisableClientState(GL_TEXTURE_COORD_ARRAY)
@@ -1173,6 +1222,11 @@ def main():
                  horizon[1] * bright * 0.9 + 0.05,
                  horizon[2] * bright * 0.9 + 0.05, 1.0)
         glFogfv(GL_FOG_COLOR, fog_c)
+        # Gradually thicken fog up to +10% when the camera is in frost biome.
+        # frost_intensity_at returns the smoothstep-blended biome weight so
+        # density eases in/out at zone transitions rather than snapping.
+        frost_i = frost_intensity_at(s_car)
+        glFogf(GL_FOG_DENSITY, 0.0055 * (1.0 + 0.10 * frost_i))
         glClearColor(horizon[0], horizon[1], horizon[2], 1.0)
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -1203,7 +1257,7 @@ def main():
                            glow_color=(0.55, 0.65, 0.85),
                            core_alpha=moon_alpha)
 
-        draw_terrain(terrain_tex, s_car, t_time, amb)
+        draw_terrain(terrain_tex, snow_ground_tex, s_car, t_time, amb)
         draw_forest(s_car, tree_lists, frost_tree_lists, amb)
         draw_road(road_tex, s_car, amb)
         draw_snow_shoulders(snow_ground_tex, s_car, amb)
