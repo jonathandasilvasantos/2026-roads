@@ -3023,6 +3023,107 @@ def draw_snow(state, snow_tex, wL, wR, cam_x, cam_y, cam_z):
     glDisable(GL_POINT_SPRITE)
 
 
+# --- Volumetric dust ---
+# Camera-local cloud of illuminated airborne motes. Rare event: a triple-
+# sine-product intensity gate keeps dust mostly absent, with occasional
+# soft blooms (think pollen in a still meadow, or dry-wind haze). Fully
+# additive so stacked particles read as volume rather than flat sprites.
+# Suppressed by storm (rain clears the air), scaled by ambient brightness
+# (dust motes need light to read), and by open-biome exposure (dust rises
+# where land is dry and wind-blown).
+
+DUST_N = 360
+DUST_BOX_X = 42.0
+DUST_BOX_Z = 52.0
+DUST_Y_MIN = 0.4
+DUST_Y_MAX = 12.0
+
+
+def dust_intensity_at(t_time):
+    """Three detuned sines with a high threshold — dust events are rare
+    and build/clear smoothly over tens of seconds."""
+    a = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 210.0)
+    b = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 67.0 + 1.7)
+    c = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 143.0 + 0.5)
+    raw = a * b * c
+    x = max(0.0, (raw - 0.46) / 0.54)
+    x = min(1.0, x)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def init_dust(seed=201):
+    rng = np.random.default_rng(seed)
+    pos = np.zeros((DUST_N, 3), dtype=np.float32)
+    pos[:, 0] = rng.uniform(-DUST_BOX_X, DUST_BOX_X, DUST_N)
+    pos[:, 1] = rng.uniform(DUST_Y_MIN, DUST_Y_MAX, DUST_N)
+    pos[:, 2] = rng.uniform(-DUST_BOX_Z, DUST_BOX_Z * 0.3, DUST_N)
+    vel = np.zeros((DUST_N, 3), dtype=np.float32)
+    vel[:, 0] = rng.uniform(-0.35, 0.35, DUST_N)
+    vel[:, 1] = rng.uniform(-0.18, 0.05, DUST_N)  # near-zero gravity — motes hover
+    vel[:, 2] = rng.uniform(-0.30, 0.30, DUST_N)
+    seeds = rng.uniform(0.0, 2 * math.pi, DUST_N).astype(np.float32)
+    return pos, vel, seeds
+
+
+def update_dust(state, dt, t_time):
+    pos, vel, seeds = state
+    # Low-frequency swirl per particle — gives each mote its own life
+    swx = 0.16 * np.sin(t_time * 0.7 + seeds)
+    swy = 0.08 * np.sin(t_time * 0.45 + seeds * 1.3)
+    swz = 0.14 * np.cos(t_time * 0.6 + seeds * 0.9)
+    pos[:, 0] += (vel[:, 0] + swx) * dt
+    pos[:, 1] += (vel[:, 1] + swy) * dt
+    pos[:, 2] += (vel[:, 2] + swz) * dt
+
+    below = pos[:, 1] < DUST_Y_MIN
+    above = pos[:, 1] > DUST_Y_MAX
+    outX = np.abs(pos[:, 0]) > DUST_BOX_X
+    outZ = np.abs(pos[:, 2]) > DUST_BOX_Z
+    respawn = below | above | outX | outZ
+    n = int(respawn.sum())
+    if n > 0:
+        rng = np.random.default_rng()
+        pos[respawn, 0] = rng.uniform(-DUST_BOX_X, DUST_BOX_X, n).astype(np.float32)
+        pos[respawn, 1] = rng.uniform(DUST_Y_MIN, DUST_Y_MAX, n).astype(np.float32)
+        pos[respawn, 2] = rng.uniform(-DUST_BOX_Z, DUST_BOX_Z * 0.3, n).astype(np.float32)
+
+
+def draw_dust(state, dust_tex, intensity, cam_x, cam_y, cam_z, amb_rgb):
+    """Additive point sprites — stacked particles brighten naturally,
+    giving a volumetric read without any actual volumetric rendering."""
+    if intensity < 0.03:
+        return
+    pos, _v, _s = state
+
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, dust_tex)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glEnable(GL_POINT_SPRITE)
+    glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_TRUE)
+    glPointSize(5.5)
+    glPointParameterfv(GL_POINT_DISTANCE_ATTENUATION, (0.0, 0.10, 0.0025))
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+    glDepthMask(GL_FALSE)
+
+    glPushMatrix()
+    glTranslatef(cam_x, cam_y, cam_z)
+    # Warm ivory dust tint modulated by ambient, so motes dim at night
+    glColor4f(min(1.0, amb_rgb[0] + 0.05),
+              min(1.0, amb_rgb[1] * 0.92),
+              min(1.0, amb_rgb[2] * 0.72),
+              min(1.0, intensity * 0.55))
+    glEnableClientState(GL_VERTEX_ARRAY)
+    glVertexPointer(3, GL_FLOAT, 0, pos)
+    glDrawArrays(GL_POINTS, 0, len(pos))
+    glDisableClientState(GL_VERTEX_ARRAY)
+    glPopMatrix()
+
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+    glDisable(GL_POINT_SPRITE)
+
+
 # --- Procedural flowers ---
 # Small wild flowers along the roadside in flat / vegetated biomes.
 # Rendered as Lighthouse3D-style crossed billboard quads (two textured
@@ -3038,9 +3139,9 @@ def draw_snow(state, snow_tex, wL, wR, cam_x, cam_y, cam_z):
 # cluster of 6-12 flowers in a small patch) so the shoulder isn't a
 # uniform sprinkling.
 
-FLOWER_SPACING = 0.95           # stride along road for candidate flower slots
-FLOWER_MIN_D = 0.6              # closest to road edge
-FLOWER_MAX_D = 6.0              # farthest from road edge (stay off the field)
+FLOWER_SPACING = 0.85           # stride along road for candidate flower slots
+FLOWER_MIN_D = 0.15             # right up against the pavement shoulder
+FLOWER_MAX_D = 3.0              # stay within the visible strip next to the road
 FLOWER_MAX_RENDER_DIST = 280.0  # distance culling — flowers are tiny past this
 FLOWER_CLUSTER_PROB = 0.06      # 6% of valid slots become a crop cluster
 
@@ -3971,6 +4072,9 @@ def main():
     snow_ground_tex = upload_texture(load_texture_file("textures/Snow001_1K-JPG_Color.jpg"))
     snowflake_tex = upload_texture(make_snowflake_texture(), internal=GL_RGBA, src=GL_RGBA)
     snow_state = init_snow()
+    # Volumetric dust — reuse the soft-disc snowflake texture (same shape,
+    # we tint it warm at draw time) to avoid another tiny RGBA upload.
+    dust_state = init_dust()
     facade_tex = upload_texture(make_facade_texture())
     emission_tex = upload_texture(make_facade_emission_texture(), internal=GL_RGBA, src=GL_RGBA)
     building_lists = build_building_variants()
@@ -4316,6 +4420,18 @@ def main():
         update_rain(rain_state, dt)
         rain_i = storm_i * (1.0 - frost_i)
         draw_rain(rain_state, rain_i, cx, cy, cz)
+
+        # Volumetric dust motes — rare, gated by dust_intensity_at(t_time),
+        # suppressed by rain (wet air carries no dust), scaled by ambient
+        # brightness (dust reads only when the sun catches it), and by
+        # open-biome exposure (dust rises where land is dry and wind-blown).
+        dust_base = dust_intensity_at(t_time)
+        dust_base *= max(0.0, 1.0 - 1.2 * storm_i)       # rain clears dust
+        dust_base *= min(1.0, bright)                     # needs light
+        dust_base *= (0.30 + 0.70 * open_exp_trees)       # open terrain bias
+        dust_i = min(1.0, dust_base * 1.4)
+        update_dust(dust_state, dt, t_time)
+        draw_dust(dust_state, snowflake_tex, dust_i, cx, cy, cz, amb)
 
         # lightning bolt (if one is currently active)
         draw_bolt(active_bolt, bolt_age)
