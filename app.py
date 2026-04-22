@@ -3,8 +3,12 @@ import sys
 import numpy as np
 import pygame
 from pygame.locals import DOUBLEBUF, OPENGL, FULLSCREEN, QUIT, KEYDOWN, K_ESCAPE
+import random
 from OpenGL.GL import *
-from OpenGL.GLU import gluPerspective, gluLookAt
+from OpenGL.GLU import (
+    gluPerspective, gluLookAt, gluNewQuadric, gluQuadricTexture,
+    gluQuadricNormals, gluCylinder, GLU_SMOOTH,
+)
 
 
 # --- Road ---
@@ -28,14 +32,21 @@ TERRAIN_EDGE_D = 0.1
 # --- Biomes ---
 ZONE_LEN = 240.0
 TRANS_LEN = 45.0
-BIOME_PLAIN, BIOME_HILL, BIOME_MOUNTAIN, BIOME_RIVER = 0, 1, 2, 3
+BIOME_PLAIN, BIOME_HILL, BIOME_MOUNTAIN, BIOME_RIVER, BIOME_FOREST = 0, 1, 2, 3, 4
+BIOME_COUNT = 5
 
 BIOME_COLOR = np.array([
-    [0.46, 0.70, 0.26],
-    [0.32, 0.56, 0.20],
-    [0.62, 0.54, 0.46],
-    [0.26, 0.48, 0.68],
+    [0.46, 0.70, 0.26],   # plain grass
+    [0.32, 0.56, 0.20],   # hill grass
+    [0.62, 0.54, 0.46],   # mountain rock
+    [0.26, 0.48, 0.68],   # river water
+    [0.20, 0.36, 0.14],   # forest floor (dark undergrowth)
 ], dtype=np.float32)
+
+# --- Forest / trees ---
+TREE_SPACING = 3.2           # stride along road for potential tree slots
+TREE_MAX_PERP = 46.0         # max perpendicular distance from road edge
+N_TREE_VARIANTS = 6          # number of baked tree templates
 
 # --- Day/Night cycle ---
 # One minute == midnight → noon, so full cycle = 120s
@@ -71,12 +82,12 @@ def curve_y_np(s):
 # --- Biomes ---
 def biome_at(zone_idx, side):
     key = (zone_idx * 2654435761 + (0 if side < 0 else 9277) + 1013904223) & 0xFFFFFFFF
-    return key % 4
+    return key % BIOME_COUNT
 
 
 def biome_weights_vec(s_arr, side):
     NS = len(s_arr)
-    out = np.zeros((NS, 4), dtype=np.float32)
+    out = np.zeros((NS, BIOME_COUNT), dtype=np.float32)
     for i, s in enumerate(s_arr):
         idx = int(s // ZONE_LEN)
         pos = s - idx * ZONE_LEN
@@ -102,6 +113,10 @@ def is_plain(s, side):
     return biome_weights_vec(np.array([s], dtype=np.float32), side)[0, BIOME_PLAIN] > 0.65
 
 
+def forest_weight_at(s, side):
+    return biome_weights_vec(np.array([s], dtype=np.float32), side)[0, BIOME_FOREST]
+
+
 # --- Terrain heights ---
 def terrain_heights(s, d, t_time):
     plain = -0.25 + 0.18 * np.sin(s * 0.25 + d * 0.18)
@@ -123,7 +138,10 @@ def terrain_heights(s, d, t_time):
         np.where(d < far_bank, water,
                  -3.0 + np.clip((d - far_bank) / 10.0, 0.0, 1.0) * 3.3),
     )
-    return plain, hill, mountain, river
+    # forest: near-flat forest floor with subtle rise for undergrowth humps
+    forest = (-0.28 + 0.25 * np.sin(s * 0.11 + d * 0.18)
+              + 0.15 * np.sin(s * 0.04))
+    return plain, hill, mountain, river, forest
 
 
 # --- Day/Night model ---
@@ -339,7 +357,7 @@ def upload_texture(img, internal=GL_RGB, src=GL_RGB, mipmaps=True):
     tex_id = glGenTextures(1)
     glBindTexture(GL_TEXTURE_2D, tex_id)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
                     GL_LINEAR_MIPMAP_LINEAR if mipmaps else GL_LINEAR)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
@@ -567,9 +585,10 @@ def build_side_arrays(s_arr, s_car, side, t_time, amb_rgb):
     weights = biome_weights_vec(s_arr, side)
     s2 = s_arr[:, None]
     d2 = d[None, :]
-    plain, hill, mnt, river = terrain_heights(s2, d2, t_time)
+    plain, hill, mnt, river, forest = terrain_heights(s2, d2, t_time)
     off = (weights[:, 0:1] * plain + weights[:, 1:2] * hill
-           + weights[:, 2:3] * mnt + weights[:, 3:4] * river)
+           + weights[:, 2:3] * mnt + weights[:, 3:4] * river
+           + weights[:, 4:5] * forest)
     x = rx[:, None] + side * (ROAD_WIDTH / 2 + d[None, :])
     y = ry[:, None] + off
     z = np.broadcast_to(rz[:, None], (NS, K))
@@ -681,6 +700,200 @@ def draw_lamps(s_car, night_a):
     glDisable(GL_BLEND)
 
 
+# --- Trees (procedural recursive branching with L-system-style randomness) ---
+# Design: each tree is a recursive fractal. A trunk cylinder tapers up, then
+# splits into 2-3 children with random yaw+pitch. Terminal nodes emit a
+# cross-billboard leaf cluster with an alpha-cutout texture. Each variant is
+# baked once into a display list, then instanced across forest zones with
+# glTranslate/glRotate/glScale and glCallList.
+#
+# Bark texture is a real CC0 photo from ambientCG (Bark001). Leaf texture is
+# procedurally generated with random ovoid blobs on a transparent background;
+# multiple crossed quads read the same texture to imply volumetric foliage.
+
+
+def load_texture_file(path):
+    surf = pygame.image.load(path)
+    arr = pygame.surfarray.array3d(surf)       # (w, h, 3)
+    arr = np.transpose(arr, (1, 0, 2))         # (h, w, 3) row-major
+    arr = arr[::-1]                             # GL origin is lower-left
+    return np.ascontiguousarray(arr, dtype=np.uint8)
+
+
+def make_leaf_texture(size=256):
+    """RGBA foliage cluster — ovoid leaves with soft alpha, transparent BG."""
+    rng = np.random.default_rng(23)
+    rgba = np.zeros((size, size, 4), dtype=np.float32)
+    ys, xs = np.mgrid[0:size, 0:size].astype(np.float32)
+
+    for _ in range(22):
+        cx = float(rng.integers(28, size - 28))
+        cy = float(rng.integers(28, size - 28))
+        rx = float(rng.integers(8, 15))
+        ry = float(rng.integers(14, 26))
+        angle = float(rng.uniform(0.0, math.pi))
+        g = 0.45 + float(rng.uniform(-0.08, 0.18))
+        r = 0.18 + float(rng.uniform(-0.05, 0.10))
+        b = 0.12 + float(rng.uniform(-0.03, 0.10))
+        cosA, sinA = math.cos(angle), math.sin(angle)
+        dx = xs - cx
+        dy = ys - cy
+        xr = dx * cosA + dy * sinA
+        yr = -dx * sinA + dy * cosA
+        dist = (xr / rx) ** 2 + (yr / ry) ** 2
+        m = np.clip(1.0 - dist, 0.0, 1.0) ** 1.2
+        # darken a faint central vein line
+        vein = 1.0 - 0.18 * np.exp(-(xr ** 2) / max(0.3, (rx * 0.18) ** 2))
+        sa = m * 0.95
+        rgba[..., 0] = rgba[..., 0] * (1 - sa) + r * vein * sa
+        rgba[..., 1] = rgba[..., 1] * (1 - sa) + g * vein * sa
+        rgba[..., 2] = rgba[..., 2] * (1 - sa) + b * vein * sa
+        rgba[..., 3] = np.maximum(rgba[..., 3], m)
+
+    return (rgba * 255).clip(0, 255).astype(np.uint8)
+
+
+_TREE_QUADRIC = None
+
+
+def _tree_quadric():
+    global _TREE_QUADRIC
+    if _TREE_QUADRIC is None:
+        _TREE_QUADRIC = gluNewQuadric()
+        gluQuadricTexture(_TREE_QUADRIC, GL_TRUE)
+        gluQuadricNormals(_TREE_QUADRIC, GLU_SMOOTH)
+    return _TREE_QUADRIC
+
+
+def _draw_leaf_cluster(rng, size):
+    """3–5 crossed textured quads at current transform, facing varied directions."""
+    n = rng.randint(3, 5)
+    for _ in range(n):
+        yaw = rng.uniform(0.0, 360.0)
+        pitch = rng.uniform(-35.0, 35.0)
+        roll = rng.uniform(-20.0, 20.0)
+        glPushMatrix()
+        glRotatef(yaw, 0, 1, 0)
+        glRotatef(pitch, 1, 0, 0)
+        glRotatef(roll, 0, 0, 1)
+        s = size
+        glBegin(GL_QUADS)
+        glTexCoord2f(0.0, 0.0); glVertex3f(-s, -s * 0.3, 0.0)
+        glTexCoord2f(1.0, 0.0); glVertex3f(+s, -s * 0.3, 0.0)
+        glTexCoord2f(1.0, 1.0); glVertex3f(+s, s * 1.7, 0.0)
+        glTexCoord2f(0.0, 1.0); glVertex3f(-s, s * 1.7, 0.0)
+        glEnd()
+        glPopMatrix()
+
+
+def _emit_branch(rng, length, radius, depth, max_depth, bark_tex, leaf_tex):
+    """Recursive branch emitter. Embeds texture binds + alpha-test state into
+    the currently compiling display list."""
+    # Bark segment (tapered cylinder aligned along +Y)
+    glBindTexture(GL_TEXTURE_2D, bark_tex)
+    glDisable(GL_ALPHA_TEST)
+    glPushMatrix()
+    glRotatef(-90.0, 1, 0, 0)  # gluCylinder lies along +Z → rotate into +Y
+    tip = radius * 0.72
+    gluCylinder(_tree_quadric(), radius, tip, length, 8, 1)
+    glPopMatrix()
+
+    terminal = depth >= max_depth or length < 0.35
+    if terminal:
+        # Leaf cluster at branch tip
+        glBindTexture(GL_TEXTURE_2D, leaf_tex)
+        glEnable(GL_ALPHA_TEST)
+        glAlphaFunc(GL_GREATER, 0.4)
+        glPushMatrix()
+        glTranslatef(0.0, length, 0.0)
+        leaf_size = max(0.35, radius * 7.5 + 0.4)
+        _draw_leaf_cluster(rng, leaf_size)
+        glPopMatrix()
+        return
+
+    glPushMatrix()
+    glTranslatef(0.0, length, 0.0)
+    n_children = rng.choice([2, 2, 3]) if depth < max_depth - 1 else rng.choice([1, 2])
+    base_yaw = rng.uniform(0.0, 360.0)
+    for i in range(n_children):
+        yaw = base_yaw + (360.0 / n_children) * i + rng.uniform(-22.0, 22.0)
+        pitch = rng.uniform(22.0, 46.0) * (1.0 - depth * 0.06)
+        glPushMatrix()
+        glRotatef(yaw, 0, 1, 0)
+        glRotatef(pitch, 1, 0, 0)
+        child_len = length * rng.uniform(0.62, 0.80)
+        child_rad = tip * rng.uniform(0.82, 0.98)
+        _emit_branch(rng, child_len, child_rad, depth + 1, max_depth, bark_tex, leaf_tex)
+        glPopMatrix()
+    glPopMatrix()
+
+
+def build_tree_variant(seed, bark_tex, leaf_tex):
+    """Compile one tree into a display list. Returns the list id."""
+    rng = random.Random(seed)
+    trunk_len = rng.uniform(2.8, 4.4)
+    trunk_rad = rng.uniform(0.18, 0.32)
+    max_depth = rng.choice([4, 5, 5])
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    _emit_branch(rng, trunk_len, trunk_rad, 0, max_depth, bark_tex, leaf_tex)
+    glDisable(GL_ALPHA_TEST)  # leave state clean for the caller
+    glEndList()
+    return list_id
+
+
+def build_tree_variants(bark_tex, leaf_tex, n=N_TREE_VARIANTS):
+    return [build_tree_variant(101 + i * 37, bark_tex, leaf_tex) for i in range(n)]
+
+
+def draw_forest(s_car, tree_lists, amb_rgb):
+    """Instance baked tree lists across positions in forest biome zones."""
+    s_start = math.floor(s_car / TREE_SPACING) * TREE_SPACING
+    max_s = s_car + N_SEG * SEG_LEN
+    n_steps = int((max_s - s_start) / TREE_SPACING) + 1
+    nvar = len(tree_lists)
+
+    glEnable(GL_TEXTURE_2D)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    # leaves lean slightly warmer; trunks neutral — apply ambient tint uniformly
+    glColor3f(min(1.0, amb_rgb[0]),
+              min(1.0, amb_rgb[1]),
+              min(1.0, amb_rgb[2]))
+
+    for i in range(n_steps):
+        s = s_start + i * TREE_SPACING
+        if s < s_car - 1.0:
+            continue
+        for side in (-1, +1):
+            density = forest_weight_at(s, side)
+            if density < 0.28:
+                continue
+            # deterministic tree hash per (s, side)
+            key = (int(s * 97) * 2654435761
+                   + (0 if side < 0 else 7919)
+                   + 1013904223) & 0xFFFFFFFF
+            # density-gated placement
+            if ((key & 0xFFFF) / 65535.0) > density * 0.95:
+                continue
+            d_edge = 1.2 + ((key >> 16) & 0xFF) / 255.0 * TREE_MAX_PERP
+            variant = ((key >> 24) & 0x07) % nvar
+            yaw = ((key >> 8) & 0xFF) / 255.0 * 360.0
+            scale = 0.78 + ((key >> 4) & 0x0F) / 15.0 * 0.55
+
+            tx = curve_x(s) + side * (ROAD_WIDTH / 2 + d_edge)
+            ty = curve_y(s) - 0.15
+            tz = -(s - s_car)
+
+            glPushMatrix()
+            glTranslatef(tx, ty, tz)
+            glRotatef(yaw, 0, 1, 0)
+            glScalef(scale, scale, scale)
+            glCallList(tree_lists[variant])
+            glPopMatrix()
+
+    glDisable(GL_ALPHA_TEST)
+
+
 # --- Main ---
 def main():
     pygame.init()
@@ -707,6 +920,9 @@ def main():
     terrain_tex = upload_texture(make_terrain_texture())
     cloud_tex = upload_texture(make_cloud_texture(), internal=GL_RGBA, src=GL_RGBA)
     stars_tex = upload_texture(make_stars_texture())
+    bark_tex = upload_texture(load_texture_file("textures/Bark001_1K-JPG_Color.jpg"))
+    leaf_tex = upload_texture(make_leaf_texture(), internal=GL_RGBA, src=GL_RGBA)
+    tree_lists = build_tree_variants(bark_tex, leaf_tex)
     sv, stc, sfr, sidx = build_sky_dome()
     sky_state = (sv, stc, sfr, sidx, cloud_tex, stars_tex)
 
@@ -772,6 +988,7 @@ def main():
                            core_alpha=moon_alpha)
 
         draw_terrain(terrain_tex, s_car, t_time, amb)
+        draw_forest(s_car, tree_lists, amb)
         draw_road(road_tex, s_car, amb)
         draw_lamps(s_car, night_a)
 
