@@ -32,8 +32,9 @@ TERRAIN_EDGE_D = 0.1
 # --- Biomes ---
 ZONE_LEN = 240.0
 TRANS_LEN = 45.0
-BIOME_PLAIN, BIOME_HILL, BIOME_MOUNTAIN, BIOME_RIVER, BIOME_FOREST = 0, 1, 2, 3, 4
-BIOME_COUNT = 5
+(BIOME_PLAIN, BIOME_HILL, BIOME_MOUNTAIN, BIOME_RIVER,
+ BIOME_FOREST, BIOME_FROST) = 0, 1, 2, 3, 4, 5
+BIOME_COUNT = 6
 
 BIOME_COLOR = np.array([
     [0.46, 0.70, 0.26],   # plain grass
@@ -41,12 +42,16 @@ BIOME_COLOR = np.array([
     [0.62, 0.54, 0.46],   # mountain rock
     [0.26, 0.48, 0.68],   # river water
     [0.20, 0.36, 0.14],   # forest floor (dark undergrowth)
+    [0.88, 0.92, 1.00],   # frost (snow field, cold blue-white)
 ], dtype=np.float32)
 
 # --- Forest / trees ---
 TREE_SPACING = 3.2           # stride along road for potential tree slots
 TREE_MAX_PERP = 46.0         # max perpendicular distance from road edge
 N_TREE_VARIANTS = 6          # number of baked tree templates
+
+# --- Snow road shoulders ---
+SNOW_SHOULDER_W = 2.2
 
 # --- Day/Night cycle ---
 # One minute == midnight → noon, so full cycle = 120s
@@ -117,6 +122,17 @@ def forest_weight_at(s, side):
     return biome_weights_vec(np.array([s], dtype=np.float32), side)[0, BIOME_FOREST]
 
 
+def frost_weight_at(s, side):
+    return biome_weights_vec(np.array([s], dtype=np.float32), side)[0, BIOME_FROST]
+
+
+def frost_intensity_at(s):
+    """Max frost weight across sides — drives snowfall visibility."""
+    w = biome_weights_vec(np.array([s], dtype=np.float32), -1)[0, BIOME_FROST]
+    w2 = biome_weights_vec(np.array([s], dtype=np.float32), +1)[0, BIOME_FROST]
+    return float(max(w, w2))
+
+
 # --- Terrain heights ---
 def terrain_heights(s, d, t_time):
     plain = -0.25 + 0.18 * np.sin(s * 0.25 + d * 0.18)
@@ -141,7 +157,12 @@ def terrain_heights(s, d, t_time):
     # forest: near-flat forest floor with subtle rise for undergrowth humps
     forest = (-0.28 + 0.25 * np.sin(s * 0.11 + d * 0.18)
               + 0.15 * np.sin(s * 0.04))
-    return plain, hill, mountain, river, forest
+    # frost: snowy drifts — slightly higher near road (plow banks), gentle dunes
+    frost = (-0.20
+             + 0.35 * np.exp(-d / 6.0)              # snow pile near road edge
+             + 0.45 * np.sin(s * 0.07 + d * 0.09)   # rolling drifts
+             + 0.20 * np.sin(s * 0.19))
+    return plain, hill, mountain, river, forest, frost
 
 
 # --- Day/Night model ---
@@ -585,10 +606,10 @@ def build_side_arrays(s_arr, s_car, side, t_time, amb_rgb):
     weights = biome_weights_vec(s_arr, side)
     s2 = s_arr[:, None]
     d2 = d[None, :]
-    plain, hill, mnt, river, forest = terrain_heights(s2, d2, t_time)
+    plain, hill, mnt, river, forest, frost = terrain_heights(s2, d2, t_time)
     off = (weights[:, 0:1] * plain + weights[:, 1:2] * hill
            + weights[:, 2:3] * mnt + weights[:, 3:4] * river
-           + weights[:, 4:5] * forest)
+           + weights[:, 4:5] * forest + weights[:, 5:6] * frost)
     x = rx[:, None] + side * (ROAD_WIDTH / 2 + d[None, :])
     y = ry[:, None] + off
     z = np.broadcast_to(rz[:, None], (NS, K))
@@ -753,6 +774,72 @@ def make_leaf_texture(size=256):
     return (rgba * 255).clip(0, 255).astype(np.uint8)
 
 
+def make_snow_bark_texture(bark_rgb):
+    """Brighten bark toward snow-covered wood; keep bark detail showing through."""
+    rng = np.random.default_rng(57)
+    snow = np.array([232.0, 238.0, 248.0], dtype=np.float32)
+    t = 0.60  # 0 = raw bark, 1 = pure snow
+    out = bark_rgb.astype(np.float32) * (1.0 - t) + snow * t
+    # per-pixel noise so snow doesn't look flat
+    noise = rng.integers(-14, 14, bark_rgb.shape[:2], dtype=np.int16).astype(np.float32)
+    out[..., 0] = np.clip(out[..., 0] + noise, 0, 255)
+    out[..., 1] = np.clip(out[..., 1] + noise, 0, 255)
+    out[..., 2] = np.clip(out[..., 2] + noise * 0.6 + 6.0, 0, 255)  # tilt toward blue
+    return out.astype(np.uint8)
+
+
+def make_snow_leaf_texture(size=256):
+    """Leaf-cluster texture where most leaves carry a snow cap — mostly white
+    with occasional green peek-through and pale veins."""
+    rng = np.random.default_rng(47)
+    rgba = np.zeros((size, size, 4), dtype=np.float32)
+    ys, xs = np.mgrid[0:size, 0:size].astype(np.float32)
+    for _ in range(24):
+        cx = float(rng.integers(28, size - 28))
+        cy = float(rng.integers(28, size - 28))
+        rx = float(rng.integers(9, 16))
+        ry = float(rng.integers(15, 26))
+        angle = float(rng.uniform(0.0, math.pi))
+        if rng.random() < 0.25:
+            # unsnowed leaf — still green for contrast
+            r = 0.32 + float(rng.uniform(-0.05, 0.08))
+            g = 0.52 + float(rng.uniform(-0.05, 0.15))
+            b = 0.28 + float(rng.uniform(-0.05, 0.10))
+        else:
+            w = 0.90 + float(rng.uniform(-0.08, 0.06))
+            r = w
+            g = w * 0.99
+            b = min(1.0, w * 1.03)
+        cosA, sinA = math.cos(angle), math.sin(angle)
+        dx = xs - cx
+        dy = ys - cy
+        xr = dx * cosA + dy * sinA
+        yr = -dx * sinA + dy * cosA
+        dist = (xr / rx) ** 2 + (yr / ry) ** 2
+        m = np.clip(1.0 - dist, 0.0, 1.0) ** 1.2
+        vein = 1.0 - 0.12 * np.exp(-(xr ** 2) / max(0.3, (rx * 0.18) ** 2))
+        sa = m * 0.95
+        rgba[..., 0] = rgba[..., 0] * (1 - sa) + r * vein * sa
+        rgba[..., 1] = rgba[..., 1] * (1 - sa) + g * vein * sa
+        rgba[..., 2] = rgba[..., 2] * (1 - sa) + b * vein * sa
+        rgba[..., 3] = np.maximum(rgba[..., 3], m)
+    return (rgba * 255).clip(0, 255).astype(np.uint8)
+
+
+def make_snowflake_texture(size=32):
+    """Soft white disc for point-sprite snowflakes (RGBA, alpha falloff)."""
+    ys, xs = np.mgrid[0:size, 0:size].astype(np.float32)
+    c = (size - 1) / 2.0
+    d = np.sqrt((xs - c) ** 2 + (ys - c) ** 2) / c
+    alpha = np.clip(1.0 - d, 0.0, 1.0) ** 2.2
+    rgba = np.zeros((size, size, 4), dtype=np.float32)
+    rgba[..., 0] = 1.0
+    rgba[..., 1] = 1.0
+    rgba[..., 2] = 1.0
+    rgba[..., 3] = alpha
+    return (rgba * 255).astype(np.uint8)
+
+
 _TREE_QUADRIC = None
 
 
@@ -846,8 +933,11 @@ def build_tree_variants(bark_tex, leaf_tex, n=N_TREE_VARIANTS):
     return [build_tree_variant(101 + i * 37, bark_tex, leaf_tex) for i in range(n)]
 
 
-def draw_forest(s_car, tree_lists, amb_rgb):
-    """Instance baked tree lists across positions in forest biome zones."""
+def draw_forest(s_car, tree_lists, frost_tree_lists, amb_rgb):
+    """Instance baked tree lists across positions in forest/frost biome zones.
+    Picks the frost (snow-covered) variant set where the slot is in a frost
+    zone; forest zones get the normal green variants.
+    """
     s_start = math.floor(s_car / TREE_SPACING) * TREE_SPACING
     max_s = s_car + N_SEG * SEG_LEN
     n_steps = int((max_s - s_start) / TREE_SPACING) + 1
@@ -855,7 +945,6 @@ def draw_forest(s_car, tree_lists, amb_rgb):
 
     glEnable(GL_TEXTURE_2D)
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
-    # leaves lean slightly warmer; trunks neutral — apply ambient tint uniformly
     glColor3f(min(1.0, amb_rgb[0]),
               min(1.0, amb_rgb[1]),
               min(1.0, amb_rgb[2]))
@@ -865,15 +954,16 @@ def draw_forest(s_car, tree_lists, amb_rgb):
         if s < s_car - 1.0:
             continue
         for side in (-1, +1):
-            density = forest_weight_at(s, side)
-            if density < 0.28:
+            w = biome_weights_vec(np.array([s], dtype=np.float32), side)[0]
+            fw = float(w[BIOME_FOREST])
+            frw = float(w[BIOME_FROST])
+            tree_density = fw + frw  # trees grow in both
+            if tree_density < 0.28:
                 continue
-            # deterministic tree hash per (s, side)
             key = (int(s * 97) * 2654435761
                    + (0 if side < 0 else 7919)
                    + 1013904223) & 0xFFFFFFFF
-            # density-gated placement
-            if ((key & 0xFFFF) / 65535.0) > density * 0.95:
+            if ((key & 0xFFFF) / 65535.0) > tree_density * 0.95:
                 continue
             d_edge = 1.2 + ((key >> 16) & 0xFF) / 255.0 * TREE_MAX_PERP
             variant = ((key >> 24) & 0x07) % nvar
@@ -884,14 +974,133 @@ def draw_forest(s_car, tree_lists, amb_rgb):
             ty = curve_y(s) - 0.15
             tz = -(s - s_car)
 
+            use_frost = frw > fw
+            lst = frost_tree_lists[variant] if use_frost else tree_lists[variant]
+
             glPushMatrix()
             glTranslatef(tx, ty, tz)
             glRotatef(yaw, 0, 1, 0)
             glScalef(scale, scale, scale)
-            glCallList(tree_lists[variant])
+            glCallList(lst)
             glPopMatrix()
 
     glDisable(GL_ALPHA_TEST)
+
+
+# --- Snow road shoulders ---
+def draw_snow_shoulders(snow_tex, s_car, amb_rgb):
+    """Two QUAD_STRIPs hugging the road edges; per-vertex alpha tracks frost
+    weight so snow tapers cleanly into biome transitions."""
+    NS = N_SEG + 1
+    s_arr = np.arange(NS, dtype=np.float32) * SEG_LEN + s_car
+    wL = biome_weights_vec(s_arr, -1)[:, BIOME_FROST]
+    wR = biome_weights_vec(s_arr, +1)[:, BIOME_FROST]
+    if wL.max() < 0.02 and wR.max() < 0.02:
+        return
+
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, snow_tex)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glDepthMask(GL_FALSE)
+
+    for side, warr in ((-1, wL), (+1, wR)):
+        glBegin(GL_QUAD_STRIP)
+        for i in range(NS):
+            s = s_arr[i]
+            a = float(min(1.0, warr[i] * 1.3))
+            x = curve_x(s); y = curve_y(s); z = -(s - s_car)
+            inner = x + side * (ROAD_WIDTH / 2 + 0.02)
+            outer = x + side * (ROAD_WIDTH / 2 + SNOW_SHOULDER_W)
+            v = s * 0.25
+            glColor4f(amb_rgb[0], amb_rgb[1], amb_rgb[2], a)
+            glTexCoord2f(0.0, v); glVertex3f(inner, y + 0.05, z)
+            glTexCoord2f(0.35, v); glVertex3f(outer, y + 0.05, z)
+        glEnd()
+
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+
+
+# --- Snowfall particle system ---
+# Camera-local box of point-sprite flakes. Each flake falls with gravity + slow
+# horizontal swirl; when it leaves the box, it respawns at the top edge with
+# a new random X/Z. Rendering is gated and alpha-scaled by the frost weight at
+# the camera, so flakes only appear in frost biomes and fade at transitions.
+SNOW_N = 700
+SNOW_BOX_X = 34.0
+SNOW_BOX_Z = 60.0
+SNOW_Y_TOP = 22.0
+SNOW_Y_BOTTOM = -2.0
+
+
+def init_snow(seed=77):
+    rng = np.random.default_rng(seed)
+    pos = np.zeros((SNOW_N, 3), dtype=np.float32)
+    pos[:, 0] = rng.uniform(-SNOW_BOX_X, SNOW_BOX_X, SNOW_N)
+    pos[:, 1] = rng.uniform(SNOW_Y_BOTTOM, SNOW_Y_TOP, SNOW_N)
+    pos[:, 2] = rng.uniform(-SNOW_BOX_Z, SNOW_BOX_Z * 0.2, SNOW_N)
+    vel = np.zeros((SNOW_N, 3), dtype=np.float32)
+    vel[:, 0] = rng.uniform(-0.35, 0.35, SNOW_N)
+    vel[:, 1] = rng.uniform(-5.6, -3.8, SNOW_N)
+    vel[:, 2] = rng.uniform(-0.25, 0.25, SNOW_N)
+    seeds = rng.uniform(0.0, 6.2831855, SNOW_N).astype(np.float32)
+    return pos, vel, seeds
+
+
+def update_snow(state, dt, t_time):
+    pos, vel, seeds = state
+    # vertical fall + gentle horizontal swirl
+    swirl_x = 0.55 * np.sin(t_time * 1.25 + seeds)
+    swirl_z = 0.45 * np.cos(t_time * 0.85 + seeds * 1.3)
+    pos[:, 0] += (vel[:, 0] + swirl_x) * dt
+    pos[:, 1] += vel[:, 1] * dt
+    pos[:, 2] += (vel[:, 2] + swirl_z) * dt
+
+    # respawn when below bottom or outside horizontal box
+    below = pos[:, 1] < SNOW_Y_BOTTOM
+    outX = np.abs(pos[:, 0]) > SNOW_BOX_X
+    outZ = np.abs(pos[:, 2]) > SNOW_BOX_Z
+    respawn = below | outX | outZ
+    n = int(respawn.sum())
+    if n > 0:
+        rng = np.random.default_rng()
+        pos[respawn, 0] = rng.uniform(-SNOW_BOX_X, SNOW_BOX_X, n).astype(np.float32)
+        pos[respawn, 1] = SNOW_Y_TOP
+        pos[respawn, 2] = rng.uniform(-SNOW_BOX_Z, SNOW_BOX_Z * 0.3, n).astype(np.float32)
+
+
+def draw_snow(state, snow_tex, intensity, cam_x, cam_y, cam_z):
+    """Renders point-sprite flakes translated to camera. `intensity` is the
+    frost biome weight at camera — never draws above 0 outside frost zones."""
+    if intensity < 0.02:
+        return
+    pos, _vel, _seed = state
+
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, snow_tex)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glEnable(GL_POINT_SPRITE)
+    glTexEnvi(GL_POINT_SPRITE, GL_COORD_REPLACE, GL_TRUE)
+    glPointSize(14.0)
+    glPointParameterfv(GL_POINT_DISTANCE_ATTENUATION, (0.0, 0.06, 0.0015))
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glDepthMask(GL_FALSE)
+
+    glPushMatrix()
+    glTranslatef(cam_x, cam_y, cam_z)
+    glColor4f(1.0, 1.0, 1.0, min(1.0, intensity * 1.2))
+    glEnableClientState(GL_VERTEX_ARRAY)
+    glVertexPointer(3, GL_FLOAT, 0, pos)
+    glDrawArrays(GL_POINTS, 0, len(pos))
+    glDisableClientState(GL_VERTEX_ARRAY)
+    glPopMatrix()
+
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+    glDisable(GL_POINT_SPRITE)
 
 
 # --- Main ---
@@ -920,9 +1129,16 @@ def main():
     terrain_tex = upload_texture(make_terrain_texture())
     cloud_tex = upload_texture(make_cloud_texture(), internal=GL_RGBA, src=GL_RGBA)
     stars_tex = upload_texture(make_stars_texture())
-    bark_tex = upload_texture(load_texture_file("textures/Bark001_1K-JPG_Color.jpg"))
+    bark_rgb = load_texture_file("textures/Bark001_1K-JPG_Color.jpg")
+    bark_tex = upload_texture(bark_rgb)
+    snow_bark_tex = upload_texture(make_snow_bark_texture(bark_rgb))
     leaf_tex = upload_texture(make_leaf_texture(), internal=GL_RGBA, src=GL_RGBA)
+    snow_leaf_tex = upload_texture(make_snow_leaf_texture(), internal=GL_RGBA, src=GL_RGBA)
     tree_lists = build_tree_variants(bark_tex, leaf_tex)
+    frost_tree_lists = build_tree_variants(snow_bark_tex, snow_leaf_tex)
+    snow_ground_tex = upload_texture(load_texture_file("textures/Snow001_1K-JPG_Color.jpg"))
+    snowflake_tex = upload_texture(make_snowflake_texture(), internal=GL_RGBA, src=GL_RGBA)
+    snow_state = init_snow()
     sv, stc, sfr, sidx = build_sky_dome()
     sky_state = (sv, stc, sfr, sidx, cloud_tex, stars_tex)
 
@@ -988,9 +1204,15 @@ def main():
                            core_alpha=moon_alpha)
 
         draw_terrain(terrain_tex, s_car, t_time, amb)
-        draw_forest(s_car, tree_lists, amb)
+        draw_forest(s_car, tree_lists, frost_tree_lists, amb)
         draw_road(road_tex, s_car, amb)
+        draw_snow_shoulders(snow_ground_tex, s_car, amb)
         draw_lamps(s_car, night_a)
+
+        # snowfall: only in frost biomes, intensity tracks frost weight at camera
+        snow_i = frost_intensity_at(s_car)
+        update_snow(snow_state, dt, t_time)
+        draw_snow(snow_state, snowflake_tex, snow_i, cx, cy, cz)
 
         pygame.display.flip()
 

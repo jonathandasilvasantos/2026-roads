@@ -25,8 +25,13 @@ Press **Esc** to quit. Runs fullscreen at the native display resolution.
   sits behind the "car" and pitches into climbs and descents by sampling the
   path ahead.
 - **Biomes** — per-side, zone-based. Each ~240m zone on each side of the road
-  independently rolls one of: plain, hill, mountain, river, forest. 45m
-  smoothstep transitions blend heights and colors between zones.
+  independently rolls one of: plain, hill, mountain, river, forest, frost.
+  45m smoothstep transitions blend heights and colors between zones.
+- **Frost zones** — snow-tinted ground, drifts piled against the road edge,
+  snow-covered trees (separate tree template set built with a snow-bark and
+  snowy-leaf texture), and snow shoulders along the pavement. Point-sprite
+  snowfall drifts down with horizontal swirl, gated by the frost weight at
+  the camera so it only appears in frost biomes and fades at transitions.
 - **Terrain** — 14-band triangle strip per side (~80m outward) with per-biome
   height profiles: plain flat, hill gentle waves, mountain steep ridged
   rise, river dipped valley with animated water, forest near-flat floor.
@@ -50,6 +55,7 @@ Press **Esc** to quit. Runs fullscreen at the native display resolution.
 ## Textures
 
 - **Bark** — [ambientCG Bark001](https://ambientcg.com/view?id=Bark001), CC0.
+- **Snow ground** — [ambientCG Snow001](https://ambientcg.com/view?id=Snow001), CC0.
 - **Leaves** — procedural (RGBA foliage cluster with soft alpha + faint vein).
 - **Road asphalt** — procedural noise + dashed center line + side stripes.
 - **Terrain ground** — procedural multi-octave fBm, tinted at runtime.
