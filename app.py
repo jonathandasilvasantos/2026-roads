@@ -15,8 +15,8 @@ from OpenGL.GLU import (
 
 # --- Road ---
 ROAD_WIDTH = 10.0
-SEG_LEN = 2.0
-N_SEG = 180
+SEG_LEN = 2.2
+N_SEG = 400            # visible road/terrain extent: ~880m ahead of camera
 SPEED = 28.0           # default cruise speed (m/s); Up/Down adjust live
 SPEED_ACCEL = 24.0     # m/s² applied while Up/Down is held
 SPEED_MIN = 0.0
@@ -35,8 +35,8 @@ D_STEP = 6.0
 TERRAIN_EDGE_D = 0.1
 
 # --- Biomes ---
-ZONE_LEN = 240.0
-TRANS_LEN = 45.0
+ZONE_LEN = 280.0
+TRANS_LEN = 95.0       # long smoothstep between zones so biomes shift gently
 (BIOME_PLAIN, BIOME_HILL, BIOME_MOUNTAIN, BIOME_RIVER,
  BIOME_FOREST, BIOME_FROST, BIOME_CITY) = 0, 1, 2, 3, 4, 5, 6
 BIOME_COUNT = 7
@@ -62,7 +62,7 @@ SNOW_SHOULDER_W = 2.2
 # --- Day/Night cycle ---
 # One minute == midnight → noon, so full cycle = 120s
 DAY_PERIOD = 120.0
-SKY_DOME_R = 400.0
+SKY_DOME_R = 1000.0    # large enough to enclose the deeper visible terrain
 
 
 # --- Path curves ---
@@ -92,10 +92,20 @@ def curve_y_np(s):
 
 # --- Biomes ---
 def biome_at(zone_idx, side):
-    # offset chosen so the first city zone lands at zone 2 — visible within
-    # ~15 seconds of the start rather than minutes in.
-    key = (zone_idx * 2654435761 + (0 if side < 0 else 9277)) & 0xFFFFFFFF
-    return key % BIOME_COUNT
+    """Per-zone biome, with one coherence rule: frost zones are always
+    symmetric across the road. If either side would roll frost, both do,
+    so snow-covered ground never butts up against green grass on the
+    opposite side (which looks wrong — weather is atmospheric). Other
+    biomes still vary per side so you can get mountain on the left and
+    plain on the right for scenic variety.
+    """
+    key_l = (zone_idx * 2654435761) & 0xFFFFFFFF
+    key_r = (zone_idx * 2654435761 + 9277) & 0xFFFFFFFF
+    bl = key_l % BIOME_COUNT
+    br = key_r % BIOME_COUNT
+    if bl == BIOME_FROST or br == BIOME_FROST:
+        return BIOME_FROST
+    return bl if side < 0 else br
 
 
 def biome_weights_vec(s_arr, side):
@@ -310,9 +320,10 @@ def storm_intensity_at(t_time):
     Tuning: period ~4 minutes, threshold 0.55 on the normalised product,
     roughly 8-12% of wall-clock time sits in a visible storm, ~3% at peak.
     """
-    a = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 260.0)
-    b = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 71.0 + 1.3)
-    c = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 131.0 + 0.7)
+    # Longer primary period (~7 min) so storms build and clear slowly.
+    a = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 420.0)
+    b = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 115.0 + 1.3)
+    c = 0.5 + 0.5 * math.sin(t_time * 2 * math.pi / 210.0 + 0.7)
     raw = a * b * c
     x = max(0.0, (raw - 0.36) / 0.64)
     x = min(1.0, x)
@@ -1769,12 +1780,17 @@ def main():
 
     glMatrixMode(GL_PROJECTION)
     glLoadIdentity()
-    gluPerspective(68.0, W / float(H), 0.1, 1200.0)
+    # Far plane pushed to 1800m so the dome and distant terrain stay inside
+    # the frustum without clipping. Near plane kept tight for foreground
+    # detail.
+    gluPerspective(68.0, W / float(H), 0.1, 1800.0)
     glMatrixMode(GL_MODELVIEW)
 
     glEnable(GL_FOG)
     glFogi(GL_FOG_MODE, GL_EXP2)
-    glFogf(GL_FOG_DENSITY, 0.0055)
+    # Lighter fog so distant mountains and terrain fade in gradually over
+    # several hundred metres instead of popping at the edge of the mesh.
+    glFogf(GL_FOG_DENSITY, 0.0032)
 
     road_tex = upload_texture(make_road_texture())
     terrain_tex = upload_texture(make_terrain_texture())
@@ -1799,6 +1815,8 @@ def main():
     active_bolt = None
     bolt_age = 0.0
     time_to_strike = 3.0
+    # Seed the EMA with the starting storm value so we don't ramp in from 0
+    storm_smoothed = storm_intensity_at(0.0)
     sv, stc, sfr, sidx = build_sky_dome()
     sky_state = (sv, stc, sfr, sidx, cloud_tex, stars_tex)
 
@@ -1833,8 +1851,14 @@ def main():
         t_time += dt
         t_day = (t_day + dt / DAY_PERIOD) % 1.0
 
-        # weather tick: storm intensity and lightning lifecycle
-        storm_i = storm_intensity_at(t_time)
+        # weather tick: storm intensity and lightning lifecycle.
+        # EMA on the raw storm signal so intensity climbs and falls over
+        # ~30 seconds rather than whatever the sine product happens to do —
+        # looks like weather building gradually, not flicking on and off.
+        storm_raw = storm_intensity_at(t_time)
+        storm_tau = 30.0
+        storm_smoothed += (storm_raw - storm_smoothed) * min(1.0, dt / storm_tau)
+        storm_i = storm_smoothed
         if active_bolt is not None:
             bolt_age += dt
             if bolt_age > BOLT_LIFE:
@@ -1867,7 +1891,7 @@ def main():
         # density eases in/out at zone transitions rather than snapping.
         frost_i = frost_intensity_at(s_car)
         # +10% fog in frost, +30% more in heavy storm (rain reduces visibility)
-        glFogf(GL_FOG_DENSITY, 0.0055 * (1.0 + 0.10 * frost_i + 0.30 * storm_i))
+        glFogf(GL_FOG_DENSITY, 0.0032 * (1.0 + 0.10 * frost_i + 0.30 * storm_i))
         glClearColor(horizon[0], horizon[1], horizon[2], 1.0)
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
