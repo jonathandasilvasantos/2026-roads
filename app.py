@@ -2832,6 +2832,251 @@ def draw_snow(state, snow_tex, wL, wR, cam_x, cam_y, cam_z):
     glDisable(GL_POINT_SPRITE)
 
 
+# --- Procedural flowers ---
+# Small wild flowers along the roadside in flat / vegetated biomes.
+# Rendered as Lighthouse3D-style crossed billboard quads (two textured
+# quads at 90° to each other) with alpha-cutout petals and stem baked
+# into one RGBA texture.
+#
+# Diversity: six colour variants generated from a single procedural
+# recipe (petals + center disc + stem) by seeding different palettes.
+# Placement: plain + hill + forest biomes, not mountain/river/frost/city.
+# Wind sway: same rotation-around-base trick as trees but with a larger
+# amplitude and a higher sway rate so flowers feel more reactive than
+# the canopies above them. A subset of slots becomes a *crop* (a dense
+# cluster of 6-12 flowers in a small patch) so the shoulder isn't a
+# uniform sprinkling.
+
+FLOWER_SPACING = 0.95           # stride along road for candidate flower slots
+FLOWER_MIN_D = 0.6              # closest to road edge
+FLOWER_MAX_D = 6.0              # farthest from road edge (stay off the field)
+FLOWER_MAX_RENDER_DIST = 280.0  # distance culling — flowers are tiny past this
+FLOWER_CLUSTER_PROB = 0.06      # 6% of valid slots become a crop cluster
+
+
+FLOWER_PALETTES = [
+    # (petal_rgb, center_rgb)
+    ((1.00, 0.90, 0.20), (0.65, 0.40, 0.08)),   # 0 yellow daisy
+    ((0.95, 0.28, 0.20), (0.25, 0.10, 0.08)),   # 1 red poppy
+    ((0.62, 0.30, 0.85), (0.85, 0.78, 0.25)),   # 2 purple aster
+    ((0.98, 0.96, 0.95), (0.95, 0.80, 0.20)),   # 3 white daisy
+    ((0.98, 0.62, 0.78), (0.70, 0.40, 0.35)),   # 4 pink cosmos
+    ((1.00, 0.55, 0.20), (0.40, 0.20, 0.08)),   # 5 orange marigold
+]
+
+
+def make_flower_texture(petal_rgb, center_rgb, size=128, seed=0):
+    """Procedural RGBA flower — petals radiating around a center disc, with
+    a slim green stem below. Top ~55% of the texture is the flower head,
+    bottom ~45% is the stem, so the same quad carries both when drawn as
+    a vertical billboard."""
+    rng = np.random.default_rng(seed + 5000)
+    rgba = np.zeros((size, size, 4), dtype=np.float32)
+    ys, xs = np.mgrid[0:size, 0:size].astype(np.float32)
+
+    # Flower head is positioned in the upper part of the texture so the
+    # rendered quad will have flower on top, stem trailing below.
+    cx = size / 2.0
+    cy = size * 0.32   # flower center a bit above the middle
+    petal_len = size * 0.24
+    petal_wid = size * 0.095
+    n_petals = int(rng.integers(6, 10))
+    base_angle = float(rng.uniform(0.0, 2 * math.pi / max(1, n_petals)))
+    petal_variation = float(rng.uniform(-0.04, 0.08))
+
+    for i in range(n_petals):
+        angle = base_angle + i * 2 * math.pi / n_petals + petal_variation * i
+        off = petal_len * 0.7
+        px = cx + off * math.cos(angle)
+        py = cy + off * math.sin(angle)
+        cosA = math.cos(angle); sinA = math.sin(angle)
+        dx = xs - px
+        dy = ys - py
+        xr = dx * cosA + dy * sinA
+        yr = -dx * sinA + dy * cosA
+        d = (xr / petal_len) ** 2 + (yr / petal_wid) ** 2
+        m = np.clip(1.0 - d, 0.0, 1.0) ** 1.3
+        # Slight hue variation per petal for painterly feel
+        jitter = 0.85 + 0.15 * ((i % 3) / 2.0)
+        pr = petal_rgb[0] * jitter
+        pg = petal_rgb[1] * jitter
+        pb = petal_rgb[2] * jitter
+        sa = m * 0.96
+        rgba[..., 0] = rgba[..., 0] * (1 - sa) + pr * sa
+        rgba[..., 1] = rgba[..., 1] * (1 - sa) + pg * sa
+        rgba[..., 2] = rgba[..., 2] * (1 - sa) + pb * sa
+        rgba[..., 3] = np.maximum(rgba[..., 3], m)
+
+    # Center disc
+    dx = xs - cx
+    dy = ys - cy
+    d = np.sqrt(dx * dx + dy * dy) / (size * 0.085)
+    m = np.clip(1.0 - d, 0.0, 1.0) ** 1.6
+    sa = m * 1.0
+    rgba[..., 0] = rgba[..., 0] * (1 - sa) + center_rgb[0] * sa
+    rgba[..., 1] = rgba[..., 1] * (1 - sa) + center_rgb[1] * sa
+    rgba[..., 2] = rgba[..., 2] * (1 - sa) + center_rgb[2] * sa
+    rgba[..., 3] = np.maximum(rgba[..., 3], m)
+
+    # Slim green stem from just under the center downward to the bottom
+    stem_x = int(cx)
+    stem_y0 = int(cy + size * 0.02)
+    stem_y1 = size
+    stem_half_w = 2
+    stem_rgb = (0.22, 0.46, 0.14)
+    for y in range(stem_y0, stem_y1):
+        for dxp in range(-stem_half_w, stem_half_w + 1):
+            xi = stem_x + dxp
+            if 0 <= xi < size:
+                # Fade stem slightly as it goes down
+                t = 1.0 - (y - stem_y0) / max(1, (stem_y1 - stem_y0))
+                rgba[y, xi, 0] = stem_rgb[0] * (0.7 + 0.3 * t)
+                rgba[y, xi, 1] = stem_rgb[1] * (0.7 + 0.3 * t)
+                rgba[y, xi, 2] = stem_rgb[2] * (0.7 + 0.3 * t)
+                rgba[y, xi, 3] = 1.0
+
+    # A couple of slim leaves on the stem
+    for ly in (int(size * 0.55), int(size * 0.70)):
+        lenpx = size * 0.07
+        for dy_ in range(-3, 4):
+            for dx_ in range(-int(lenpx), int(lenpx)):
+                m_leaf = max(0.0, 1.0 - (dx_ / lenpx) ** 2 - (dy_ / 3.0) ** 2)
+                if m_leaf <= 0:
+                    continue
+                xi = stem_x + dx_
+                yi = ly + dy_
+                if 0 <= xi < size and 0 <= yi < size:
+                    rgba[yi, xi, 0] = stem_rgb[0] * 1.15
+                    rgba[yi, xi, 1] = stem_rgb[1] * 1.15
+                    rgba[yi, xi, 2] = stem_rgb[2] * 1.15
+                    rgba[yi, xi, 3] = max(rgba[yi, xi, 3], m_leaf)
+
+    return (np.clip(rgba, 0, 1) * 255).astype(np.uint8)
+
+
+def build_flower_variant(flower_tex):
+    """Two crossed textured quads (N-S and E-W oriented) with alpha test
+    baked in. Flower head at top of the quad, stem at bottom — the
+    display list's texture bind is the flower colour, so instancing just
+    means glCallList at the right transform."""
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    glBindTexture(GL_TEXTURE_2D, flower_tex)
+    glEnable(GL_ALPHA_TEST)
+    glAlphaFunc(GL_GREATER, 0.45)
+    # A unit-size billboard: -0.5..+0.5 in X, 0..1 in Y. Runtime glScalef
+    # turns it into 0.3-0.5 m tall flowers.
+    for rot in (0.0, 90.0):
+        glPushMatrix()
+        glRotatef(rot, 0.0, 1.0, 0.0)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0.0, 0.0); glVertex3f(-0.5, 0.0, 0.0)
+        glTexCoord2f(1.0, 0.0); glVertex3f(0.5, 0.0, 0.0)
+        glTexCoord2f(1.0, 1.0); glVertex3f(0.5, 1.0, 0.0)
+        glTexCoord2f(0.0, 1.0); glVertex3f(-0.5, 1.0, 0.0)
+        glEnd()
+        glPopMatrix()
+    glDisable(GL_ALPHA_TEST)
+    glEndList()
+    return list_id
+
+
+def draw_flowers(s_car, flower_variants, amb_rgb, t_time, wind_strength):
+    """Instance flowers + clusters along flat-ground biomes. Wind sway
+    uses a larger amplitude and higher frequency than trees so flowers
+    feel lighter. Distance-culled past ~280 m because they're tiny."""
+    s_start = math.floor(s_car / FLOWER_SPACING) * FLOWER_SPACING
+    max_s = s_car + min(N_SEG * SEG_LEN, FLOWER_MAX_RENDER_DIST)
+    n_steps = int((max_s - s_start) / FLOWER_SPACING) + 1
+    nvar = len(flower_variants)
+    if nvar == 0 or n_steps <= 0:
+        return
+
+    # Wind parameters — larger and faster than the tree sway
+    sway = wind_strength > 0.02
+    if sway:
+        gust = 0.55 + 0.45 * math.sin(t_time * 0.35)
+        amp_deg = wind_strength * gust * 10.0      # up to ~8° per axis
+        omega = 2.6 + wind_strength * 3.5
+        lean_deg = wind_strength * 2.5
+    else:
+        amp_deg = omega = lean_deg = 0.0
+
+    glEnable(GL_TEXTURE_2D)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glColor3f(min(1.0, amb_rgb[0]),
+              min(1.0, amb_rgb[1]),
+              min(1.0, amb_rgb[2]))
+
+    for i in range(n_steps):
+        s = s_start + i * FLOWER_SPACING
+        if s < s_car - 0.5:
+            continue
+        for side in (-1, +1):
+            w_b = biome_weights_vec(np.array([s], dtype=np.float32), side)[0]
+            # Coherent with landscape: plain, hill, forest welcome flowers.
+            # Skip mountain (rocky), frost (snow), river (water), city.
+            ok = float(w_b[BIOME_PLAIN] + w_b[BIOME_HILL]
+                       + w_b[BIOME_FOREST])
+            bad = float(w_b[BIOME_MOUNTAIN] + w_b[BIOME_RIVER]
+                        + w_b[BIOME_FROST] + w_b[BIOME_CITY])
+            if ok < 0.55 or bad > 0.30:
+                continue
+
+            key = (int(s * 41) * 2654435761
+                   + (0 if side < 0 else 3019)) & 0xFFFFFFFF
+            # Density gate — probability of a flower at this slot
+            density = 0.40 * ok
+            if (key & 0xFF) / 255.0 > density:
+                continue
+
+            # Rarely a crop cluster instead of a single flower
+            is_cluster = ((key >> 24) & 0xFF) / 255.0 < FLOWER_CLUSTER_PROB
+            cluster_n = int(rng_range_from_hash(key, 6, 13)) if is_cluster else 1
+
+            d_base = FLOWER_MIN_D + ((key >> 8) & 0xFF) / 255.0 \
+                     * (FLOWER_MAX_D - FLOWER_MIN_D)
+            variant = ((key >> 16) & 0x0F) % nvar
+            scale_base = 0.30 + ((key >> 20) & 0x0F) / 15.0 * 0.25
+            # Phase for wind, seeded by slot
+            phase0 = ((key >> 12) & 0x3FFF) * (2.0 * math.pi / 0x3FFF)
+
+            for k in range(cluster_n):
+                if cluster_n > 1:
+                    ck = (key * 0x9E3779B1 + k * 0x85EBCA77) & 0xFFFFFFFF
+                    jitter_x = ((ck & 0xFFFF) / 65535.0 - 0.5) * 1.6
+                    jitter_z = (((ck >> 16) & 0xFFFF) / 65535.0 - 0.5) * 1.6
+                    jitter_d = (ck & 0xFF) / 255.0 * 0.8
+                    phase = phase0 + k * 0.37
+                else:
+                    jitter_x = jitter_z = jitter_d = 0.0
+                    phase = phase0
+
+                tx = curve_x(s) + side * (ROAD_WIDTH / 2 + d_base + jitter_d) + jitter_x
+                ty = curve_y(s) - 0.08
+                tz = -(s - s_car) + jitter_z
+
+                glPushMatrix()
+                glTranslatef(tx, ty, tz)
+                if sway:
+                    sx = lean_deg + amp_deg * math.sin(t_time * omega + phase)
+                    sz = amp_deg * 0.65 * math.sin(
+                        t_time * omega * 1.3 + phase + 0.5
+                    )
+                    glRotatef(sx, 1.0, 0.0, 0.0)
+                    glRotatef(sz, 0.0, 0.0, 1.0)
+                glScalef(scale_base, scale_base, scale_base)
+                glCallList(flower_variants[variant])
+                glPopMatrix()
+
+
+def rng_range_from_hash(key, lo, hi):
+    """Small stable helper: turn the low bits of a 32-bit hash into an
+    integer in [lo, hi]."""
+    span = max(1, hi - lo + 1)
+    return lo + ((key >> 28) % span)
+
+
 # --- Procedural houses ---
 # Rural / suburban dwellings placed far enough from the road that
 # geometric imperfections blur out (50-85 m perpendicular). Each house is
@@ -3553,6 +3798,15 @@ def main():
         upload_texture(make_slate_roof_texture()),
     ]
     house_variants = build_house_variants(house_wall_texes, house_roof_texes)
+    # Flowers: six colour palettes, each compiled as a crossed-quad
+    # billboard display list.
+    flower_variants = []
+    for idx, (petal_rgb, center_rgb) in enumerate(FLOWER_PALETTES):
+        flower_tex = upload_texture(
+            make_flower_texture(petal_rgb, center_rgb, seed=idx),
+            internal=GL_RGBA, src=GL_RGBA,
+        )
+        flower_variants.append(build_flower_variant(flower_tex))
     rain_state = init_rain()
     pond_tex = upload_texture(make_pond_texture(), internal=GL_RGBA, src=GL_RGBA)
     flare_tex = upload_texture(make_flare_disc_texture(), internal=GL_RGBA, src=GL_RGBA)
@@ -3833,6 +4087,9 @@ def main():
         # Snow accumulates on roofs during frost biome, melts off when
         # the biome transitions back to plain/forest.
         draw_houses(s_car, house_variants, snow_ground_tex, amb)
+        # Flowers along the shoulders — same wind as the trees so the
+        # whole landscape pulses together when a gust rolls through.
+        draw_flowers(s_car, flower_variants, amb, t_time, wind_strength)
         # Road pavement with subtle wet darkening during rain, then the
         # snow overlay pass that fades in/out with frost biome transitions.
         draw_road(road_tex, s_car, amb, storm_i)
