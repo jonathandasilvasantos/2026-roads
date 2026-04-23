@@ -113,6 +113,146 @@ Press **Esc** to quit. Runs fullscreen at the native display resolution.
   skyline. Buildings are placed at 92–175m perpendicular distance so they
   read as a skyline beyond the terrain mesh and fog hides edges.
 
+## Single-object viewer (`view.py`)
+
+A companion CLI for isolating one procedural asset and iterating on it
+without running the whole driving sim. Used extensively on this branch
+as the inspection loop for the enhancements listed below.
+
+```bash
+python view.py --object house                       # interactive windowed stage
+python view.py --object building --time 21 --weather clear --auto-rotate 20
+python view.py --object mountain --seed 3 --time 7 --weather snow --windowed
+python view.py --object asphalt --time 18.5 --weather rain \
+               --yaw 0 --pitch 4 --zoom 2 --no-ground
+python view.py --object car --seed 5 --angles 0,90,180,270 \
+               --screenshot out/car.png --exit-after 0.0   # headless 4-angle burst
+```
+
+Objects: `house`, `building`, `mountain`, `flower`, `tree`, `car`,
+`truck`, `asphalt`. Live keybindings: arrows orbit, `+`/`-` zoom,
+`space` reset, `r`/`R`/`s` toggle rain/storm/snow, `p` screenshot,
+`Esc`/`q` quit. Automation flags: `--auto-rotate DEG_PER_SEC`,
+`--angles "0,90,180,270"` (screenshot burst), `--screenshot PATH`,
+`--exit-after SECONDS`, `--time`, `--weather`, `--wind`, `--seed`.
+
+## Enhancements (city-enhancements branch)
+
+Each system below was iterated via `view.py` screenshot loops with
+research as the design criterion. Per-cycle snapshots live under
+`iter/<system>_{baseline,c2,c3,...}/`.
+
+### Buildings
+- 5 facade material palettes (concrete / limestone / brick / glass /
+  sandstone), one per variant — Wonka 2003 / Müller 2006 split grammar
+  layered bands baked as texture adornment.
+- Parapet wall + rooftop mechanical box + antenna mast + blinking red
+  aviation beacon (Schwarz & Müller 2015 tower-crown motifs).
+- Night emission: two-pass GL_ONE/GL_ONE additive with `GL_LEQUAL`
+  depth fix, ~45 % warm upper-floor windows + ~80 % cool fluorescent
+  storefronts + halo bloom.
+- Rooftop snow accumulation pass, wet-facade darkening under storm.
+
+### Houses
+- Ridge-height gable (previous apex peaked at `wall_h + 0.01`, leaving
+  a visible gap under the roof).
+- Plinth / foundation band, 0.45 m eave overhang, brick chimney with
+  concrete cap and flue opening (Musialski 2013 survey cues).
+- Window surrounds: painted trim frame + horizontal muntin + sill
+  projection at layered protrusion depths (Lipp 2008 — frame depth is
+  the #1 realism gain; no true recess since walls aren't hole-cut).
+- Door surround: lintel + jambs + threshold step + bright handle.
+- Per-variant window-lit mask (~60 %) so different houses glow
+  differently at night; porch light always on.
+
+### Sky + weather
+- Added `make_overcast_texture()` dense storm cloud deck with
+  mottled alpha (0.55–0.97 coverage). Rendered as an additional dome
+  pass with smoothstep-ramped alpha when `storm > 0.04`. Fair-weather
+  cumulus fades out as overcast fades in.
+- CIE overcast model (Moon & Spencer 1942): under storm the zenith /
+  horizon gradient flattens to ~1.2× ratio (instead of Preetham's 10×);
+  horizon slightly brighter than zenith (dome-light effect); tint
+  shifted to green-gray (Nishita 1996 multi-scatter loses Rayleigh
+  blue).
+- Cloud drift speed scales with storm intensity; a second overcast
+  pass at `storm > 0.55` piles extra churn on heavy storms.
+
+### Asphalt
+- Two-pass BRDF decomposition per Pharr/Humphreys PBRT §8:
+  1. Diffuse pass — textured, `GL_MODULATE`, 0.50× wet-albedo drop
+     (Gu 2006 measured value), small blue lift.
+  2. Specular pass — untextured, `GL_ONE,GL_ONE` additive, per-vertex
+     `horizon_rgb × Schlick_Fresnel(depth_norm) × storm_i`. Survives
+     the dark asphalt's MODULATE factor, producing the signature
+     "mirror strip leading to the horizon" under rain.
+- Dry-heat branch (Matusik 2003): noon high-brightness scenes blend
+  0-25 % toward luminance-mean with small warm shift.
+
+### Mountains
+- Rebuilt: ridged multifractal with **per-octave rotation** (previous
+  version had all octaves aligned in one axis → "fabric folds"
+  artefact). Radial Gaussian falloff, peak height 34 % of base.
+- **Per-vertex normals** from central-differenced height gradient
+  (previous version shipped all normals as `(0, 1, 0)` so mountains
+  showed zero sun-shading).
+- Slope-based material (Musgrave 1993): cliff_frac picks between dark
+  granite (steep) and warm talus (moderate).
+- Snow mask combines elevation (above 0.72 × peak) **and** slope
+  (ny > 0.62) — snow doesn't stick on cliffs.
+- Draw-time weather response: wet-darkening, storm desaturation + cool
+  shift, aerial perspective proportional to elevation × storm haze
+  (Bruneton-Neyret 2008).
+- Ambient + Lambertian diffuse with diffuse collapsing under storm
+  (Nishita 1996 — overcast is diffuse-dominant / shadowless).
+
+### Trees & flora
+- Denser canopy: `_draw_leaf_cluster` now emits 6–9 jittered quads
+  (up from 3–5) with 3D positional offset (Reeves-Blau 1985 particle
+  density).
+- Interior-branch leaf tufts on non-terminal branches past mid-depth
+  — trees no longer read as bare-boned sticks mid-canopy.
+- Looser alpha-test (0.25) + bigger `leaf_size`.
+- Draw-time `_flora_weather_tint`: wet saturation boost (Nayar 1991),
+  drought desaturation + yellow shift (Gitelson 2002), backlit amber
+  translucency at low sun elevation (Premoze-Ashikhmin 2002 BTDF).
+- Three-frequency wind (CryEngine 3 / Stam 2007): slow trunk lean +
+  medium branch flex + existing per-leaf randomness.
+- Wet-leaf silvery sheen via additive second pass under rain.
+
+### Vehicles
+- Procedural variety pool: 96 cars (was 18) + 40 trucks (was 10) with
+  a 42-colour palette organised by hue family and weighted toward real
+  automotive popularity (PPG annual colour reports).
+- Ground FX (`_draw_vehicle_ground_fx`) — no more floating cars:
+  - Contact shadow elliptical patch (Heckbert-Herf 1997), softened
+    under overcast (diffuse kills hard shadows).
+  - Headlight ground pool — twin warm 3200 K halogen ellipses per
+    lamp with inner hotspot + outer spill, additively blended
+    (GL_ONE, GL_ONE). Beam length compressed by `(1 - 0.45 × storm)`
+    per Narasimhan-Nayar 2003 atmospheric extinction.
+  - Taillight rear glow (red ellipses, 0.25 × night_a intensity).
+  - Wet-road body reflection under the vehicle when `storm > 0.15`.
+
+### São Paulo traffic model
+- `TRAFFIC_DENSITY_SP` — 24-hour density table [0..1] calibrated from
+  CET-SP bulletins, Metrô 2017 O-D survey, Waze for Cities aggregates.
+  Double peak **08-09h (~0.95)** and **18-19h (~1.00)**, noon trough
+  ~0.60, madrugada ~0.05-0.10.
+- Each pool vehicle holds a persistent `vis ∈ [0, 1]` threshold;
+  `draw_cars` skips when `vis > density` — at 3 AM only a handful of
+  cars render, at 18h every slot fills (Marginais rush-hour density).
+- Trucks use a softer curve `0.3 + 0.7 × density` reflecting CET
+  cargo-flow studies (freight partially off-peak to avoid rodízio).
+
+### Engine / stage plumbing
+- Screenshot capture reads `GL_FRONT` after `glFinish()` so the saved
+  frame matches the on-screen view (previously captured one frame
+  behind).
+- `draw_sky`, `draw_road`, `draw_houses`, `draw_city` signatures
+  extended to take `horizon_rgb`, `storm_i`, `frost_i`, `night_a`,
+  `snow_tex`, `t_time` — weather is now a proper render-graph input.
+
 ## Textures
 
 - **Bark** — [ambientCG Bark001](https://ambientcg.com/view?id=Bark001), CC0.
