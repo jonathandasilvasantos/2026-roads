@@ -475,6 +475,72 @@ def _draw_mountain(mdata, ctx):
 _MOUNTAIN_CACHE = {}
 
 
+def _flora_weather_tint(amb_rgb, storm_i, sun_d, t_time, is_flower=False):
+    """Draw-time tint for tree canopy / flower petals, responsive to
+    weather and sun angle.
+
+    Research-derived adjustments:
+      * Nayar 1991 / wet-leaf observation: water film INCREASES apparent
+        colour saturation (wet leaves "pop" greener) and slight
+        brightness. Small effect — the main wet look is additive sheen.
+      * Gitelson 2002 drought stress: chlorophyll loss → yellow-green
+        shift, saturation drops 15-25%. Applied when ambient is bright
+        and storm is zero (dry hot day).
+      * Premoze-Ashikhmin 2002 leaf translucency: when sun is low and
+        behind the viewer (or generally low-angle), leaves viewed along
+        the transmission path glow amber-green. Easier proxy: when sun
+        elevation is low (dawn/dusk), boost warm channels slightly.
+      * Deussen et al. 1998 inter-plant variation: add a small
+        deterministic per-time hue wobble so flora doesn't read as a
+        single flat-colored object; kept stable enough for screenshots.
+    """
+    r, g, b = amb_rgb[0], amb_rgb[1], amb_rgb[2]
+
+    # --- Wet boost (storm_i > 0): saturation × 1.15, brightness × 1.03.
+    # Operate on (r, g, b) around their mean to lift saturation.
+    if storm_i > 0.04:
+        s = storm_i * storm_i * (3 - 2 * storm_i)
+        k = 0.15 * s
+        mean = (r + g + b) / 3.0
+        r = r + (r - mean) * k
+        g = g + (g - mean) * k
+        b = b + (b - mean) * k
+        boost = 1.0 + 0.03 * s
+        r *= boost; g *= boost; b *= boost
+
+    # --- Dry heat branch: bright ambient + no storm → desaturate + yellow.
+    bright = (amb_rgb[0] + amb_rgb[1] + amb_rgb[2]) / 3.0
+    if storm_i < 0.05 and bright > 0.85:
+        heat = min(1.0, (bright - 0.85) / 0.15)
+        # Shift slightly toward (r up, b down) and desaturate
+        mean = (r + g + b) / 3.0
+        desat = 0.18 * heat
+        r = r + (mean - r) * desat
+        g = g + (mean - g) * desat
+        b = b + (mean - b) * desat
+        r *= (1.0 + 0.04 * heat)
+        b *= (1.0 - 0.08 * heat)
+
+    # --- Backlit translucency boost when sun is low (dawn/dusk).
+    # Approximate: sun_d[1] is sun elevation (y component). Low-positive
+    # y = near horizon = transmission-dominated geometry.
+    if sun_d is not None:
+        sun_y = float(sun_d[1])
+        if 0.02 < sun_y < 0.55:
+            # Peaks at ~0.25 elevation (morning/evening).
+            trans = 1.0 - abs(sun_y - 0.25) / 0.25
+            trans = max(0.0, min(1.0, trans))
+            # Flowers already have saturated petals — gentler lift.
+            k = (0.06 if is_flower else 0.10) * trans
+            r += 0.18 * k      # warm amber transmission
+            g += 0.12 * k
+            # b unchanged — translucency doesn't add blue
+
+    return (max(0.0, min(1.0, r)),
+            max(0.0, min(1.0, g)),
+            max(0.0, min(1.0, b)))
+
+
 def _mountain_draw_and_dims(seed):
     """Lookup/build cached mountain data + return draw_fn, dims."""
     if seed not in _MOUNTAIN_CACHE:
@@ -685,20 +751,54 @@ def build_object(obj_name, seed, cache):
             glEnable(GL_TEXTURE_2D)
             glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
             amb = ctx["amb"]
-            glColor3f(min(1.0, amb[0]), min(1.0, amb[1]), min(1.0, amb[2]))
-            lists = tc["frost"] if ctx["frost"] > 0.5 else tc["variants"]
-            lid = lists[seed % len(lists)]
-            # Wind sway, same math as draw_forest but single-tree
-            wind = ctx["wind"]
+            storm_i = ctx.get("storm", 0.0)
+            frost_i = ctx.get("frost", 0.0)
+            sun_d = ctx.get("sun_d")
             t = ctx["t_time"]
-            sx = wind * 2.5 * math.sin(t * 2.2)
-            sz = wind * 1.8 * math.sin(t * 2.7 + 1.1)
+            tint = _flora_weather_tint(amb, storm_i, sun_d, t)
+            glColor3f(*tint)
+            lists = tc["frost"] if frost_i > 0.5 else tc["variants"]
+            lid = lists[seed % len(lists)]
+
+            # Three-frequency wind (CryEngine 3 / Stam 2007 approach):
+            #  * slow trunk lean   (0.8 Hz)
+            #  * medium branch flex (2.2 Hz)
+            #  * fast leaf flutter  (5.5 Hz, small amplitude)
+            wind = ctx["wind"]
+            gust = 0.6 + 0.4 * math.sin(t * 0.35)
+            lean_x = wind * 1.5 * gust * math.sin(t * 0.8)
+            lean_z = wind * 1.1 * gust * math.sin(t * 0.75 + 0.9)
+            flex_x = wind * 2.5 * math.sin(t * 2.2)
+            flex_z = wind * 1.8 * math.sin(t * 2.7 + 1.1)
             glPushMatrix()
-            glRotatef(sx, 1, 0, 0)
-            glRotatef(sz, 0, 0, 1)
+            glRotatef(lean_x + flex_x, 1, 0, 0)
+            glRotatef(lean_z + flex_z, 0, 0, 1)
             glCallList(lid)
             glPopMatrix()
             glDisable(GL_ALPHA_TEST)
+
+            # Wet-leaf specular: under rain, water film on leaves
+            # scatters a silvery sheen — simulated with a faint
+            # additive second pass at near-white color. Low enough
+            # intensity that the tree is not washed out.
+            if storm_i > 0.08:
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_ONE, GL_ONE)
+                glDepthFunc(GL_LEQUAL)
+                glDepthMask(GL_FALSE)
+                sheen = storm_i * 0.12
+                glColor4f(sheen * (0.92 + 0.08 * amb[0]),
+                          sheen * (0.94 + 0.06 * amb[1]),
+                          sheen * (0.96 + 0.04 * amb[2]), 1.0)
+                glPushMatrix()
+                glRotatef(lean_x + flex_x, 1, 0, 0)
+                glRotatef(lean_z + flex_z, 0, 0, 1)
+                glCallList(lid)
+                glPopMatrix()
+                glDepthFunc(GL_LESS)
+                glDepthMask(GL_TRUE)
+                glDisable(GL_BLEND)
+
             glColor3f(1, 1, 1)
         return draw, (3.0, 6.0, 3.0)
 
@@ -717,13 +817,18 @@ def build_object(obj_name, seed, cache):
         def draw(ctx):
             glEnable(GL_TEXTURE_2D)
             amb = ctx["amb"]
-            glColor3f(min(1.0, amb[0]), min(1.0, amb[1]), min(1.0, amb[2]))
+            storm_i = ctx.get("storm", 0.0)
+            sun_d = ctx.get("sun_d")
+            t = ctx["t_time"]
+            tint = _flora_weather_tint(amb, storm_i, sun_d, t,
+                                        is_flower=True)
+            glColor3f(*tint)
             glPushMatrix()
-            # Scale up the unit billboard (~1m) so it's legible on-stage.
             glScalef(1.0, 1.0, 1.0)
             wind = ctx["wind"]
-            t = ctx["t_time"]
-            glRotatef(wind * 8.0 * math.sin(t * 3.0), 1, 0, 0)
+            # Flowers sway faster than trees (lighter structure)
+            glRotatef(wind * 10.0 * math.sin(t * 3.0), 1, 0, 0)
+            glRotatef(wind * 6.0 * math.sin(t * 4.2 + 1.3), 0, 0, 1)
             glCallList(lid)
             glPopMatrix()
             glDisable(GL_ALPHA_TEST)

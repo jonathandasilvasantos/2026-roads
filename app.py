@@ -3200,17 +3200,32 @@ def _tree_quadric():
 
 
 def _draw_leaf_cluster(rng, size):
-    """3–5 crossed textured quads at current transform, facing varied directions."""
-    n = rng.randint(3, 5)
+    """Dense foliage cluster of crossed textured quads.
+
+    Reeves & Blau 1985 "particle system" tree rendering + Deussen 1998
+    canopy density observation: readable trees need many overlapping
+    billboards (not just 3-5). Bumped to 6-9 quads with small positional
+    jitter so each cluster fills a genuine canopy volume instead of
+    reading as a single sprite."""
+    n = rng.randint(6, 9)
     for _ in range(n):
         yaw = rng.uniform(0.0, 360.0)
-        pitch = rng.uniform(-35.0, 35.0)
-        roll = rng.uniform(-20.0, 20.0)
+        pitch = rng.uniform(-45.0, 45.0)
+        roll = rng.uniform(-30.0, 30.0)
+        # Small positional jitter around the cluster centre — leaves
+        # are at different depths within the tip volume so overlaps
+        # look like 3D foliage, not a flat cross.
+        jx = rng.uniform(-size * 0.25, size * 0.25)
+        jy = rng.uniform(-size * 0.15, size * 0.35)
+        jz = rng.uniform(-size * 0.25, size * 0.25)
         glPushMatrix()
+        glTranslatef(jx, jy, jz)
         glRotatef(yaw, 0, 1, 0)
         glRotatef(pitch, 1, 0, 0)
         glRotatef(roll, 0, 0, 1)
-        s = size
+        # Slightly larger bounds per quad so overlap produces a
+        # continuous canopy instead of "beaded" texture tiles.
+        s = size * rng.uniform(1.05, 1.35)
         glBegin(GL_QUADS)
         glTexCoord2f(0.0, 0.0); glVertex3f(-s, -s * 0.3, 0.0)
         glTexCoord2f(1.0, 0.0); glVertex3f(+s, -s * 0.3, 0.0)
@@ -3234,16 +3249,46 @@ def _emit_branch(rng, length, radius, depth, max_depth, bark_tex, leaf_tex):
 
     terminal = depth >= max_depth or length < 0.35
     if terminal:
-        # Leaf cluster at branch tip
+        # Leaf cluster at branch tip — larger for better canopy density.
         glBindTexture(GL_TEXTURE_2D, leaf_tex)
         glEnable(GL_ALPHA_TEST)
-        glAlphaFunc(GL_GREATER, 0.4)
+        glAlphaFunc(GL_GREATER, 0.25)  # softer alpha cutoff → fewer holes
         glPushMatrix()
         glTranslatef(0.0, length, 0.0)
-        leaf_size = max(0.35, radius * 7.5 + 0.4)
+        leaf_size = max(0.55, radius * 9.0 + 0.6)
         _draw_leaf_cluster(rng, leaf_size)
         glPopMatrix()
         return
+
+    # --- Interior-branch foliage: small leaf tufts on non-terminal
+    # branches so the tree looks naturally leafed all along its upper
+    # levels rather than only at the tips. Only at the deeper half of
+    # the tree (depth >= max_depth/2) to avoid decorating the trunk.
+    if depth >= max_depth // 2 + 1:
+        glBindTexture(GL_TEXTURE_2D, leaf_tex)
+        glEnable(GL_ALPHA_TEST)
+        glAlphaFunc(GL_GREATER, 0.25)
+        glPushMatrix()
+        glTranslatef(0.0, length * 0.70, 0.0)
+        mid_size = max(0.35, radius * 6.0 + 0.3)
+        # Smaller cluster inline on the branch
+        n = rng.randint(2, 4)
+        for _ in range(n):
+            yaw = rng.uniform(0.0, 360.0)
+            pitch = rng.uniform(-25.0, 25.0)
+            glPushMatrix()
+            glRotatef(yaw, 0, 1, 0)
+            glRotatef(pitch, 1, 0, 0)
+            s = mid_size * rng.uniform(1.0, 1.2)
+            glBegin(GL_QUADS)
+            glTexCoord2f(0.0, 0.0); glVertex3f(-s, -s * 0.3, 0.0)
+            glTexCoord2f(1.0, 0.0); glVertex3f(+s, -s * 0.3, 0.0)
+            glTexCoord2f(1.0, 1.0); glVertex3f(+s, s * 1.7, 0.0)
+            glTexCoord2f(0.0, 1.0); glVertex3f(-s, s * 1.7, 0.0)
+            glEnd()
+            glPopMatrix()
+        glPopMatrix()
+        glDisable(GL_ALPHA_TEST)
 
     glPushMatrix()
     glTranslatef(0.0, length, 0.0)
