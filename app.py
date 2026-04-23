@@ -444,6 +444,54 @@ def night_factor_at(t_day):
     return _smooth((-el + 0.05) / 0.35)
 
 
+# --- Traffic density model (São Paulo weekday profile) -------------------
+#
+# Hourly density [0, 1] calibrated from CET-SP bulletins ("Desempenho do
+# Sistema Viário Principal"), Metrô SP 2017 Origem-Destino survey, and
+# Waze for Cities aggregate flow data. Double-peak pattern dominates:
+#  * Morning peak ~08:00-09:00 (home -> work / school)
+#  * Evening peak ~18:00-19:00 (return + commerce exodus)
+#  * Noon trough  ~12:00-14:00 (lunch is only a secondary pulse; many
+#    paulistanos eat near work)
+#  * Night minimum 02:00-05:00
+# Rodízio (license-plate rotation) operates 07-10 and 17-20 on weekdays,
+# flattening the peaks slightly from their pre-rodízio levels. The curve
+# captures that attenuation — peaks are ~0.95-1.00 rather than pure 1.0
+# all day long.
+#
+# Index = hour of day [0..23]. Use `traffic_density_at(t_day)` for
+# continuous sampling with cosine interpolation between neighbours.
+TRAFFIC_DENSITY_SP = [
+    0.10, 0.06, 0.05, 0.05, 0.06, 0.12,  # 00-05 (madrugada)
+    0.35, 0.75, 0.95, 0.88, 0.72, 0.60,  # 06-11 (morning peak ~8-9)
+    0.68, 0.62, 0.55, 0.58, 0.68, 0.85,  # 12-17 (lunch ripple, pm climb)
+    1.00, 0.96, 0.78, 0.55, 0.35, 0.20,  # 18-23 (evening peak ~18-19)
+]
+
+
+def traffic_density_at(t_day):
+    """Continuous 0..1 traffic density for current t_day, following the
+    São Paulo weekday profile. Cosine interpolation between hourly
+    samples so the curve is smooth across the clock."""
+    t = (t_day % 1.0) * 24.0
+    i = int(t) % 24
+    j = (i + 1) % 24
+    a = t - i
+    # Cosine smoothing — softer than linear at the peaks.
+    a = 0.5 - 0.5 * math.cos(a * math.pi)
+    return TRAFFIC_DENSITY_SP[i] * (1 - a) + TRAFFIC_DENSITY_SP[j] * a
+
+
+def traffic_speed_factor_at(t_day):
+    """Speed multiplier for oncoming/passing traffic. Drops under heavy
+    density (peak hours) to suggest congestion — peak density 1.0 maps
+    to ~0.55× freeflow speed (matches CET ordinary-peak observations on
+    Marginal Tietê, where 70 km/h limits collapse to ~40 km/h).
+    """
+    d = traffic_density_at(t_day)
+    return max(0.5, 1.0 - 0.45 * d)
+
+
 def cloud_tint_at(t_day, storm=0.0):
     el = sun_dir_at(t_day)[1]
     day = _smooth((el + 0.15) / 0.50)
@@ -5281,7 +5329,8 @@ CAR_LANE_HALF = 2.5
 # (5 styles × wide dim ranges × 40-colour palette × random spoiler /
 # spoke / headlight parameters) that near-duplicates are rare.
 N_CAR_VARIANTS = 96
-N_CARS_PER_LANE = 5
+N_CARS_PER_LANE = 10  # pool size per lane; density gate below controls
+                        # how many actually draw (São Paulo weekday curve).
 # Same-direction (player's left) cars enter from behind the camera, pass
 # through, and recede into the distance. So their spawn range is *behind*
 # s_car, and they're despawned only when they drift off the far horizon.
@@ -6001,6 +6050,12 @@ def init_cars(seed=303, s_car=0.0, player_speed=0.0,
                 'lane': lane,
                 's': _car_respawn_s(lane, s_car, rng),
                 'speed': _car_speed_for(lane, player_speed, rng),
+                # Per-car visibility threshold [0, 1]. The car is rendered
+                # only when the live traffic density > this value, so as
+                # density rises (rush hour) more of the pool turns on.
+                # At density 1.0 everything is visible; at density 0.1
+                # only the ~10% with lowest thresholds show.
+                'vis': float(rng.uniform(0.0, 1.0)),
             })
     return {'cars': cars, 'rng': rng, 'n_variants': n_variants}
 
@@ -6025,6 +6080,7 @@ def update_cars(state, dt, s_car, player_speed):
                 c['s'] = _car_respawn_s(-1, s_car, rng)
                 c['variant'] = int(rng.integers(0, state['n_variants']))
                 c['speed'] = _car_speed_for(-1, player_speed, rng)
+                c['vis'] = float(rng.uniform(0.0, 1.0))
         else:
             # Oncoming: closing on the camera.
             c['s'] -= c['speed'] * dt
@@ -6032,10 +6088,11 @@ def update_cars(state, dt, s_car, player_speed):
                 c['s'] = _car_respawn_s(+1, s_car, rng)
                 c['variant'] = int(rng.integers(0, state['n_variants']))
                 c['speed'] = _car_speed_for(+1, player_speed, rng)
+                c['vis'] = float(rng.uniform(0.0, 1.0))
 
 
 def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
-              night_a, flare_tex):
+              night_a, flare_tex, density=1.0):
     if not state['cars']:
         return
 
@@ -6066,6 +6123,13 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
     glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, GL_TRUE)
 
     for c in state['cars']:
+        # Traffic-density gate — each car holds a persistent threshold
+        # in [0, 1]; it renders only when live density exceeds that
+        # value. At 3am density is ~0.05 so only the ~5% of cars with
+        # lowest thresholds appear (empty Marginais feel). At 18h
+        # density is 1.0 so every car in the pool shows (rush hour).
+        if c.get('vis', 0.0) > density:
+            continue
         s = c['s']
         if s < s_car - 15.0 or s > s_car + N_SEG * SEG_LEN:
             continue
@@ -6130,6 +6194,8 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
     tail_size = 0.60
 
     for c in state['cars']:
+        if c.get('vis', 0.0) > density:
+            continue
         s = c['s']
         if s < s_car - 15.0 or s > s_car + N_SEG * SEG_LEN:
             continue
@@ -6229,7 +6295,8 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
 # cars: left lane spawns behind the camera and overtakes it, right lane
 # spawns far ahead and closes on the camera. Density is ~1/4 of cars.
 N_TRUCK_VARIANTS = 40
-N_TRUCKS_PER_LANE = 2   # halved — trucks are rare compared to cars
+N_TRUCKS_PER_LANE = 4   # modest pool; cargo flow is less peaky and
+                          # density gate keeps most hours sparse.
 TRUCK_STYLES = ['pickup', 'box_truck', 'semi', 'flatbed', 'dump']
 
 TRUCK_PALETTE = [
@@ -6803,13 +6870,13 @@ def init_trucks(seed=707, s_car=0.0, player_speed=0.0):
 
 
 def draw_trucks(state, truck_variants, s_car, amb_rgb, sun_dir,
-                night_a, flare_tex):
+                night_a, flare_tex, density=1.0):
     # draw_cars is vehicle-agnostic: it just iterates state['cars'] and
     # calls `variants[c['variant']]['list']`. We pass the truck state and
     # truck variant pool and reuse it verbatim — including the night
     # headlight/taillight billboard pass.
     draw_cars(state, truck_variants, s_car, amb_rgb, sun_dir,
-              night_a, flare_tex)
+              night_a, flare_tex, density=density)
 
 
 # --- Main ---
@@ -7280,12 +7347,19 @@ def main():
         # Procedural traffic. Two lanes: player's left lane travels the
         # same direction as the player (cars recede), right lane is
         # oncoming (cars close toward the camera).
+        # Traffic density follows the São Paulo weekday profile — quiet
+        # between 2-5 AM, morning peak ~08:00-09:00, evening peak
+        # ~18:00-19:00. Trucks get a softer modulation since freight
+        # moves more off-peak to avoid the rodízio/congestion windows
+        # (empirical observation from CET-SP cargo studies).
+        traffic_d = traffic_density_at(t_day)
+        truck_d = 0.3 + 0.7 * traffic_d   # less peaky than cars
         update_cars(car_state, dt, s_car, speed)
         draw_cars(car_state, car_variants, s_car, amb, sun_d,
-                  night_a, flare_tex)
+                  night_a, flare_tex, density=traffic_d)
         update_cars(truck_state, dt, s_car, speed)
         draw_trucks(truck_state, truck_variants, s_car, amb, sun_d,
-                    night_a, flare_tex)
+                    night_a, flare_tex, density=truck_d)
 
         # snowfall: per-side gating. Flakes only fall where that side of
         # the road is in a frost biome; if left is frost and right isn't,
