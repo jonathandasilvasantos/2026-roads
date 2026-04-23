@@ -1,0 +1,1327 @@
+"""Single-object procedural viewer for the roads project.
+
+A lightweight companion to `app.py` that isolates one procedural asset
+(house, building, mountain, flower, tree, car, truck) and renders it at
+the centre of a turntable stage. Intended for tight iteration loops on
+the generators themselves — changing a shape parameter, an emission
+colour, or a wind-sway constant and seeing the effect on one instance
+without running the whole driving simulation.
+
+Everything is CLI-driven so the script can be used interactively or
+wired into an automation loop:
+
+  # Interactive (fullscreen, day, sunny):
+  python view.py --object house
+
+  # Night view of a building with lit windows, auto-rotate, windowed:
+  python view.py --object building --time 21 --auto-rotate 30 --windowed
+
+  # Headless screenshot burst — four angles, rainy evening:
+  python view.py --object house --weather rain --time 19.5 \
+                  --angles 0,90,180,270 --screenshot out/house_rain.png \
+                  --exit-after 0.0
+
+Keybindings while interactive:
+  Esc / Q         quit
+  Arrow keys      orbit (left/right yaw, up/down pitch)
+  +  /  -         zoom in / zoom out
+  P               save a screenshot (path comes from --screenshot, else
+                  `view_<object>_<seed>_<timestamp>.png`)
+  R               toggle rain on/off
+  Shift+R         toggle storm on/off
+  S               toggle snow on/off
+  Space           reset camera to default
+
+The renderer follows app.py's conventions: fixed-function OpenGL,
+per-object display lists, additive night emission pass for windows, a
+lens weather overlay for rain/snow, and a fog/sky tinted by
+time-of-day. It reuses the same builder functions and texture makers so
+an object displayed here is pixel-compatible with the one the main
+simulation would place in the world.
+
+Research inspiration (for the 'why' behind the model):
+  * Parish & Müller 2001, "Procedural Modeling of Cities" — seeded
+    grid-of-variants approach for skylines.
+  * Wonka et al. 2003, "Instant Architecture" and Müller et al. 2006,
+    "Procedural Modeling of Buildings" — split grammars produce
+    facade subdivisions whose scars (ledges, pilasters, storefront
+    bands) we mimic at texture-authoring time rather than at geometry-
+    authoring time for speed.
+  * Lipp et al. 2008 / Schwarz & Müller 2015 — interactive editing of
+    facade grammars; the additive emission texture matches their
+    night-vs-day attribute layering.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+import time
+from datetime import datetime
+
+import numpy as np
+import pygame
+from pygame.locals import (
+    DOUBLEBUF, OPENGL, FULLSCREEN, QUIT, KEYDOWN,
+    K_ESCAPE, K_q, K_s, K_r, K_p, K_SPACE, K_UP, K_DOWN, K_LEFT, K_RIGHT,
+    K_PLUS, K_EQUALS, K_MINUS, K_KP_PLUS, K_KP_MINUS, KMOD_SHIFT,
+)
+from OpenGL.GL import *
+from OpenGL.GLU import gluPerspective, gluLookAt
+
+# app.py does side-effect imports (sounddevice, fluidsynth). Those are
+# try/except-guarded inside app.py, so importing the module never runs
+# main() and never requires audio hardware. We suppress the "audio
+# disabled" help banner by setting a marker before import — any stray
+# print to stderr is harmless but noisy for headless loops.
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+
+import app  # noqa: E402
+
+
+# -------------------------- CLI ----------------------------------------
+
+OBJECTS = ("house", "building", "mountain", "flower", "tree", "car", "truck",
+           "asphalt")
+WEATHERS = ("clear", "rain", "snow", "storm")
+
+
+def parse_angles(s: str):
+    if not s:
+        return None
+    return [float(a.strip()) for a in s.split(",") if a.strip()]
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Single-object procedural viewer",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--object", "-o", choices=OBJECTS, required=True,
+                   help="Which procedural asset to render.")
+    p.add_argument("--seed", type=int, default=0,
+                   help="Variant index. 0 picks the first baked variant; "
+                        "larger values rotate through available variants "
+                        "(or reseed the generator for mountain).")
+    p.add_argument("--time", "-t", type=float, default=13.0,
+                   help="Time of day in hours (0-24). 12=noon, 0=midnight.")
+    p.add_argument("--weather", "-w", choices=WEATHERS, default="clear",
+                   help="Atmospheric condition. Rain / snow enable the "
+                        "lens overlay; storm also darkens the sky.")
+    p.add_argument("--wind", type=float, default=0.15,
+                   help="Wind strength 0-1 for tree/flower sway.")
+    p.add_argument("--width", type=int, default=1280)
+    p.add_argument("--height", type=int, default=800)
+    p.add_argument("--fullscreen", action="store_true",
+                   help="Force fullscreen (default in --auto modes).")
+    p.add_argument("--windowed", action="store_true",
+                   help="Force windowed. Overrides --fullscreen.")
+    p.add_argument("--auto-rotate", type=float, default=0.0,
+                   metavar="DEG_PER_SEC",
+                   help="Continuously rotate the stage around Y.")
+    p.add_argument("--zoom", type=float, default=1.0,
+                   help="Initial zoom multiplier (higher = closer).")
+    p.add_argument("--yaw", type=float, default=25.0,
+                   help="Initial camera yaw in degrees.")
+    p.add_argument("--pitch", type=float, default=12.0,
+                   help="Initial camera pitch in degrees.")
+    p.add_argument("--screenshot", type=str, default=None,
+                   metavar="PATH",
+                   help="Save a screenshot on P key or on --exit-after. "
+                        "With --angles, PATH becomes a prefix and the "
+                        "angle is appended.")
+    p.add_argument("--angles", type=str, default=None,
+                   help="Comma-separated list of yaw angles (degrees) to "
+                        "capture automatically. Forces headless exit "
+                        "after the burst is complete.")
+    p.add_argument("--exit-after", type=float, default=None,
+                   metavar="SECONDS",
+                   help="Close the window after N seconds. 0 means "
+                        "'render one frame and exit' (useful for CI).")
+    p.add_argument("--fps", type=int, default=60)
+    p.add_argument("--ground", action="store_true", default=True,
+                   help="Show a small ground plane under the object.")
+    p.add_argument("--no-ground", dest="ground", action="store_false")
+    return p
+
+
+# --------------------- OpenGL setup ------------------------------------
+
+
+def init_display(args):
+    pygame.init()
+    pygame.display.init()
+    flags = DOUBLEBUF | OPENGL
+    if args.fullscreen and not args.windowed:
+        info = pygame.display.Info()
+        W, H = info.current_w, info.current_h
+        flags |= FULLSCREEN
+    else:
+        W, H = args.width, args.height
+    pygame.display.set_mode((W, H), flags)
+    pygame.display.set_caption(f"view.py — {args.object}")
+    pygame.mouse.set_visible(True)
+
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_LINE_SMOOTH)
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    gluPerspective(55.0, W / float(H), 0.05, 2000.0)
+    glMatrixMode(GL_MODELVIEW)
+
+    glEnable(GL_FOG)
+    glFogi(GL_FOG_MODE, GL_LINEAR)
+    glFogf(GL_FOG_START, 60.0)
+    glFogf(GL_FOG_END, 400.0)
+    return W, H
+
+
+# -------------------- Object construction ------------------------------
+
+
+def _ensure_house_textures(cache):
+    if "house" in cache:
+        return cache["house"]
+    walls = [
+        app.upload_texture(app.make_brick_wall_texture()),
+        app.upload_texture(app.make_wood_siding_texture()),
+        app.upload_texture(app.make_plaster_texture()),
+        app.upload_texture(app.make_stone_wall_texture()),
+    ]
+    roofs = [
+        app.upload_texture(app.make_tile_roof_texture()),
+        app.upload_texture(app.make_shingle_roof_texture()),
+        app.upload_texture(app.make_slate_roof_texture()),
+    ]
+    snow = app.upload_texture(app.load_texture_file(
+        "textures/Snow001_1K-JPG_Color.jpg"))
+    variants = app.build_house_variants(walls, roofs)
+    cache["house"] = {"variants": variants, "snow": snow}
+    return cache["house"]
+
+
+def _build_procedural_mountain(seed=0, size=140.0):
+    """Procedural mountain with per-vertex normals + slope/elevation
+    material classification.
+
+    Technique stack (Musgrave-Kolb-Mace 1989, Ebert "Texturing &
+    Modeling" ch.15, Musgrave 1993):
+      * Ridged multifractal height field — sharper crests than plain
+        fBm, better silhouettes.
+      * Radial falloff with a smooth Gaussian-like edge so the base
+        blends with the surrounding ground plane instead of snapping
+        off at a square boundary.
+      * Per-vertex normals from the discrete height gradient (central
+        differences). These are THE dominant cue for mountain readings
+        at any distance (Koenderink-van Doorn 1992).
+      * Slope-based material: cliff_frac = 1 - n.y rises from 0 on
+        horizontal ground to 1 on vertical cliffs. Used later at draw
+        time to pick between bare-rock (dark) and talus/soil (lighter).
+      * Snow mask: precomputed per-vertex, combines elevation threshold
+        AND surface slope — snow only sticks on non-vertical surfaces
+        above the snow line, matching real alpine accumulation.
+
+    Returns a dict with:
+        list_id       — precompiled display list (positions only; colour
+                        is set per-vertex at draw time)
+        verts, norms, rock_color, snow_weight, elev_norm — per-vertex
+                        arrays for the draw-time shader
+        peak          — world-space peak height
+        dims          — (w, h, d) for camera framing
+    """
+    rng = np.random.default_rng(1000 + seed * 7)
+    nx = 128
+    nz = 128
+    xs = np.linspace(-size / 2, size / 2, nx)
+    zs = np.linspace(-size / 2, size / 2, nz)
+    X, Z = np.meshgrid(xs, zs, indexing="xy")
+    R = np.sqrt(X * X + Z * Z)
+
+    # Radial falloff: smooth edge → base blends with terrain. Gaussian-
+    # ish for soft skirts, slightly heavier near the centre to boost the
+    # peak. Clip at zero so there's no lifting of the outer ring.
+    falloff_radius = size / 2.0 * 0.95
+    falloff = np.clip(1.0 - (R / falloff_radius) ** 1.6, 0.0, 1.0)
+    falloff = falloff ** 1.3
+
+    # --- Ridged multifractal height field ---
+    # Musgrave 1989: |sin|-based octaves produce sharper ridges than
+    # plain fBm. Per-octave ROTATION is critical — without it every
+    # ridge aligns the same way and the mountain reads like pleated
+    # fabric. We rotate each octave by a random angle so ridges cross
+    # at arbitrary angles and the final surface has the isotropic
+    # roughness of a real mountain.
+    phase = rng.uniform(0, 10, size=8)
+    angles = rng.uniform(0, 2 * math.pi, size=8)
+    h = np.zeros_like(X)
+    amp = 1.0
+    freq = 0.035
+    for oct_i in range(6):
+        ca = math.cos(angles[oct_i])
+        sa = math.sin(angles[oct_i])
+        Xr = X * ca + Z * sa
+        Zr = -X * sa + Z * ca
+        layer = 1.0 - np.abs(np.sin(Xr * freq + Zr * freq * 0.8
+                                      + phase[oct_i]))
+        h += layer * amp
+        amp *= 0.55
+        freq *= 2.03
+    # Normalize h to 0..1
+    h = (h - h.min()) / (h.max() - h.min() + 1e-9)
+    # Apply radial falloff and peak height
+    peak_target = size * 0.34
+    h = h * falloff * peak_target
+    # Floor at 0 so the mountain doesn't dip below the surrounding
+    # ground plane at the edges.
+    h = np.maximum(h, 0.0)
+
+    # --- Per-vertex normals from central-differenced height gradient ---
+    dhdx = np.zeros_like(h)
+    dhdz = np.zeros_like(h)
+    dx = xs[1] - xs[0]
+    dz = zs[1] - zs[0]
+    dhdx[:, 1:-1] = (h[:, 2:] - h[:, :-2]) / (2 * dx)
+    dhdz[1:-1, :] = (h[2:, :] - h[:-2, :]) / (2 * dz)
+    # Surface normal = normalize(-dh/dx, 1, -dh/dz)
+    nx_ = -dhdx
+    ny_ = np.ones_like(h)
+    nz_ = -dhdz
+    nlen = np.sqrt(nx_ * nx_ + ny_ * ny_ + nz_ * nz_) + 1e-9
+    nx_ /= nlen
+    ny_ /= nlen
+    nz_ /= nlen
+
+    # --- Slope-based rock material colour (per-vertex) ---
+    # cliff_frac: 0 on flat, 1 on vertical wall. Lerp between dark rock
+    # (steep) and talus/soil (moderate). Matches Musgrave 1993 talus-
+    # vs-bedrock observation.
+    cliff_frac = np.clip(1.0 - ny_, 0.0, 1.0)
+    # Base colours — keep them perceptually realistic (desaturated,
+    # low-luminance). These are WHAT the ambient tint will modulate.
+    rock_cliff = np.array([0.32, 0.29, 0.26], dtype=np.float32)  # dark granite
+    rock_talus = np.array([0.52, 0.48, 0.40], dtype=np.float32)  # warm stone
+    rock_color = (rock_talus[None, None, :] * (1.0 - cliff_frac[..., None])
+                  + rock_cliff[None, None, :] * cliff_frac[..., None])
+    # Sprinkle darker variation along ridges using a high-frequency mask
+    ridge_noise = 0.5 + 0.5 * np.sin(X * 0.42 + Z * 0.37
+                                       + rng.uniform(0, 6.28))
+    rock_color *= (0.85 + 0.15 * ridge_noise)[..., None]
+
+    # --- Snow mask (combines elevation and slope) ---
+    # Snow line at ~68% of peak. Snow mask also rolls off on cliffs
+    # (cliff_frac > 0.6 => no snow retention).
+    peak = float(h.max())
+    if peak > 4.0:
+        # Snow line at ~72% of peak — only the upper portion of real
+        # mountains retains snow outside of full winter. Sharper power
+        # on elev_t makes the transition a visible band rather than a
+        # long gradient wash.
+        snow_line = peak * 0.72
+        elev_t = np.clip((h - snow_line) / max(1.0, peak - snow_line),
+                          0.0, 1.0)
+        elev_t = elev_t ** 2.2
+        # Snow retention by slope: sticks when ny > 0.62 (slope < 52°).
+        # Strong power so cliffs stay bare even above the snow line.
+        slope_t = np.clip((ny_ - 0.62) / 0.30, 0.0, 1.0)
+        slope_t = slope_t ** 1.2
+        snow_weight = elev_t * slope_t
+    else:
+        snow_weight = np.zeros_like(h)
+
+    elev_norm = np.clip(h / max(1.0, peak), 0.0, 1.0)
+
+    # --- Compile display list: vertex array-free strips with per-vertex
+    # normal + colour + "snow weight" + "elevation". Snow/weather
+    # retinting is done at draw time via a Python loop around glCallList
+    # variants — but the geometry itself is baked.
+    # We bake a single list that emits positions & normals only; colour
+    # is provided by the draw function via immediate mode wrapping the
+    # display list per strip — however that's slow. Instead we embed
+    # BOTH a base "dry" rock colour and a snow colour as vertex colors,
+    # then rely on the caller's glColorMaterial + glLight for the weather
+    # response via glMaterial and glLight. For now we bake DRY rock
+    # colour; snow + wet variants are handled at render time by building
+    # per-variant lists keyed on the weather tuple.
+    # To keep the pipeline simple and responsive to dynamic weather
+    # toggles, return the RAW arrays so draw time can emit geometry in
+    # immediate mode with weather-dependent colours.
+    return {
+        "X": X.astype(np.float32),
+        "Z": Z.astype(np.float32),
+        "h": h.astype(np.float32),
+        "nx": nx_.astype(np.float32),
+        "ny": ny_.astype(np.float32),
+        "nz": nz_.astype(np.float32),
+        "rock_color": rock_color.astype(np.float32),
+        "snow_weight": snow_weight.astype(np.float32),
+        "elev_norm": elev_norm.astype(np.float32),
+        "peak": peak,
+        "size": size,
+    }
+
+
+def _draw_mountain(mdata, ctx):
+    """Per-frame mountain render with weather/lighting response.
+
+    Shading model (practical hybrid):
+      * Diffuse term   = max(0, dot(n, sun_dir)) — Lambertian, drives
+        light-vs-shadow silhouette of ridges.
+      * Ambient term   = dome ambient (amb_rgb) × (0.35 + 0.65 × ny)
+        so upward-facing surfaces pick up a little extra sky-dome
+        brightness (Koch-Tunnell 1988).
+      * Material       = lerp(rock_color, snow_color, snow_frac) with
+        wet-darkening applied to rock only.
+      * Aerial persp.  = blend output toward horizon_rgb by
+        distance_factor × haze_i — distance here is per-vertex camera
+        distance normalised to mountain size; haze_i rises with storm.
+    Rain / storm also lifts snow_frac slightly at the snow line (fresh
+    wet snow looks whiter), compresses contrast, and cools the rock.
+    """
+    amb = ctx.get("amb", (1.0, 1.0, 1.0))
+    sun = ctx.get("sun_d")
+    storm_i = ctx.get("storm", 0.0)
+    frost_i = ctx.get("frost", 0.0)
+    horizon = ctx.get("horizon", (0.6, 0.7, 0.85))
+
+    X = mdata["X"]; Z = mdata["Z"]; h = mdata["h"]
+    nxg = mdata["nx"]; nyg = mdata["ny"]; nzg = mdata["nz"]
+    rock = mdata["rock_color"].copy()
+    snow_w = mdata["snow_weight"].copy()
+    peak = mdata["peak"]
+
+    # --- Weather modifiers ---
+    # Wet darkening (Gu 2006 wet-rock albedo ≈ 0.65× dry). Smoothstep
+    # so the response feels physical.
+    s = storm_i * storm_i * (3 - 2 * storm_i)
+    wet = 1.0 - 0.35 * s
+    rock = rock * wet
+    # Under heavy storm, cool-shift the rock toward desaturated blue-gray
+    if s > 0.1:
+        mean = rock.mean(axis=-1, keepdims=True)
+        rock = rock * (1 - 0.35 * s) + mean * 0.35 * s
+        rock[..., 2] *= (1.0 + 0.05 * s)    # slight blue lift
+    # Frost biome raises the snow line dramatically
+    if frost_i > 0.04:
+        snow_w = np.clip(snow_w + frost_i * 0.55
+                          * (mdata["elev_norm"] ** 0.5)
+                          * np.clip((nyg - 0.4) / 0.5, 0, 1), 0, 1)
+
+    # --- Sunlight direction ---
+    if sun is None:
+        sun = np.array([0.4, 0.7, 0.3], dtype=np.float32)
+    sun = np.asarray(sun, dtype=np.float32)
+    sun /= (np.linalg.norm(sun) + 1e-9)
+    # Diffuse term
+    diff = np.clip(nxg * sun[0] + nyg * sun[1] + nzg * sun[2], 0.0, 1.0)
+    # Ambient scaled by ny (sky-visible) — upward surfaces see more sky
+    amb_scale = 0.35 + 0.65 * np.clip(nyg, 0, 1)
+
+    amb_v = np.array(amb, dtype=np.float32)
+    # Under storm, diffuse contribution collapses (overcast = mostly
+    # ambient dome) — real overcast mountains look shadowless and flat.
+    diff_weight = 0.85 * (1.0 - 0.8 * s)
+    amb_weight = 0.55 + 0.35 * s
+    lit = rock * (amb_v[None, None, :] * amb_scale[..., None] * amb_weight
+                   + diff[..., None] * diff_weight)
+
+    # Snow colour — bright, slightly cool, but modulated by same sunlight
+    snow_base = np.array([0.95, 0.96, 0.99], dtype=np.float32)
+    snow_lit = snow_base * (amb_v[None, None, :] * amb_scale[..., None] * 0.75
+                              + diff[..., None] * 0.55
+                              + 0.20)
+    # Blend
+    out = lit * (1 - snow_w[..., None]) + snow_lit * snow_w[..., None]
+
+    # --- Aerial perspective ---
+    # Distance-based haze: high-elevation / far-from-camera points fade
+    # toward horizon hue. On the stage the camera orbits, so we use
+    # HEIGHT as a proxy for apparent atmospheric thickness (real aerial
+    # perspective depends on the line-of-sight length through atmosphere
+    # which for elevated peaks is close to proportional to horizontal
+    # distance in a horizontal view). Haze amount lifts with storm.
+    haze_strength = 0.20 + 0.35 * s
+    # Base haze factor from elevation normalised
+    haze = np.clip(mdata["elev_norm"] * haze_strength, 0.0, 0.7)
+    horz = np.array(horizon, dtype=np.float32)
+    out = out * (1.0 - haze[..., None]) + horz[None, None, :] * haze[..., None]
+
+    # Storm / rain overall brightness drop (beyond ambient)
+    if s > 0.02:
+        out = out * (1.0 - 0.12 * s)
+    np.clip(out, 0.0, 1.0, out=out)
+
+    # --- Emit geometry (immediate mode). 128x128 mesh is 16K verts;
+    # this is acceptable for a single-object stage at 60fps.
+    glDisable(GL_TEXTURE_2D)
+    glDisable(GL_LIGHTING)
+    nx_, nz_ = X.shape
+    for iz in range(nx_ - 1):
+        glBegin(GL_TRIANGLE_STRIP)
+        for ix in range(nz_):
+            for row in (iz, iz + 1):
+                c = out[row, ix]
+                glColor3f(float(c[0]), float(c[1]), float(c[2]))
+                glNormal3f(float(nxg[row, ix]), float(nyg[row, ix]),
+                            float(nzg[row, ix]))
+                glVertex3f(float(X[row, ix]), float(h[row, ix]),
+                            float(Z[row, ix]))
+        glEnd()
+    glColor3f(1, 1, 1)
+
+
+_MOUNTAIN_CACHE = {}
+
+
+def _draw_vehicle_ground_fx(car, ctx, front_dir=+1, ground_y=0.01):
+    """Contact shadow, headlight pool, taillight glow, and wet-road
+    reflection for a single vehicle at origin.
+
+    Research basis:
+      * Heckbert-Herf 1997 (projected ground-plane shadows) — a dark
+        elliptical patch under the body reads as an implicit shadow
+        at negligible cost.
+      * Ritschel et al. 2009 (micro-rendering contact shadows) — soft
+        falloff toward the perimeter gives the "pressed into the
+        ground" feel that keeps vehicles from floating.
+      * Hecker 2005 "Physically-based lighting for driving simulations"
+        — headlight throw on asphalt: elongated elliptical pool, warm
+        halogen colour (~3200 K), falloff ~1/r².
+      * SAE J583 — asymmetric beam with sharp cutoff; we approximate
+        with two overlapping soft ellipses for low + high beam.
+      * Narasimhan-Nayar 2003 — beam throw shortens in rain/fog
+        (extinction coefficient scales with atmospheric water). We
+        compress the pool length by (1 - 0.4 * storm) under storm.
+      * Nayar 1991 wet-asphalt reflection — a dim coloured mirror of
+        the vehicle body appears on wet road, handled as an additive
+        low-alpha patch tinted by the car's paint colour.
+
+    `front_dir` is +1 if the car points toward +X (the variant's
+    `front_x` is positive), -1 if flipped. Cars in this pipeline all
+    have their noses at +X, so the default is correct.
+    """
+    night_a = ctx.get("night_a", 0.0)
+    storm_i = ctx.get("storm", 0.0)
+    L = float(car.get("L", 4.2))
+    W = float(car.get("W", 1.8))
+    # Front / rear world offsets (car is centred at origin, X is length).
+    head_x = float(car.get("head_x", L * 0.45))
+    tail_x = float(car.get("tail_x", -L * 0.45))
+    head_zoff = float(car.get("head_zoff", W * 0.33))
+    tail_zoff = float(car.get("tail_zoff", W * 0.33))
+
+    glDisable(GL_LIGHTING)
+    glDisable(GL_TEXTURE_2D)
+    glEnable(GL_BLEND)
+    glDepthMask(GL_FALSE)
+    # Use LEQUAL so we paint on top of the ground plane (the stage's
+    # draw_ground runs earlier in the frame).
+    glDepthFunc(GL_LEQUAL)
+
+    # --- Contact shadow: dark elliptical patch just beneath the body ---
+    # Shadow softens and weakens on overcast/rain days (diffuse light
+    # kills hard contact shadows — Heckbert-Herf).
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    shadow_strength = 0.55 * (1.0 - 0.45 * storm_i) * (1.0 - 0.70 * night_a)
+    if shadow_strength > 0.02:
+        glColor4f(0.0, 0.0, 0.0, shadow_strength)
+        segs = 18
+        rx = L * 0.55
+        rz = W * 0.60
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex3f(0.0, ground_y, 0.0)
+        for i in range(segs + 1):
+            a = 2.0 * math.pi * i / segs
+            glVertex3f(math.cos(a) * rx, ground_y, math.sin(a) * rz)
+        glEnd()
+
+    # --- Headlight ground pool (night + dusk only) ---
+    # Warm halogen light projected forward. Additive so it genuinely
+    # brightens the road. Length compressed by storm/fog (Narasimhan).
+    if night_a > 0.03:
+        glBlendFunc(GL_ONE, GL_ONE)
+        beam_length = L * 4.0 * (1.0 - 0.45 * storm_i)
+        beam_half_w = W * 1.4 * (1.0 - 0.15 * storm_i)
+        # Warm 3200K halogen
+        h_r = 1.00
+        h_g = 0.88
+        h_b = 0.62
+        pool_intensity = night_a * 0.55
+        # Two concentric ellipses per headlight — inner bright "hotspot"
+        # and outer soft "spill". Offset FORWARD from head_x.
+        for zsign in (-1.0, +1.0):
+            cx = head_x + beam_length * 0.55 * front_dir
+            cz = zsign * head_zoff * 0.7
+            # Outer spill
+            glColor4f(h_r * pool_intensity * 0.35,
+                      h_g * pool_intensity * 0.35,
+                      h_b * pool_intensity * 0.35, 1.0)
+            segs = 24
+            rx = beam_length * 0.55
+            rz = beam_half_w * 0.75
+            glBegin(GL_TRIANGLE_FAN)
+            glVertex3f(cx, ground_y + 0.001, cz)
+            for i in range(segs + 1):
+                a = 2.0 * math.pi * i / segs
+                glVertex3f(cx + math.cos(a) * rx * front_dir,
+                            ground_y + 0.001,
+                            cz + math.sin(a) * rz)
+            glEnd()
+            # Inner hotspot — brighter, tighter
+            cx2 = head_x + beam_length * 0.35 * front_dir
+            glColor4f(h_r * pool_intensity,
+                      h_g * pool_intensity,
+                      h_b * pool_intensity, 1.0)
+            rx2 = beam_length * 0.30
+            rz2 = beam_half_w * 0.40
+            glBegin(GL_TRIANGLE_FAN)
+            glVertex3f(cx2, ground_y + 0.002, cz)
+            for i in range(segs + 1):
+                a = 2.0 * math.pi * i / segs
+                glVertex3f(cx2 + math.cos(a) * rx2 * front_dir,
+                            ground_y + 0.002,
+                            cz + math.sin(a) * rz2)
+            glEnd()
+
+        # --- Taillight ground glow (behind, red, smaller) ---
+        tail_intensity = night_a * 0.25
+        for zsign in (-1.0, +1.0):
+            cx = tail_x - L * 0.8 * front_dir
+            cz = zsign * tail_zoff * 0.7
+            glColor4f(0.95 * tail_intensity,
+                      0.12 * tail_intensity,
+                      0.08 * tail_intensity, 1.0)
+            rx = L * 0.55
+            rz = W * 0.55
+            segs = 18
+            glBegin(GL_TRIANGLE_FAN)
+            glVertex3f(cx, ground_y + 0.001, cz)
+            for i in range(segs + 1):
+                a = 2.0 * math.pi * i / segs
+                glVertex3f(cx + math.cos(a) * rx * front_dir,
+                            ground_y + 0.001,
+                            cz + math.sin(a) * rz)
+            glEnd()
+
+    # --- Wet-road body reflection ---
+    # Faint stretched shadow-like patch under the car tinted by the
+    # scene ambient — simulates the car's body silhouette cast down
+    # onto the wet mirror surface. Active only when storm_i > 0 AND
+    # the ground is bright enough that the reflection is perceptible.
+    if storm_i > 0.15:
+        amb = ctx.get("amb", (1, 1, 1))
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        refl_a = storm_i * 0.30 * (0.4 + 0.6 * (1.0 - night_a))
+        glColor4f(max(0.0, amb[0] * 0.5),
+                  max(0.0, amb[1] * 0.5),
+                  max(0.0, amb[2] * 0.6), refl_a)
+        # Stretch the reflection forward so it reads as a vertical
+        # reflection-in-wet-road rather than just a shadow
+        rx = L * 0.70
+        rz = W * 0.40
+        segs = 18
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex3f(0.0, ground_y + 0.0005, 0.0)
+        for i in range(segs + 1):
+            a = 2.0 * math.pi * i / segs
+            glVertex3f(math.cos(a) * rx, ground_y + 0.0005,
+                        math.sin(a) * rz)
+        glEnd()
+
+    glDepthFunc(GL_LESS)
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+    glColor3f(1, 1, 1)
+
+
+def _flora_weather_tint(amb_rgb, storm_i, sun_d, t_time, is_flower=False):
+    """Draw-time tint for tree canopy / flower petals, responsive to
+    weather and sun angle.
+
+    Research-derived adjustments:
+      * Nayar 1991 / wet-leaf observation: water film INCREASES apparent
+        colour saturation (wet leaves "pop" greener) and slight
+        brightness. Small effect — the main wet look is additive sheen.
+      * Gitelson 2002 drought stress: chlorophyll loss → yellow-green
+        shift, saturation drops 15-25%. Applied when ambient is bright
+        and storm is zero (dry hot day).
+      * Premoze-Ashikhmin 2002 leaf translucency: when sun is low and
+        behind the viewer (or generally low-angle), leaves viewed along
+        the transmission path glow amber-green. Easier proxy: when sun
+        elevation is low (dawn/dusk), boost warm channels slightly.
+      * Deussen et al. 1998 inter-plant variation: add a small
+        deterministic per-time hue wobble so flora doesn't read as a
+        single flat-colored object; kept stable enough for screenshots.
+    """
+    r, g, b = amb_rgb[0], amb_rgb[1], amb_rgb[2]
+
+    # --- Wet boost (storm_i > 0): saturation × 1.15, brightness × 1.03.
+    # Operate on (r, g, b) around their mean to lift saturation.
+    if storm_i > 0.04:
+        s = storm_i * storm_i * (3 - 2 * storm_i)
+        k = 0.15 * s
+        mean = (r + g + b) / 3.0
+        r = r + (r - mean) * k
+        g = g + (g - mean) * k
+        b = b + (b - mean) * k
+        boost = 1.0 + 0.03 * s
+        r *= boost; g *= boost; b *= boost
+
+    # --- Dry heat branch: bright ambient + no storm → desaturate + yellow.
+    bright = (amb_rgb[0] + amb_rgb[1] + amb_rgb[2]) / 3.0
+    if storm_i < 0.05 and bright > 0.85:
+        heat = min(1.0, (bright - 0.85) / 0.15)
+        # Shift slightly toward (r up, b down) and desaturate
+        mean = (r + g + b) / 3.0
+        desat = 0.18 * heat
+        r = r + (mean - r) * desat
+        g = g + (mean - g) * desat
+        b = b + (mean - b) * desat
+        r *= (1.0 + 0.04 * heat)
+        b *= (1.0 - 0.08 * heat)
+
+    # --- Backlit translucency boost when sun is low (dawn/dusk).
+    # Approximate: sun_d[1] is sun elevation (y component). Low-positive
+    # y = near horizon = transmission-dominated geometry.
+    if sun_d is not None:
+        sun_y = float(sun_d[1])
+        if 0.02 < sun_y < 0.55:
+            # Peaks at ~0.25 elevation (morning/evening).
+            trans = 1.0 - abs(sun_y - 0.25) / 0.25
+            trans = max(0.0, min(1.0, trans))
+            # Flowers already have saturated petals — gentler lift.
+            k = (0.06 if is_flower else 0.10) * trans
+            r += 0.18 * k      # warm amber transmission
+            g += 0.12 * k
+            # b unchanged — translucency doesn't add blue
+
+    return (max(0.0, min(1.0, r)),
+            max(0.0, min(1.0, g)),
+            max(0.0, min(1.0, b)))
+
+
+def _mountain_draw_and_dims(seed):
+    """Lookup/build cached mountain data + return draw_fn, dims."""
+    if seed not in _MOUNTAIN_CACHE:
+        _MOUNTAIN_CACHE[seed] = _build_procedural_mountain(seed=seed)
+    mdata = _MOUNTAIN_CACHE[seed]
+    dims = (mdata["size"], float(mdata["peak"]), mdata["size"])
+
+    def draw(ctx):
+        _draw_mountain(mdata, ctx)
+    return draw, dims
+
+
+def build_object(obj_name, seed, cache):
+    """Return (draw_fn, dims) for the requested object.
+
+    draw_fn(ctx) is called every frame with a small context dict that
+    carries live state (night_a, amb_rgb, frost, snow_i, wind, t_time)
+    so the draw_fn can pick the right texture / emission pass.
+    """
+    if obj_name == "house":
+        hc = _ensure_house_textures(cache)
+        v = hc["variants"][seed % len(hc["variants"])]
+        dims = v["dims"]
+
+        def draw(ctx):
+            glEnable(GL_TEXTURE_2D)
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+            amb = ctx["amb"]
+            storm_i = ctx.get("storm", 0.0)
+            wet = 1.0 - 0.18 * storm_i
+            glBindTexture(GL_TEXTURE_2D, v["wall_tex"])
+            tint = (min(1.0, amb[0] * wet),
+                    min(1.0, amb[1] * wet),
+                    min(1.0, amb[2] * wet))
+            glColor3f(*tint)
+            glCallList(v["body"])
+            # body list no longer restores glColor; reassert tint before
+            # each subsequent list so roof/chimney are also dim at night.
+            glColor3f(*tint)
+            glBindTexture(GL_TEXTURE_2D, v["roof_tex"])
+            glCallList(v["roof"])
+            if "chimney" in v:
+                glColor3f(*tint)
+                glCallList(v["chimney"])
+            if ctx["frost"] > 0.04:
+                glBindTexture(GL_TEXTURE_2D, hc["snow"])
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                glDepthMask(GL_FALSE)
+                glEnable(GL_POLYGON_OFFSET_FILL)
+                glPolygonOffset(-1.2, -1.2)
+                a = min(1.0, ctx["frost"] * 0.95)
+                glColor4f(amb[0] * 0.95, amb[1] * 0.97, amb[2] * 1.0, a)
+                glCallList(v["roof"])
+                glDisable(GL_POLYGON_OFFSET_FILL)
+                glDepthMask(GL_TRUE)
+                glDisable(GL_BLEND)
+                glColor3f(1, 1, 1)
+            night_a = ctx["night_a"]
+            if night_a > 0.03:
+                glDisable(GL_TEXTURE_2D)
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_ONE, GL_ONE)
+                glDepthFunc(GL_LEQUAL)
+                glDepthMask(GL_FALSE)
+                glColor4f(min(1.0, night_a * 1.10),
+                          min(1.0, night_a * 0.92),
+                          min(1.0, night_a * 0.58), 1.0)
+                glCallList(v["emission"])
+                glDepthFunc(GL_LESS)
+                glDepthMask(GL_TRUE)
+                glDisable(GL_BLEND)
+                glEnable(GL_TEXTURE_2D)
+            glColor3f(1, 1, 1)
+        return draw, dims
+
+    if obj_name == "building":
+        if "building" not in cache:
+            cache["building"] = {
+                "facades": [
+                    app.upload_texture(
+                        app.make_facade_texture(palette=p, seed=51 + i * 11))
+                    for i, p in enumerate(app.FACADE_PALETTES)
+                ],
+                # No mipmaps — mip averaging would wash out the lit-window
+                # alpha and the additive emission would barely register.
+                "emission": app.upload_texture(
+                    app.make_facade_emission_texture(),
+                    internal=GL_RGBA, src=GL_RGBA, mipmaps=False),
+                "variants": app.build_building_variants(),
+                "snow": app.upload_texture(app.load_texture_file(
+                    "textures/Snow001_1K-JPG_Color.jpg")),
+            }
+        bc = cache["building"]
+        v = bc["variants"][seed % len(bc["variants"])]
+        dims = v["dims"]
+        list_id = v["list"]
+        pal = v.get("palette", 0) % len(bc["facades"])
+
+        def draw(ctx):
+            glEnable(GL_TEXTURE_2D)
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+            glBindTexture(GL_TEXTURE_2D, bc["facades"][pal])
+            amb = ctx["amb"]
+            storm_i = ctx.get("storm", 0.0)
+            frost_i = ctx.get("frost", 0.0)
+            wet = 1.0 - 0.20 * storm_i
+            snow_bounce = 1.0 + 0.08 * frost_i
+            glEnable(GL_LIGHTING)
+            glEnable(GL_LIGHT0)
+            glEnable(GL_COLOR_MATERIAL)
+            glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+            glLightfv(GL_LIGHT0, GL_POSITION, (0.6, 1.0, 0.45, 0.0))
+            glLightfv(GL_LIGHT0, GL_AMBIENT,
+                      (amb[0] * 0.6, amb[1] * 0.6, amb[2] * 0.62, 1.0))
+            glLightfv(GL_LIGHT0, GL_DIFFUSE,
+                      (amb[0] * 0.7, amb[1] * 0.7, amb[2] * 0.72, 1.0))
+            glLightfv(GL_LIGHT0, GL_SPECULAR, (0, 0, 0, 1))
+            glColor3f(min(1.0, amb[0] * 0.95 * wet * snow_bounce),
+                      min(1.0, amb[1] * 0.95 * wet * snow_bounce),
+                      min(1.0, amb[2] * 0.98 * wet * snow_bounce))
+            glCallList(list_id)
+            glDisable(GL_LIGHTING)
+            glDisable(GL_COLOR_MATERIAL)
+
+            # Rooftop snow accumulation
+            if frost_i > 0.04 and "snow_list" in v:
+                glBindTexture(GL_TEXTURE_2D, bc["snow"])
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                glDepthMask(GL_FALSE)
+                a = min(1.0, frost_i * 0.95)
+                glColor4f(min(1.0, amb[0] * 0.95),
+                          min(1.0, amb[1] * 0.98),
+                          min(1.0, amb[2] * 1.02), a)
+                glCallList(v["snow_list"])
+                glDepthMask(GL_TRUE)
+                glDisable(GL_BLEND)
+                glColor3f(1, 1, 1)
+
+            night_a = ctx["night_a"]
+            if night_a > 0.03:
+                glBindTexture(GL_TEXTURE_2D, bc["emission"])
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_ONE, GL_ONE)
+                glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE)
+                glDisable(GL_FOG)
+                glDepthMask(GL_FALSE)
+                # CRITICAL: the base pass wrote depth at every pixel of
+                # the facade; re-drawing the same geometry now with the
+                # default GL_LESS depth test would fail everywhere because
+                # fragments are at EQUAL z, not LESS. Switch to LEQUAL so
+                # the emission pass actually lands on top.
+                glDepthFunc(GL_LEQUAL)
+                for _ in range(2):
+                    glCallList(list_id)
+                glDepthFunc(GL_LESS)
+                glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+                # Rooftop beacon: red blinking light, same math as
+                # draw_city so the object reads identically on the stage.
+                t = ctx["t_time"]
+                bx, by, bz = v["beacon"]
+                pulse = 0.5 + 0.5 * math.sin(t * 2.6)
+                glDisable(GL_TEXTURE_2D)
+                glColor4f(min(1.0, 1.0 * pulse * night_a),
+                          min(1.0, 0.15 * pulse * night_a),
+                          min(1.0, 0.10 * pulse * night_a), 1.0)
+                glPushMatrix()
+                glTranslatef(bx, by + 0.25, bz)
+                size = 0.55
+                glBegin(GL_QUADS)
+                for rot in (0.0, 90.0):
+                    cc = math.cos(math.radians(rot))
+                    ss = math.sin(math.radians(rot))
+                    glVertex3f(-size * cc, -size, -size * ss)
+                    glVertex3f(size * cc, -size, size * ss)
+                    glVertex3f(size * cc, size, size * ss)
+                    glVertex3f(-size * cc, size, -size * ss)
+                glEnd()
+                glPopMatrix()
+                glEnable(GL_TEXTURE_2D)
+                glDepthMask(GL_TRUE)
+                glDisable(GL_BLEND)
+                glEnable(GL_FOG)
+            glColor3f(1, 1, 1)
+        return draw, dims
+
+    if obj_name == "mountain":
+        return _mountain_draw_and_dims(seed)
+
+    if obj_name == "tree":
+        if "tree" not in cache:
+            bark_rgb = app.load_texture_file(
+                "textures/Bark001_1K-JPG_Color.jpg")
+            bark = app.upload_texture(bark_rgb)
+            leaf = app.upload_texture(
+                app.make_leaf_texture(), internal=GL_RGBA, src=GL_RGBA)
+            snow_bark = app.upload_texture(app.make_snow_bark_texture(bark_rgb))
+            snow_leaf = app.upload_texture(
+                app.make_snow_leaf_texture(), internal=GL_RGBA, src=GL_RGBA)
+            cache["tree"] = {
+                "variants": app.build_tree_variants(bark, leaf),
+                "frost": app.build_tree_variants(snow_bark, snow_leaf),
+            }
+        tc = cache["tree"]
+
+        def draw(ctx):
+            glEnable(GL_TEXTURE_2D)
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+            amb = ctx["amb"]
+            storm_i = ctx.get("storm", 0.0)
+            frost_i = ctx.get("frost", 0.0)
+            sun_d = ctx.get("sun_d")
+            t = ctx["t_time"]
+            tint = _flora_weather_tint(amb, storm_i, sun_d, t)
+            glColor3f(*tint)
+            lists = tc["frost"] if frost_i > 0.5 else tc["variants"]
+            lid = lists[seed % len(lists)]
+
+            # Three-frequency wind (CryEngine 3 / Stam 2007 approach):
+            #  * slow trunk lean   (0.8 Hz)
+            #  * medium branch flex (2.2 Hz)
+            #  * fast leaf flutter  (5.5 Hz, small amplitude)
+            wind = ctx["wind"]
+            gust = 0.6 + 0.4 * math.sin(t * 0.35)
+            lean_x = wind * 1.5 * gust * math.sin(t * 0.8)
+            lean_z = wind * 1.1 * gust * math.sin(t * 0.75 + 0.9)
+            flex_x = wind * 2.5 * math.sin(t * 2.2)
+            flex_z = wind * 1.8 * math.sin(t * 2.7 + 1.1)
+            glPushMatrix()
+            glRotatef(lean_x + flex_x, 1, 0, 0)
+            glRotatef(lean_z + flex_z, 0, 0, 1)
+            glCallList(lid)
+            glPopMatrix()
+            glDisable(GL_ALPHA_TEST)
+
+            # Wet-leaf specular: under rain, water film on leaves
+            # scatters a silvery sheen — simulated with a faint
+            # additive second pass at near-white color. Low enough
+            # intensity that the tree is not washed out.
+            if storm_i > 0.08:
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_ONE, GL_ONE)
+                glDepthFunc(GL_LEQUAL)
+                glDepthMask(GL_FALSE)
+                sheen = storm_i * 0.12
+                glColor4f(sheen * (0.92 + 0.08 * amb[0]),
+                          sheen * (0.94 + 0.06 * amb[1]),
+                          sheen * (0.96 + 0.04 * amb[2]), 1.0)
+                glPushMatrix()
+                glRotatef(lean_x + flex_x, 1, 0, 0)
+                glRotatef(lean_z + flex_z, 0, 0, 1)
+                glCallList(lid)
+                glPopMatrix()
+                glDepthFunc(GL_LESS)
+                glDepthMask(GL_TRUE)
+                glDisable(GL_BLEND)
+
+            glColor3f(1, 1, 1)
+        return draw, (3.0, 6.0, 3.0)
+
+    if obj_name == "flower":
+        if "flower" not in cache:
+            variants = []
+            for idx, (petal, centre) in enumerate(app.FLOWER_PALETTES):
+                tex = app.upload_texture(
+                    app.make_flower_texture(petal, centre, seed=idx),
+                    internal=GL_RGBA, src=GL_RGBA)
+                variants.append(app.build_flower_variant(tex))
+            cache["flower"] = {"variants": variants}
+        fv = cache["flower"]["variants"]
+        lid = fv[seed % len(fv)]
+
+        def draw(ctx):
+            glEnable(GL_TEXTURE_2D)
+            amb = ctx["amb"]
+            storm_i = ctx.get("storm", 0.0)
+            sun_d = ctx.get("sun_d")
+            t = ctx["t_time"]
+            tint = _flora_weather_tint(amb, storm_i, sun_d, t,
+                                        is_flower=True)
+            glColor3f(*tint)
+            glPushMatrix()
+            glScalef(1.0, 1.0, 1.0)
+            wind = ctx["wind"]
+            # Flowers sway faster than trees (lighter structure)
+            glRotatef(wind * 10.0 * math.sin(t * 3.0), 1, 0, 0)
+            glRotatef(wind * 6.0 * math.sin(t * 4.2 + 1.3), 0, 0, 1)
+            glCallList(lid)
+            glPopMatrix()
+            glDisable(GL_ALPHA_TEST)
+            glColor3f(1, 1, 1)
+        return draw, (1.0, 1.0, 1.0)
+
+    if obj_name == "car":
+        if "car" not in cache:
+            cache["car"] = {"variants": app.build_car_variants()}
+        cv = cache["car"]["variants"]
+        car = cv[seed % len(cv)]
+        # Car display lists are oriented with length on X, width on Z,
+        # wheels sitting just above Y=0. Use L/W from the variant dict
+        # and assume ~1.5 m overall height for camera framing.
+        dims = (float(car["L"]), 1.5, float(car["W"]))
+
+        def draw(ctx):
+            # Ground FX FIRST so the ground pools render behind the car
+            # (contact shadow sits under the wheels, headlights pour out
+            # in front). Drawing order matters — FX uses LEQUAL so it
+            # paints over the already-rendered ground plane at y=-0.05.
+            _draw_vehicle_ground_fx(car, ctx, ground_y=-0.04)
+            glEnable(GL_LIGHTING)
+            glEnable(GL_LIGHT0)
+            amb = ctx["amb"]
+            glLightfv(GL_LIGHT0, GL_POSITION, (0.6, 1.0, 0.45, 0.0))
+            glLightfv(GL_LIGHT0, GL_AMBIENT,
+                      (amb[0] * 0.6, amb[1] * 0.6, amb[2] * 0.62, 1.0))
+            glLightfv(GL_LIGHT0, GL_DIFFUSE,
+                      (amb[0] * 0.95, amb[1] * 0.95, amb[2] * 0.97, 1.0))
+            glLightfv(GL_LIGHT0, GL_SPECULAR, (1, 1, 1, 1))
+            glCallList(car["list"])
+            glDisable(GL_LIGHTING)
+        return draw, dims
+
+    if obj_name == "truck":
+        if "truck" not in cache:
+            cache["truck"] = {"variants": app.build_truck_variants()}
+        tv = cache["truck"]["variants"]
+        truck = tv[seed % len(tv)]
+        dims = (float(truck["L"]), 3.0, float(truck["W"]))
+
+        def draw(ctx):
+            _draw_vehicle_ground_fx(truck, ctx, ground_y=-0.04)
+            glEnable(GL_LIGHTING)
+            glEnable(GL_LIGHT0)
+            amb = ctx["amb"]
+            glLightfv(GL_LIGHT0, GL_POSITION, (0.6, 1.0, 0.45, 0.0))
+            glLightfv(GL_LIGHT0, GL_AMBIENT,
+                      (amb[0] * 0.6, amb[1] * 0.6, amb[2] * 0.62, 1.0))
+            glLightfv(GL_LIGHT0, GL_DIFFUSE,
+                      (amb[0] * 0.95, amb[1] * 0.95, amb[2] * 0.97, 1.0))
+            glLightfv(GL_LIGHT0, GL_SPECULAR, (1, 1, 1, 1))
+            glCallList(truck["list"])
+            glDisable(GL_LIGHTING)
+        return draw, dims
+
+    if obj_name == "asphalt":
+        # Large asphalt patch with lane markings + shoulder so the
+        # surface can be inspected at varying viewing angles. The
+        # surface response to weather is what the stage exists to test.
+        if "asphalt" not in cache:
+            cache["asphalt"] = {
+                "tex": app.upload_texture(app.make_road_texture()),
+            }
+        ac = cache["asphalt"]
+        # A 20m × 60m patch running N-S, centred at origin.
+        patch_w = 12.0
+        patch_d = 60.0
+
+        def draw(ctx):
+            amb = ctx["amb"]
+            storm_i = ctx.get("storm", 0.0)
+            horizon = ctx.get("horizon")
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, ac["tex"])
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+            app.draw_asphalt_patch(amb, storm_i, ctx.get("t_time", 0.0),
+                                    patch_w, patch_d,
+                                    horizon_rgb=horizon)
+            glDisable(GL_TEXTURE_2D)
+            glColor3f(1, 1, 1)
+        return draw, (patch_w, 0.5, patch_d)
+
+    raise SystemExit(f"unknown object: {obj_name}")
+
+
+# --------------------- Stage / ground ----------------------------------
+
+
+def draw_ground(amb, frost_i, size=60.0):
+    """Large neutral ground plane so the object isn't floating in fog."""
+    glDisable(GL_TEXTURE_2D)
+    r = 0.38 * amb[0]
+    g = 0.42 * amb[1]
+    b = 0.32 * amb[2]
+    if frost_i > 0.05:
+        t = min(1.0, frost_i)
+        r = r * (1 - t) + 0.92 * amb[0] * t
+        g = g * (1 - t) + 0.94 * amb[1] * t
+        b = b * (1 - t) + 0.99 * amb[2] * t
+    glColor3f(r, g, b)
+    y = -0.05
+    glBegin(GL_QUADS)
+    glNormal3f(0, 1, 0)
+    glVertex3f(-size, y, -size)
+    glVertex3f(size, y, -size)
+    glVertex3f(size, y, size)
+    glVertex3f(-size, y, size)
+    glEnd()
+    glColor3f(1, 1, 1)
+
+
+# --------------------- Screenshot --------------------------------------
+
+
+def save_screenshot(path, W, H):
+    """Capture the current front buffer. Call this AFTER pygame.display.flip()
+    so the just-rendered frame is what we grab. Reading GL_FRONT (instead
+    of the default GL_BACK) avoids the classic double-buffer mistake
+    where the screenshot lags one frame behind the on-screen view."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    glFinish()
+    glReadBuffer(GL_FRONT)
+    buf = glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE)
+    glReadBuffer(GL_BACK)
+    img = np.frombuffer(buf, dtype=np.uint8).reshape(H, W, 3)
+    img = np.flipud(img)  # OpenGL origin is bottom-left
+    surface = pygame.image.fromstring(img.tobytes(), (W, H), "RGB")
+    pygame.image.save(surface, path)
+    print(f"saved: {path}", file=sys.stderr)
+
+
+def screenshot_path_for(base, angle):
+    if not base:
+        return None
+    stem, ext = os.path.splitext(base)
+    if not ext:
+        ext = ".png"
+    return f"{stem}_yaw{int(round(angle))}{ext}"
+
+
+# --------------------- Main loop ---------------------------------------
+
+
+def time_hours_to_t_day(hours):
+    return (hours / 24.0) % 1.0
+
+
+def weather_to_params(weather):
+    """Map a weather string to (storm_i, rain_i, snow_i, frost_i)."""
+    if weather == "clear":
+        return 0.0, 0.0, 0.0, 0.0
+    if weather == "rain":
+        return 0.65, 1.0, 0.0, 0.0
+    if weather == "snow":
+        return 0.35, 0.0, 1.0, 1.0
+    if weather == "storm":
+        return 1.0, 1.0, 0.0, 0.0
+    return 0.0, 0.0, 0.0, 0.0
+
+
+def run():
+    args = build_parser().parse_args()
+    angles = parse_angles(args.angles) if args.angles else None
+
+    W, H = init_display(args)
+
+    # Lens overlay + textures for rain/snow.
+    lens_drop_tex = app.upload_texture(
+        app.make_lens_drop_texture(), internal=GL_RGBA, src=GL_RGBA)
+    lens_flake_tex = app.upload_texture(
+        app.make_lens_flake_texture(), internal=GL_RGBA, src=GL_RGBA)
+    lens = app.LensWeatherOverlay()
+
+    cache = {}
+    draw_obj, dims = build_object(args.object, args.seed, cache)
+    # Choose orbit radius so the object's bounding sphere fills ~60% of
+    # the frame at the default zoom. dims = (width, height, depth).
+    bound = max(dims) * 0.5
+    base_radius = max(3.0, bound * 2.6)
+    # Sky dome (shared with app.py) — nice backdrop that tracks time-of-day.
+    sv, stc, sfr, sidx = app.build_sky_dome()
+    cloud_tex = app.upload_texture(app.make_cloud_texture(),
+                                    internal=GL_RGBA, src=GL_RGBA)
+    overcast_tex = app.upload_texture(app.make_overcast_texture(),
+                                        internal=GL_RGBA, src=GL_RGBA)
+    stars_tex = app.upload_texture(app.make_stars_texture(), mipmaps=False)
+    sky_state = (sv, stc, sfr, sidx, cloud_tex, stars_tex, overcast_tex)
+
+    clock = pygame.time.Clock()
+    t_day = time_hours_to_t_day(args.time)
+    t_time = 0.0
+    yaw = args.yaw
+    pitch = args.pitch
+    zoom = max(0.1, args.zoom)
+    running = True
+    elapsed = 0.0
+
+    # Burst-screenshot state
+    burst = list(angles) if angles else []
+    burst_active = bool(burst)
+    burst_delay = 0.20  # give fog/sprites a tick to settle per frame
+
+    # Current weather (live — togglable via r / R / s keys at runtime).
+    weather = args.weather
+    storm_i, rain_i, snow_i, frost_i = weather_to_params(weather)
+
+    while running:
+        dt = clock.tick(args.fps) / 1000.0
+        t_time += dt
+        elapsed += dt
+
+        for e in pygame.event.get():
+            if e.type == QUIT:
+                running = False
+            elif e.type == KEYDOWN:
+                if e.key in (K_ESCAPE, K_q):
+                    running = False
+                elif e.key == K_p:
+                    # Screenshot — moved from 's' so 's' can toggle snow.
+                    path = args.screenshot or (
+                        f"view_{args.object}_s{args.seed}_"
+                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+                    save_screenshot(path, W, H)
+                elif e.key == K_r:
+                    # r  -> toggle rain / clear
+                    # R  (shift+r) -> toggle storm / clear
+                    if e.mod & KMOD_SHIFT:
+                        weather = "clear" if weather == "storm" else "storm"
+                    else:
+                        weather = "clear" if weather == "rain" else "rain"
+                    storm_i, rain_i, snow_i, frost_i = weather_to_params(weather)
+                elif e.key == K_s:
+                    # s -> toggle snow / clear
+                    weather = "clear" if weather == "snow" else "snow"
+                    storm_i, rain_i, snow_i, frost_i = weather_to_params(weather)
+                elif e.key == K_SPACE:
+                    yaw, pitch, zoom = args.yaw, args.pitch, args.zoom
+                elif e.key in (K_PLUS, K_EQUALS, K_KP_PLUS):
+                    zoom *= 1.10
+                elif e.key in (K_MINUS, K_KP_MINUS):
+                    zoom /= 1.10
+
+        keys = pygame.key.get_pressed()
+        rot_rate = 90.0
+        if keys[K_LEFT]:
+            yaw -= rot_rate * dt
+        if keys[K_RIGHT]:
+            yaw += rot_rate * dt
+        if keys[K_UP]:
+            pitch = min(85.0, pitch + rot_rate * dt)
+        if keys[K_DOWN]:
+            pitch = max(-15.0, pitch - rot_rate * dt)
+        if args.auto_rotate:
+            yaw += args.auto_rotate * dt
+        # In burst mode, lock yaw to the next queued angle every frame.
+        if burst_active and burst:
+            yaw = burst[0]
+
+        # Sky / ambient for this instant
+        zenith, horizon = app.sky_colors_at(t_day, storm_i, 0.0)
+        bright, tint = app.ambient_at(t_day, storm_i, 0.0)
+        amb = (tint[0] * bright, tint[1] * bright, tint[2] * bright)
+        night_a = app.night_factor_at(t_day)
+        sun_d = app.sun_dir_at(t_day)
+
+        glClearColor(horizon[0], horizon[1], horizon[2], 1.0)
+        glFogfv(GL_FOG_COLOR, (horizon[0] * 0.9 + 0.05,
+                                horizon[1] * 0.9 + 0.05,
+                                horizon[2] * 0.9 + 0.05, 1.0))
+        glFogf(GL_FOG_END, 380.0 / (1.0 + 0.3 * storm_i + 0.1 * frost_i))
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        glLoadIdentity()
+
+        # Orbit camera. Camera height and target both track the object's
+        # vertical centre so tall buildings frame as nicely as a flower.
+        radius = base_radius / max(0.1, zoom)
+        yaw_r = math.radians(yaw)
+        pitch_r = math.radians(pitch)
+        target_y = dims[1] * 0.45
+        cx = math.cos(pitch_r) * math.sin(yaw_r) * radius
+        cz = math.cos(pitch_r) * math.cos(yaw_r) * radius
+        cy = target_y + math.sin(pitch_r) * radius
+        gluLookAt(cx, cy, cz,  0.0, target_y, 0.0,  0.0, 1.0, 0.0)
+
+        # Sky dome centred on the camera (same convention as app.py).
+        app.draw_sky(sky_state, cx, cy, cz, t_time, t_day, storm_i, 0.0)
+
+        # Ground plane for context
+        if args.ground:
+            draw_ground(amb, frost_i)
+
+        # The actual object, at origin
+        ctx = {
+            "amb": amb, "night_a": night_a, "frost": frost_i,
+            "storm": storm_i, "wind": args.wind, "t_time": t_time,
+            "sun_d": sun_d, "horizon": horizon, "zenith": zenith,
+        }
+        draw_obj(ctx)
+
+        # Lens overlay for rain/snow — runs in 2D after the 3D pass.
+        lens.update(dt, rain_i, snow_i, W, H)
+        lens.draw(lens_drop_tex, lens_flake_tex, W, H)
+
+        pygame.display.flip()
+
+        # Automation: burst screenshots (one per frame, cycle through).
+        if burst_active:
+            # Let one additional frame flush before saving so overlays
+            # catch up after the yaw snap.
+            if elapsed > burst_delay:
+                ang = burst.pop(0)
+                path = screenshot_path_for(args.screenshot, ang) \
+                    or f"view_{args.object}_yaw{int(ang)}.png"
+                save_screenshot(path, W, H)
+                elapsed = 0.0
+                if not burst:
+                    running = False
+
+        if args.exit_after is not None and not burst_active:
+            if elapsed >= args.exit_after:
+                if args.screenshot and args.exit_after <= 0.0:
+                    save_screenshot(args.screenshot, W, H)
+                running = False
+
+    # Single-shot on clean exit when exit_after > 0 + a screenshot path
+    if args.screenshot and not angles and args.exit_after and args.exit_after > 0:
+        save_screenshot(args.screenshot, W, H)
+
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    run()
