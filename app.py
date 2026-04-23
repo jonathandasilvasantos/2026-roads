@@ -5274,7 +5274,13 @@ def draw_city(s_car, building_lists, facade_texes, emission_tex,
 # two lanes — player's left lane travels same direction as the player
 # (cars drift away), right lane is oncoming (cars close toward the camera).
 CAR_LANE_HALF = 2.5
-N_CAR_VARIANTS = 18
+# Variant pool: pre-built at startup as individual display lists and
+# then instanced per-frame by the traffic system. 96 vehicles is the
+# sweet spot between "every car feels different" and "startup is
+# still under a second" — the generator has enough latent variety
+# (5 styles × wide dim ranges × 40-colour palette × random spoiler /
+# spoke / headlight parameters) that near-duplicates are rare.
+N_CAR_VARIANTS = 96
 N_CARS_PER_LANE = 5
 # Same-direction (player's left) cars enter from behind the camera, pass
 # through, and recede into the distance. So their spawn range is *behind*
@@ -5298,14 +5304,40 @@ CAR_SPEED_AWAY_OVER_MIN = 4.0
 CAR_SPEED_AWAY_OVER_MAX = 12.0
 CAR_SPEED_AWAY_FLOOR = 22.0
 
+# Automotive paint palette — broad spread mirroring real-world colour
+# popularity (reds / blacks / whites / silvers / greys dominate per
+# PPG/Axalta annual colour reports; brights and earth tones fill out
+# the long tail). 40 entries so the 96-car pool pulls a visually
+# distinct colour most of the time.
 CAR_PALETTE = [
-    (0.85, 0.10, 0.10), (0.10, 0.22, 0.70), (0.93, 0.93, 0.95),
-    (0.07, 0.07, 0.09), (0.18, 0.18, 0.22), (0.72, 0.72, 0.74),
-    (0.20, 0.55, 0.28), (0.92, 0.76, 0.12), (0.32, 0.24, 0.56),
-    (0.75, 0.38, 0.08), (0.08, 0.50, 0.55), (0.62, 0.08, 0.22),
-    (0.12, 0.35, 0.60), (0.55, 0.62, 0.70), (0.88, 0.84, 0.78),
-    (0.40, 0.10, 0.12), (0.14, 0.48, 0.38), (0.98, 0.58, 0.30),
-    (0.25, 0.30, 0.38), (0.65, 0.70, 0.22),
+    # --- Reds & warm ---
+    (0.85, 0.10, 0.10), (0.62, 0.08, 0.22), (0.40, 0.10, 0.12),
+    (0.95, 0.25, 0.18), (0.70, 0.18, 0.10), (0.55, 0.05, 0.08),
+    # --- Oranges / amber ---
+    (0.98, 0.58, 0.30), (0.75, 0.38, 0.08), (0.92, 0.50, 0.12),
+    (0.85, 0.42, 0.15),
+    # --- Yellows ---
+    (0.92, 0.76, 0.12), (0.95, 0.85, 0.20), (0.88, 0.72, 0.08),
+    (0.65, 0.70, 0.22),
+    # --- Greens ---
+    (0.20, 0.55, 0.28), (0.14, 0.48, 0.38), (0.10, 0.32, 0.18),
+    (0.34, 0.58, 0.32), (0.42, 0.55, 0.15),
+    # --- Teals / cyans ---
+    (0.08, 0.50, 0.55), (0.12, 0.38, 0.46), (0.22, 0.62, 0.68),
+    # --- Blues ---
+    (0.10, 0.22, 0.70), (0.12, 0.35, 0.60), (0.08, 0.18, 0.42),
+    (0.22, 0.30, 0.58), (0.30, 0.48, 0.78), (0.06, 0.12, 0.28),
+    # --- Purples ---
+    (0.32, 0.24, 0.56), (0.42, 0.18, 0.48),
+    # --- Whites / off-whites (popular) ---
+    (0.93, 0.93, 0.95), (0.88, 0.84, 0.78), (0.96, 0.95, 0.90),
+    (0.82, 0.80, 0.78),
+    # --- Silvers / greys (popular) ---
+    (0.72, 0.72, 0.74), (0.55, 0.62, 0.70), (0.45, 0.48, 0.52),
+    (0.62, 0.64, 0.68),
+    # --- Blacks / near-blacks ---
+    (0.07, 0.07, 0.09), (0.18, 0.18, 0.22), (0.12, 0.14, 0.18),
+    (0.25, 0.30, 0.38),
 ]
 
 
@@ -6196,7 +6228,7 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
 # `_car_respawn_s` and `_car_speed_for` so trucks follow the same flow as
 # cars: left lane spawns behind the camera and overtakes it, right lane
 # spawns far ahead and closes on the camera. Density is ~1/4 of cars.
-N_TRUCK_VARIANTS = 10
+N_TRUCK_VARIANTS = 40
 N_TRUCKS_PER_LANE = 2   # halved — trucks are rare compared to cars
 TRUCK_STYLES = ['pickup', 'box_truck', 'semi', 'flatbed', 'dump']
 
