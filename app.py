@@ -2800,17 +2800,81 @@ def _draw_bridges(s_arr, bridge_w, base_col, frost_i, s_car):
         _emit_strip_segments(s_arr, bridge_w, 0.25, emit)
 
 
-def draw_road(tex_id, s_car, amb_rgb, storm_i=0.0):
-    # Wet asphalt reads darker (higher absorption, lower diffuse),
-    # which naturally dampens the visibility of cracks and dirt when
-    # it's raining — same optical reason real wet asphalt looks uniform.
-    wet = 1.0 - 0.18 * storm_i
-    r = min(1.0, amb_rgb[0] * wet)
-    g = min(1.0, amb_rgb[1] * wet)
-    b = min(1.0, amb_rgb[2] * (wet + 0.02))  # slight blue wet tint
+def _asphalt_diffuse(amb_rgb, storm_i):
+    """Diffuse wet/dry asphalt tint (modulated onto the texture).
+
+    References: Nayar 1991 (wet surfaces darken ~50%), Gu 2006 (wet
+    asphalt albedo ≈ 0.55× dry, small blue lift), Dana 1999 CUReT
+    (dry 0.08-0.22 luminance, wet 0.03-0.10), Matusik 2003 (sun-
+    bleached tar drifts toward neutral gray with slight warm cast).
+    """
+    if storm_i < 0.02:
+        # Dry branch with heat/bleaching response. When ambient is
+        # bright (high-sun), tar drifts toward its luminance-average
+        # (grays out / fades) and picks up a touch of warmth. This is
+        # subtle — overcast/cloudy dry still reads as cool-neutral.
+        bright = (amb_rgb[0] + amb_rgb[1] + amb_rgb[2]) / 3.0
+        heat = max(0.0, min(1.0, (bright - 0.55) / 0.45))
+        if heat < 0.02:
+            return (min(1.0, amb_rgb[0]),
+                    min(1.0, amb_rgb[1]),
+                    min(1.0, amb_rgb[2]))
+        # Blend 0-25% toward luminance-average with a mild warm shift
+        k = heat * 0.25
+        avg = bright
+        r = amb_rgb[0] * (1 - k) + avg * k * 1.04
+        g = amb_rgb[1] * (1 - k) + avg * k * 1.01
+        b = amb_rgb[2] * (1 - k) + avg * k * 0.95
+        return (min(1.0, r), min(1.0, g), min(1.0, b))
+    s = storm_i * storm_i * (3 - 2 * storm_i)
+    wet = 1.0 - 0.50 * s
+    return (min(1.0, amb_rgb[0] * wet * 0.97),
+            min(1.0, amb_rgb[1] * wet * 0.99),
+            min(1.0, amb_rgb[2] * wet * 1.02))
+
+
+def _asphalt_specular(storm_i, horizon_rgb, depth_norm):
+    """Fresnel-weighted sky reflection contribution, to be drawn as an
+    UNTEXTURED ADDITIVE quad so the sky reflection survives the
+    asphalt texture's low diffuse albedo. Without this split, the
+    signature wet-highway "mirror strip" effect is erased by the dark
+    asphalt texture's MODULATE factor.
+
+    Schlick Fresnel F(θ) = F0 + (1-F0)*(1-cosθ)^5 with cosθ ≈ sin(pitch)
+    for low camera angles. We approximate this via depth_norm^4 which
+    captures the same sharp grazing-angle rise without trig.
+    """
+    if storm_i < 0.02:
+        return (0.0, 0.0, 0.0)
+    s = storm_i * storm_i * (3 - 2 * storm_i)
+    # 0.60 peak so the mirror never fully washes out the lane markings.
+    fresnel = (depth_norm ** 3) * s * 0.60
+    return (horizon_rgb[0] * fresnel,
+            horizon_rgb[1] * fresnel,
+            horizon_rgb[2] * fresnel)
+
+
+def draw_road(tex_id, s_car, amb_rgb, storm_i=0.0, horizon_rgb=None):
+    """Asphalt strip with per-vertex wet-weather response.
+
+    Two-pass render (Pharr/Humphreys PBRT §8 decomposition):
+      1. Diffuse pass — textured, MODULATE. Darkened with the wet
+         factor. This is the underlying asphalt you'd see if you put
+         your face inches from it.
+      2. Specular pass — untextured, ADDITIVE, per-vertex Fresnel×sky.
+         This is the mirror reflection that survives the asphalt's low
+         diffuse albedo because it's added, not modulated. The classic
+         "wet highway leading to the horizon" look.
+    """
+    if horizon_rgb is None:
+        horizon_rgb = (amb_rgb[0] * 1.1, amb_rgb[1] * 1.1, amb_rgb[2] * 1.2)
+    dr, dg, db = _asphalt_diffuse(amb_rgb, storm_i)
+
+    # --- Diffuse pass
     glEnable(GL_TEXTURE_2D)
     glBindTexture(GL_TEXTURE_2D, tex_id)
-    glColor3f(r, g, b)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glColor3f(dr, dg, db)
     glBegin(GL_QUAD_STRIP)
     for i in range(N_SEG + 1):
         s = s_car - NEAR_EXTEND + i * SEG_LEN
@@ -2822,6 +2886,77 @@ def draw_road(tex_id, s_car, amb_rgb, storm_i=0.0):
         glTexCoord2f(1.0, v); glVertex3f(x + ROAD_WIDTH / 2, y + 0.03, z)
     glEnd()
     glDisable(GL_TEXTURE_2D)
+
+    # --- Specular sky-reflection pass (only when wet)
+    if storm_i >= 0.02:
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_ONE, GL_ONE)
+        glDepthFunc(GL_LEQUAL)
+        glDepthMask(GL_FALSE)
+        glBegin(GL_QUAD_STRIP)
+        for i in range(N_SEG + 1):
+            s = s_car - NEAR_EXTEND + i * SEG_LEN
+            x = curve_x(s)
+            y = curve_y(s)
+            z = -(s - s_car)
+            rel = max(0.0, (s - s_car)) / max(1.0, N_SEG * SEG_LEN)
+            rel = min(1.0, rel)
+            sr, sg, sb = _asphalt_specular(storm_i, horizon_rgb, rel)
+            glColor3f(sr, sg, sb)
+            glVertex3f(x - ROAD_WIDTH / 2, y + 0.031, z)
+            glVertex3f(x + ROAD_WIDTH / 2, y + 0.031, z)
+        glEnd()
+        glDepthFunc(GL_LESS)
+        glDepthMask(GL_TRUE)
+        glDisable(GL_BLEND)
+    glColor3f(1, 1, 1)
+
+
+def draw_asphalt_patch(amb_rgb, storm_i, t_time, patch_w, patch_d,
+                        horizon_rgb=None, tex_bound=True):
+    """Standalone asphalt quad (view.py stage). Same two-pass weather
+    response as draw_road — diffuse modulate, then additive specular.
+    """
+    if horizon_rgb is None:
+        horizon_rgb = (amb_rgb[0] * 1.1, amb_rgb[1] * 1.1, amb_rgb[2] * 1.2)
+    strips = 24
+    u_rep = patch_w / 4.0
+    v_rep = patch_d / 8.0
+    dr, dg, db = _asphalt_diffuse(amb_rgb, storm_i)
+
+    # --- Diffuse pass
+    glColor3f(dr, dg, db)
+    glBegin(GL_QUAD_STRIP)
+    for i in range(strips + 1):
+        t = i / strips
+        zv = -patch_d / 2 + t * patch_d
+        glNormal3f(0, 1, 0)
+        glTexCoord2f(0.0, t * v_rep); glVertex3f(-patch_w / 2, 0.0, zv)
+        glTexCoord2f(u_rep, t * v_rep); glVertex3f(patch_w / 2, 0.0, zv)
+    glEnd()
+
+    # --- Specular pass (only when wet). Untextured + additive so the
+    # sky reflection appears BRIGHTER than the dark asphalt below it.
+    if storm_i >= 0.02:
+        glDisable(GL_TEXTURE_2D)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_ONE, GL_ONE)
+        glDepthFunc(GL_LEQUAL)
+        glDepthMask(GL_FALSE)
+        glBegin(GL_QUAD_STRIP)
+        for i in range(strips + 1):
+            t = i / strips
+            zv = -patch_d / 2 + t * patch_d
+            sr, sg, sb = _asphalt_specular(storm_i, horizon_rgb, t)
+            glColor3f(sr, sg, sb)
+            glVertex3f(-patch_w / 2, 0.001, zv)
+            glVertex3f(patch_w / 2, 0.001, zv)
+        glEnd()
+        glDepthFunc(GL_LESS)
+        glDepthMask(GL_TRUE)
+        glDisable(GL_BLEND)
+        glEnable(GL_TEXTURE_2D)
+    glColor3f(1, 1, 1)
 
 
 def draw_road_snow_overlay(snow_tex, s_car, amb_rgb):
@@ -7051,7 +7186,7 @@ def main():
         draw_flowers(s_car, flower_variants, amb, t_time, wind_strength)
         # Road pavement with subtle wet darkening during rain, then the
         # snow overlay pass that fades in/out with frost biome transitions.
-        draw_road(road_tex, s_car, amb, storm_i)
+        draw_road(road_tex, s_car, amb, storm_i, horizon_rgb=horizon)
         draw_road_snow_overlay(snow_ground_tex, s_car, amb)
         # Ponds draw *after* the road so any puddle sits on top of the
         # pavement (including its imperfections and snow overlay). This

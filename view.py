@@ -80,7 +80,8 @@ import app  # noqa: E402
 
 # -------------------------- CLI ----------------------------------------
 
-OBJECTS = ("house", "building", "mountain", "flower", "tree", "car", "truck")
+OBJECTS = ("house", "building", "mountain", "flower", "tree", "car", "truck",
+           "asphalt")
 WEATHERS = ("clear", "rain", "snow", "storm")
 
 
@@ -549,6 +550,33 @@ def build_object(obj_name, seed, cache):
             glDisable(GL_LIGHTING)
         return draw, dims
 
+    if obj_name == "asphalt":
+        # Large asphalt patch with lane markings + shoulder so the
+        # surface can be inspected at varying viewing angles. The
+        # surface response to weather is what the stage exists to test.
+        if "asphalt" not in cache:
+            cache["asphalt"] = {
+                "tex": app.upload_texture(app.make_road_texture()),
+            }
+        ac = cache["asphalt"]
+        # A 20m × 60m patch running N-S, centred at origin.
+        patch_w = 12.0
+        patch_d = 60.0
+
+        def draw(ctx):
+            amb = ctx["amb"]
+            storm_i = ctx.get("storm", 0.0)
+            horizon = ctx.get("horizon")
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, ac["tex"])
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+            app.draw_asphalt_patch(amb, storm_i, ctx.get("t_time", 0.0),
+                                    patch_w, patch_d,
+                                    horizon_rgb=horizon)
+            glDisable(GL_TEXTURE_2D)
+            glColor3f(1, 1, 1)
+        return draw, (patch_w, 0.5, patch_d)
+
     raise SystemExit(f"unknown object: {obj_name}")
 
 
@@ -747,7 +775,7 @@ def run():
         ctx = {
             "amb": amb, "night_a": night_a, "frost": frost_i,
             "storm": storm_i, "wind": args.wind, "t_time": t_time,
-            "sun_d": sun_d,
+            "sun_d": sun_d, "horizon": horizon, "zenith": zenith,
         }
         draw_obj(ctx)
 
