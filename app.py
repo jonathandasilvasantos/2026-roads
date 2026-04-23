@@ -3874,6 +3874,73 @@ def build_house_roof_list(w, d, wall_h, roof_h):
     return list_id
 
 
+def build_house_emission_list(w, d, wall_h, lit_mask):
+    """Compile an additive-blend emission pass for a house: only the windows
+    and porch light that should glow after dark. Window positions match
+    `build_house_body_list` exactly (same window_y / offsets) so the glow
+    sits on top of the dark glass panes.
+
+    `lit_mask` is a sequence of 8 booleans (front-left, front-right, back-
+    left, back-right, left-front, left-back, right-front, right-back). The
+    porch light over the door is always on at night — it's the single
+    visual cue that a house is inhabited and drives most of the warm
+    skyline glow in rural zones.
+    """
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    eps = 0.020  # slightly larger than body eps so z-fighting doesn't clip
+    win_w_ = 0.9
+    win_h_ = 1.0
+    win_y = wall_h * 0.55 - win_h_ / 2
+    glBegin(GL_QUADS)
+    # Front (-Z): two windows + porch light
+    for i, xoff in enumerate((-w * 0.28, w * 0.28)):
+        if not lit_mask[i]:
+            continue
+        glVertex3f(xoff - win_w_ / 2, win_y, -d / 2 - eps)
+        glVertex3f(xoff + win_w_ / 2, win_y, -d / 2 - eps)
+        glVertex3f(xoff + win_w_ / 2, win_y + win_h_, -d / 2 - eps)
+        glVertex3f(xoff - win_w_ / 2, win_y + win_h_, -d / 2 - eps)
+    # Back (+Z)
+    for i, xoff in enumerate((-w * 0.28, w * 0.28)):
+        if not lit_mask[2 + i]:
+            continue
+        glVertex3f(xoff + win_w_ / 2, win_y, d / 2 + eps)
+        glVertex3f(xoff - win_w_ / 2, win_y, d / 2 + eps)
+        glVertex3f(xoff - win_w_ / 2, win_y + win_h_, d / 2 + eps)
+        glVertex3f(xoff + win_w_ / 2, win_y + win_h_, d / 2 + eps)
+    # Left (-X)
+    for i, zoff in enumerate((-d * 0.28, d * 0.28)):
+        if not lit_mask[4 + i]:
+            continue
+        glVertex3f(-w / 2 - eps, win_y, zoff + win_w_ / 2)
+        glVertex3f(-w / 2 - eps, win_y, zoff - win_w_ / 2)
+        glVertex3f(-w / 2 - eps, win_y + win_h_, zoff - win_w_ / 2)
+        glVertex3f(-w / 2 - eps, win_y + win_h_, zoff + win_w_ / 2)
+    # Right (+X)
+    for i, zoff in enumerate((-d * 0.28, d * 0.28)):
+        if not lit_mask[6 + i]:
+            continue
+        glVertex3f(w / 2 + eps, win_y, zoff - win_w_ / 2)
+        glVertex3f(w / 2 + eps, win_y, zoff + win_w_ / 2)
+        glVertex3f(w / 2 + eps, win_y + win_h_, zoff + win_w_ / 2)
+        glVertex3f(w / 2 + eps, win_y + win_h_, zoff - win_w_ / 2)
+    glEnd()
+    # Porch light: a small glowing disk above the door (front face).
+    porch_r = 0.14
+    porch_y = 2.15
+    glBegin(GL_TRIANGLE_FAN)
+    glVertex3f(0.0, porch_y, -d / 2 - eps * 1.2)
+    for k in range(13):
+        ang = 2.0 * math.pi * k / 12.0
+        glVertex3f(math.cos(ang) * porch_r,
+                   porch_y + math.sin(ang) * porch_r,
+                   -d / 2 - eps * 1.2)
+    glEnd()
+    glEndList()
+    return list_id
+
+
 def build_house_variants(wall_textures, roof_textures, n=8):
     """Generate n variants mixing wall+roof texture combinations and
     randomising dimensions."""
@@ -3886,9 +3953,14 @@ def build_house_variants(wall_textures, roof_textures, n=8):
         d = rng.uniform(6.5, 9.0)
         wall_h = rng.uniform(*HOUSE_WALL_H_RANGE)
         roof_h = rng.uniform(*HOUSE_ROOF_H_RANGE)
+        # Per-variant lit-window pattern so different houses glow
+        # differently: ~60% of windows are lit on a given night. Same seed
+        # chain as dimensions so a given variant is stable across runs.
+        lit_mask = tuple(rng.random() < 0.60 for _ in range(8))
         variants.append({
             "body": build_house_body_list(wall_tex, w, d, wall_h),
             "roof": build_house_roof_list(w, d, wall_h, roof_h),
+            "emission": build_house_emission_list(w, d, wall_h, lit_mask),
             "wall_tex": wall_tex,
             "roof_tex": roof_tex,
             "dims": (w, d, wall_h + roof_h),
@@ -3896,7 +3968,7 @@ def build_house_variants(wall_textures, roof_textures, n=8):
     return variants
 
 
-def draw_houses(s_car, house_variants, snow_tex, amb_rgb):
+def draw_houses(s_car, house_variants, snow_tex, amb_rgb, night_a=0.0):
     """Instance rural houses across flat-ground biomes, with a per-house
     roof snow pass scaled by the frost weight at that s."""
     s_start = math.floor(s_car / HOUSE_SPACING) * HOUSE_SPACING
@@ -3975,6 +4047,24 @@ def draw_houses(s_car, house_variants, snow_tex, amb_rgb):
                 glDisable(GL_BLEND)
                 glColor3f(1.0, 1.0, 1.0)
 
+            # Night emission: warm-tinted glow from windows + porch light.
+            # Additive over the body; gated by night_a so lamps are fully off
+            # at day, ramp up through dusk, stay on through the small hours.
+            if night_a > 0.03 and "emission" in v:
+                glDisable(GL_TEXTURE_2D)
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+                glDepthMask(GL_FALSE)
+                glColor4f(min(1.0, night_a * 1.05),
+                          min(1.0, night_a * 0.88),
+                          min(1.0, night_a * 0.55),
+                          1.0)
+                glCallList(v["emission"])
+                glDepthMask(GL_TRUE)
+                glDisable(GL_BLEND)
+                glEnable(GL_TEXTURE_2D)
+                glColor3f(1.0, 1.0, 1.0)
+
             glPopMatrix()
 
 
@@ -4005,16 +4095,52 @@ def city_weight_at(s, side):
     return biome_weights_vec(np.array([s], dtype=np.float32), side)[0, BIOME_CITY]
 
 
-def make_facade_texture(size=512, cols=8, rows=16, seed=51):
-    """Base facade: concrete walls with a regular window grid, windows
-    rendered as darker-reflective panels with a lighter frame highlight."""
+def make_facade_texture(size=512, cols=8, rows=16, seed=51,
+                         palette="concrete"):
+    """Base facade with a regular window grid.
+
+    Adornment: a thin concrete ledge ("string course") between floors and
+    a subtle vertical pilaster between window columns — small relief cues
+    that keep the facade from reading as a flat grid up close, mirroring
+    the layered-band motif common in Wonka 2003 / Müller 2006 split-grammar
+    facades.
+
+    `palette` selects one of several material bases so neighbouring
+    buildings don't all read as the same bluish concrete. Windows always
+    stay dark-blue glass so the night emission pass lands consistently
+    across palettes.
+    """
     rng = np.random.default_rng(seed)
-    rgb = np.full((size, size, 3), [62, 63, 72], dtype=np.int16)
+    palettes = {
+        "concrete": (np.array([62, 63, 72]), np.array([112, 112, 120]),
+                     np.array([22, 22, 28])),
+        "limestone": (np.array([165, 148, 120]), np.array([200, 188, 160]),
+                      np.array([95, 82, 60])),
+        "brick":     (np.array([120, 58, 48]),  np.array([170, 95, 78]),
+                      np.array([55, 24, 20])),
+        "glass":     (np.array([58, 78, 95]),   np.array([140, 160, 180]),
+                      np.array([18, 26, 40])),
+        "sandstone": (np.array([145, 125, 95]), np.array([195, 175, 140]),
+                      np.array([85, 68, 48])),
+    }
+    base, hi, sh = palettes.get(palette, palettes["concrete"])
+    rgb = np.broadcast_to(base, (size, size, 3)).astype(np.int16).copy()
     noise = rng.integers(-10, 10, (size, size, 1), dtype=np.int16)
-    rgb = np.clip(rgb + noise, 28, 95).astype(np.uint8)
+    rgb = np.clip(rgb + noise, 18, 230).astype(np.uint8)
 
     cw = size / cols
     rh = size / rows
+    # Horizontal ledge between floors — two-pixel bright over one-pixel shadow
+    for r in range(1, rows):
+        y = int(r * rh)
+        if 0 < y < size - 2:
+            rgb[y - 1:y + 1, :] = (105, 108, 116)
+            rgb[y + 1:y + 2, :] = (38, 40, 46)
+    # Vertical pilaster between columns
+    for c in range(1, cols):
+        x = int(c * cw)
+        if 0 < x < size - 1:
+            rgb[:, x:x + 1] = (82, 84, 92)
     for c in range(cols):
         for r in range(rows):
             x0 = int(c * cw + cw * 0.18)
@@ -4026,39 +4152,83 @@ def make_facade_texture(size=512, cols=8, rows=16, seed=51):
             # sill/lintel highlights
             rgb[y0:y0 + 1, x0:x1] = (112, 112, 120)
             rgb[y1 - 1:y1, x0:x1] = (22, 22, 28)
+    # Ground-floor storefront band: widen + brighten the bottom row to hint
+    # at shop windows / lobby glazing
+    y0 = int(rh * 0.10)
+    y1 = int(rh * 0.92)
+    for c in range(cols):
+        x0 = int(c * cw + cw * 0.08)
+        x1 = int(c * cw + cw * 0.92)
+        rgb[y0:y1, x0:x1] = (34, 40, 52)
+        rgb[y0:y0 + 1, x0:x1] = (130, 130, 138)
     return rgb
 
 
 def make_facade_emission_texture(size=512, cols=8, rows=16, seed=73):
     """Sparse lit windows on fully-transparent background. Same UV layout
     as the base facade so lights land exactly on window panes.
-    ~45% of windows lit, each with slight warm-color jitter."""
+    ~45% of windows lit, each with slight warm-color jitter.
+
+    Bright ground-floor storefronts are lit more often (~80%) and cooler
+    (fluorescent-leaning), so the base of the building reads like street-
+    level retail at night while upper floors are warmer residential/office
+    mixes. A faint halo ring around each lit window simulates glass bloom
+    under additive blending."""
     rng = np.random.default_rng(seed)
     rgba = np.zeros((size, size, 4), dtype=np.uint8)
     cw = size / cols
     rh = size / rows
     for c in range(cols):
         for r in range(rows):
-            if rng.random() > 0.45:
+            ground = (r == 0)
+            p_lit = 0.80 if ground else 0.45
+            if rng.random() > p_lit:
                 continue
             x0 = int(c * cw + cw * 0.18)
             x1 = int(c * cw + cw * 0.82)
             y0 = int(r * rh + rh * 0.20)
             y1 = int(r * rh + rh * 0.78)
-            warm = float(rng.uniform(0.80, 1.0))
-            hue_shift = float(rng.uniform(-0.10, 0.15))  # small cool/warm mix
-            rr = int(np.clip(255 * warm, 40, 255))
-            gg = int(np.clip(225 * warm * (1.0 - hue_shift * 0.4), 40, 255))
-            bb = int(np.clip(150 * warm * (1.0 - hue_shift), 20, 255))
+            if ground:
+                # cool fluorescent storefront
+                warm = float(rng.uniform(0.85, 1.0))
+                rr = int(np.clip(210 * warm, 40, 255))
+                gg = int(np.clip(230 * warm, 40, 255))
+                bb = int(np.clip(255 * warm, 40, 255))
+            else:
+                warm = float(rng.uniform(0.80, 1.0))
+                hue_shift = float(rng.uniform(-0.10, 0.15))
+                rr = int(np.clip(255 * warm, 40, 255))
+                gg = int(np.clip(225 * warm * (1.0 - hue_shift * 0.4), 40, 255))
+                bb = int(np.clip(150 * warm * (1.0 - hue_shift), 20, 255))
             rgba[y0:y1, x0:x1, 0] = rr
             rgba[y0:y1, x0:x1, 1] = gg
             rgba[y0:y1, x0:x1, 2] = bb
             rgba[y0:y1, x0:x1, 3] = 255
+            # halo: 1-pixel faint ring around the pane for additive bloom
+            hy0 = max(0, y0 - 2); hy1 = min(size, y1 + 2)
+            hx0 = max(0, x0 - 2); hx1 = min(size, x1 + 2)
+            halo_patch = rgba[hy0:hy1, hx0:hx1]
+            halo_mask = halo_patch[..., 3] == 0
+            halo_patch[..., 0] = np.where(halo_mask, rr // 3, halo_patch[..., 0])
+            halo_patch[..., 1] = np.where(halo_mask, gg // 3, halo_patch[..., 1])
+            halo_patch[..., 2] = np.where(halo_mask, bb // 3, halo_patch[..., 2])
+            halo_patch[..., 3] = np.where(halo_mask, 90, halo_patch[..., 3])
+            rgba[hy0:hy1, hx0:hx1] = halo_patch
     return rgba
 
 
-def build_building_variant(seed):
-    """Compile one building (prism, 4 facade quads) into a display list.
+FACADE_PALETTES = ("concrete", "limestone", "brick", "glass", "sandstone")
+
+
+def build_building_variant(seed, palette_count=len(FACADE_PALETTES)):
+    """Compile one building into a display list and return metadata.
+
+    Geometry: 4 textured facade quads, a textured rooftop cap, a short
+    parapet wall ringing the roof, and a small rooftop mechanical box +
+    antenna mast. The parapet hides the flat-cap seam and gives the
+    silhouette a more varied skyline than a perfectly flat prism —
+    matching the setback/crown motifs called out in Schwarz & Müller
+    2015 as high-value detail for procedural towers.
 
     UV repetition is baked so windows tile consistently with real-world
     dimensions: one window per WINDOW_H_M horizontally, one floor per
@@ -4069,9 +4239,17 @@ def build_building_variant(seed):
     w = rng.uniform(7.0, 14.0)
     d = rng.uniform(7.0, 14.0)
     h = rng.uniform(22.0, 78.0)
+    parapet_h = rng.uniform(0.8, 1.6)
+    # Rooftop antenna is taller on taller buildings; small machine-room
+    # box is offset to one quadrant for asymmetric silhouette.
+    antenna_h = rng.uniform(3.0, 8.0) * (0.6 + 0.4 * (h / 78.0))
+    mech_w = rng.uniform(2.0, 4.0)
+    mech_d = rng.uniform(2.0, 4.0)
+    mech_h = rng.uniform(1.6, 2.8)
+    mech_ox = rng.uniform(-w * 0.2, w * 0.2)
+    mech_oz = rng.uniform(-d * 0.2, d * 0.2)
+    palette_idx = rng.randrange(palette_count)
 
-    # one texture tile == 8 windows wide × 16 floors tall; build's UV repeats
-    # per world distance chosen so window proportions stay constant.
     u_front = (w / WINDOW_H_M) / 8.0
     u_side = (d / WINDOW_H_M) / 8.0
     v_up = (h / FLOOR_H_M) / 16.0
@@ -4079,40 +4257,150 @@ def build_building_variant(seed):
     list_id = glGenLists(1)
     glNewList(list_id, GL_COMPILE)
     glBegin(GL_QUADS)
-    # -Z face (front) — outward normal -Z
+    # -Z face (front)
     glNormal3f(0.0, 0.0, -1.0)
     glTexCoord2f(0, 0); glVertex3f(-w / 2, 0, -d / 2)
     glTexCoord2f(u_front, 0); glVertex3f(w / 2, 0, -d / 2)
     glTexCoord2f(u_front, v_up); glVertex3f(w / 2, h, -d / 2)
     glTexCoord2f(0, v_up); glVertex3f(-w / 2, h, -d / 2)
-    # +Z face (back) — outward normal +Z
+    # +Z face (back)
     glNormal3f(0.0, 0.0, 1.0)
     glTexCoord2f(0, 0); glVertex3f(w / 2, 0, d / 2)
     glTexCoord2f(u_front, 0); glVertex3f(-w / 2, 0, d / 2)
     glTexCoord2f(u_front, v_up); glVertex3f(-w / 2, h, d / 2)
     glTexCoord2f(0, v_up); glVertex3f(w / 2, h, d / 2)
-    # -X face (left) — outward normal -X
+    # -X face (left)
     glNormal3f(-1.0, 0.0, 0.0)
     glTexCoord2f(0, 0); glVertex3f(-w / 2, 0, d / 2)
     glTexCoord2f(u_side, 0); glVertex3f(-w / 2, 0, -d / 2)
     glTexCoord2f(u_side, v_up); glVertex3f(-w / 2, h, -d / 2)
     glTexCoord2f(0, v_up); glVertex3f(-w / 2, h, d / 2)
-    # +X face (right) — outward normal +X
+    # +X face (right)
     glNormal3f(1.0, 0.0, 0.0)
     glTexCoord2f(0, 0); glVertex3f(w / 2, 0, -d / 2)
     glTexCoord2f(u_side, 0); glVertex3f(w / 2, 0, d / 2)
     glTexCoord2f(u_side, v_up); glVertex3f(w / 2, h, d / 2)
     glTexCoord2f(0, v_up); glVertex3f(w / 2, h, -d / 2)
-    # +Y face (roof) — dark flat cap so the building reads as solid from
-    # above; UVs point at a single neutral texel so no windows appear.
+    # Rooftop cap (under the parapet, structural) — neutral texel so no
+    # windows appear top-down.
     glNormal3f(0.0, 1.0, 0.0)
     glTexCoord2f(0.02, 0.02); glVertex3f(-w / 2, h, -d / 2)
     glTexCoord2f(0.03, 0.02); glVertex3f(w / 2, h, -d / 2)
     glTexCoord2f(0.03, 0.03); glVertex3f(w / 2, h, d / 2)
     glTexCoord2f(0.02, 0.03); glVertex3f(-w / 2, h, d / 2)
     glEnd()
+
+    # --- Parapet: outer + inner + cap strips. Sampled from a neutral
+    # (unwindowed) texel of the facade texture so it reads as solid
+    # concrete/limestone/etc. matching the main wall.
+    pw = 0.25  # parapet wall thickness
+    pt = h + parapet_h  # parapet top y
+    glBegin(GL_QUADS)
+    # Outer four faces
+    for nx, nz, x0, z0, x1, z1 in (
+        (0.0, -1.0, -w / 2, -d / 2, w / 2, -d / 2),
+        (0.0,  1.0,  w / 2,  d / 2, -w / 2, d / 2),
+        (-1.0, 0.0, -w / 2,  d / 2, -w / 2, -d / 2),
+        (1.0,  0.0,  w / 2, -d / 2,  w / 2,  d / 2),
+    ):
+        glNormal3f(nx, 0.0, nz)
+        glTexCoord2f(0.02, 0.50); glVertex3f(x0, h, z0)
+        glTexCoord2f(0.03, 0.50); glVertex3f(x1, h, z1)
+        glTexCoord2f(0.03, 0.51); glVertex3f(x1, pt, z1)
+        glTexCoord2f(0.02, 0.51); glVertex3f(x0, pt, z0)
+    # Cap (top of parapet, ring)
+    glNormal3f(0.0, 1.0, 0.0)
+    for (x0, z0, x1, z1) in (
+        (-w / 2, -d / 2, w / 2, -d / 2 + pw),
+        (-w / 2, d / 2 - pw, w / 2, d / 2),
+        (-w / 2, -d / 2 + pw, -w / 2 + pw, d / 2 - pw),
+        (w / 2 - pw, -d / 2 + pw, w / 2, d / 2 - pw),
+    ):
+        glTexCoord2f(0.02, 0.02); glVertex3f(x0, pt, z0)
+        glTexCoord2f(0.03, 0.02); glVertex3f(x1, pt, z0)
+        glTexCoord2f(0.03, 0.03); glVertex3f(x1, pt, z1)
+        glTexCoord2f(0.02, 0.03); glVertex3f(x0, pt, z1)
+
+    # --- Rooftop mechanical box
+    mx0, mx1 = mech_ox - mech_w / 2, mech_ox + mech_w / 2
+    mz0, mz1 = mech_oz - mech_d / 2, mech_oz + mech_d / 2
+    my0, my1 = h, h + mech_h
+    # 4 sides + top
+    for nx, nz, x0, z0, x1, z1 in (
+        (0.0, -1.0, mx0, mz0, mx1, mz0),
+        (0.0,  1.0, mx1, mz1, mx0, mz1),
+        (-1.0, 0.0, mx0, mz1, mx0, mz0),
+        (1.0,  0.0, mx1, mz0, mx1, mz1),
+    ):
+        glNormal3f(nx, 0.0, nz)
+        glTexCoord2f(0.02, 0.02); glVertex3f(x0, my0, z0)
+        glTexCoord2f(0.03, 0.02); glVertex3f(x1, my0, z1)
+        glTexCoord2f(0.03, 0.03); glVertex3f(x1, my1, z1)
+        glTexCoord2f(0.02, 0.03); glVertex3f(x0, my1, z0)
+    glNormal3f(0.0, 1.0, 0.0)
+    glTexCoord2f(0.02, 0.02); glVertex3f(mx0, my1, mz0)
+    glTexCoord2f(0.03, 0.02); glVertex3f(mx1, my1, mz0)
+    glTexCoord2f(0.03, 0.03); glVertex3f(mx1, my1, mz1)
+    glTexCoord2f(0.02, 0.03); glVertex3f(mx0, my1, mz1)
+    glEnd()
+
+    # --- Antenna mast: thin cross of two quads (no need for cylinder, it
+    # reads as a silhouette pin against the sky)
+    ax = mech_ox
+    az = mech_oz
+    ay0 = my1
+    ay1 = ay0 + antenna_h
+    ar = 0.06
+    glBegin(GL_QUADS)
+    glNormal3f(0.0, 0.0, -1.0)
+    glTexCoord2f(0.02, 0.02); glVertex3f(ax - ar, ay0, az)
+    glTexCoord2f(0.03, 0.02); glVertex3f(ax + ar, ay0, az)
+    glTexCoord2f(0.03, 0.03); glVertex3f(ax + ar, ay1, az)
+    glTexCoord2f(0.02, 0.03); glVertex3f(ax - ar, ay1, az)
+    glNormal3f(-1.0, 0.0, 0.0)
+    glTexCoord2f(0.02, 0.02); glVertex3f(ax, ay0, az - ar)
+    glTexCoord2f(0.03, 0.02); glVertex3f(ax, ay0, az + ar)
+    glTexCoord2f(0.03, 0.03); glVertex3f(ax, ay1, az + ar)
+    glTexCoord2f(0.02, 0.03); glVertex3f(ax, ay1, az - ar)
+    glEnd()
+
     glEndList()
-    return list_id, (w, h, d)
+
+    # --- Snow accumulation list: ONLY the upward-facing roof surfaces
+    # (rooftop cap, parapet cap strips, mech box top). Drawn in a
+    # separate pass with the snow ground texture + alpha scaled by
+    # frost_intensity so accumulation fades in and out with the biome.
+    snow_list = glGenLists(1)
+    glNewList(snow_list, GL_COMPILE)
+    glBegin(GL_QUADS)
+    glNormal3f(0, 1, 0)
+    # Rooftop cap (centre of roof, below the parapet interior)
+    sh_eps = 0.02  # small vertical offset so snow sits ON top, not z-fighting
+    # Full roof square plus parapet rim: easier to paint the whole roof
+    # area at y=pt (parapet top) — this includes the parapet cap and the
+    # inside of the roof is covered by the cap band itself.
+    glTexCoord2f(0, 0); glVertex3f(-w / 2, pt + sh_eps, -d / 2)
+    glTexCoord2f(w / 2.5, 0); glVertex3f(w / 2, pt + sh_eps, -d / 2)
+    glTexCoord2f(w / 2.5, d / 2.5); glVertex3f(w / 2, pt + sh_eps, d / 2)
+    glTexCoord2f(0, d / 2.5); glVertex3f(-w / 2, pt + sh_eps, d / 2)
+    # Mech box top
+    glTexCoord2f(0, 0); glVertex3f(mx0, my1 + sh_eps, mz0)
+    glTexCoord2f(mech_w / 2.5, 0); glVertex3f(mx1, my1 + sh_eps, mz0)
+    glTexCoord2f(mech_w / 2.5, mech_d / 2.5); glVertex3f(mx1, my1 + sh_eps, mz1)
+    glTexCoord2f(0, mech_d / 2.5); glVertex3f(mx0, my1 + sh_eps, mz1)
+    glEnd()
+    glEndList()
+
+    return {
+        "list": list_id,
+        "snow_list": snow_list,
+        "dims": (w, h + parapet_h + mech_h + antenna_h, d),
+        "body_dims": (w, h, d),
+        "palette": palette_idx,
+        # Rooftop beacon at the top of the antenna (drawn per-frame so it
+        # can blink on the night emission pass).
+        "beacon": (ax, ay1, az),
+    }
 
 
 def build_building_variants(n=N_BUILDING_VARIANTS):
@@ -4152,23 +4440,36 @@ def _iter_city_slots(s_car):
             yield s, side, key, tx, ty, tz, yaw, variant
 
 
-def draw_city(s_car, building_lists, facade_tex, emission_tex,
-              amb_rgb, night_a):
-    """Two-pass render: tinted facade, then additive emission at night."""
+def draw_city(s_car, building_lists, facade_texes, emission_tex,
+              amb_rgb, night_a, t_time=0.0, storm_i=0.0, frost_i=0.0,
+              snow_tex=None):
+    """Two-pass render: tinted facade, then additive emission at night.
+
+    `facade_texes` is a list of GL texture ids (one per palette) so
+    neighbouring buildings vary in material — the per-variant palette
+    index selects which one is bound before its display list is called.
+    """
     slots = list(_iter_city_slots(s_car))
     if not slots:
         return
+    # Accept either a single tex id (legacy) or a list/tuple of them.
+    if isinstance(facade_texes, (int, np.integer)):
+        facade_texes = [facade_texes]
 
     glEnable(GL_TEXTURE_2D)
-    glBindTexture(GL_TEXTURE_2D, facade_tex)
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
 
     # Enable fixed-function lighting for the facade pass so each face
     # picks up different brightness from the baked normals. Without this
     # all four walls shade identically and buildings look flat/paper-like.
-    tint = (min(1.0, amb_rgb[0] * 0.85),
-            min(1.0, amb_rgb[1] * 0.85),
-            min(1.0, amb_rgb[2] * 0.90))
+    # Rain darkens the facade (wet-stone look, ~0.80x); frost biomes
+    # brighten it slightly because snow-lit ambient bounces light back
+    # onto the walls.
+    wet = 1.0 - 0.20 * storm_i
+    snow_bounce = 1.0 + 0.08 * frost_i
+    tint = (min(1.0, amb_rgb[0] * 0.85 * wet * snow_bounce),
+            min(1.0, amb_rgb[1] * 0.85 * wet * snow_bounce),
+            min(1.0, amb_rgb[2] * 0.90 * wet * snow_bounce))
     glEnable(GL_LIGHTING)
     glEnable(GL_LIGHT0)
     glEnable(GL_COLOR_MATERIAL)
@@ -4187,7 +4488,10 @@ def draw_city(s_car, building_lists, facade_tex, emission_tex,
     glColor3f(*tint)
 
     for s, side, key, tx, ty, tz, yaw, variant in slots:
-        list_id, _dims = building_lists[variant]
+        v = building_lists[variant]
+        list_id = v["list"]
+        pal = v.get("palette", 0) % len(facade_texes)
+        glBindTexture(GL_TEXTURE_2D, facade_texes[pal])
         glPushMatrix()
         glTranslatef(tx, ty, tz)
         glRotatef(yaw, 0, 1, 0)
@@ -4197,29 +4501,104 @@ def draw_city(s_car, building_lists, facade_tex, emission_tex,
     glDisable(GL_LIGHTING)
     glDisable(GL_COLOR_MATERIAL)
 
+    # --- Rooftop snow pass: an alpha-blended white-ish cap on every
+    # upward-facing roof surface, scaled by frost_i so snow fades in
+    # and melts out as the biome transitions.
+    if frost_i > 0.04 and snow_tex is not None:
+        glBindTexture(GL_TEXTURE_2D, snow_tex)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDepthMask(GL_FALSE)
+        alpha = min(1.0, frost_i * 0.95)
+        glColor4f(min(1.0, amb_rgb[0] * 0.95),
+                  min(1.0, amb_rgb[1] * 0.98),
+                  min(1.0, amb_rgb[2] * 1.02), alpha)
+        for s, side, key, tx, ty, tz, yaw, variant in slots:
+            v = building_lists[variant]
+            if "snow_list" not in v:
+                continue
+            glPushMatrix()
+            glTranslatef(tx, ty, tz)
+            glRotatef(yaw, 0, 1, 0)
+            glCallList(v["snow_list"])
+            glPopMatrix()
+        glDepthMask(GL_TRUE)
+        glDisable(GL_BLEND)
+        glColor3f(1, 1, 1)
+
     if night_a < 0.03:
         return
 
-    # Emission pass: additive blend, warm tint scaled by night factor.
+    # Emission pass: straight additive (GL_ONE, GL_ONE) over the
+    # transparent-background emission texture. Transparent texels have
+    # rgb=(0,0,0) so they add nothing; lit texels contribute their
+    # bright colour directly. Fog is disabled for this pass so distant
+    # windows don't wash into the horizon — night-time skyscraper lights
+    # are supposed to punch through atmospheric haze.
     glBindTexture(GL_TEXTURE_2D, emission_tex)
     glEnable(GL_BLEND)
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+    glBlendFunc(GL_ONE, GL_ONE)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE)
+    glDisable(GL_FOG)
     glDepthMask(GL_FALSE)
-    glColor4f(min(1.0, night_a * 1.1),
-              min(1.0, night_a * 1.02),
-              min(1.0, night_a * 0.85),
-              1.0)
+    # GL_LEQUAL so equal-Z emission fragments pass the depth test that
+    # the base pass wrote — otherwise GL_LESS rejects every emission
+    # fragment at exactly the facade depth and the city turns invisible
+    # at night.
+    glDepthFunc(GL_LEQUAL)
+    # Run the emission twice: the additive operation saturates windows but
+    # also lifts the surrounding halo → gives the "bloom" feel without a
+    # shader-based blur. Second pass uses the same texture & blend.
+    for _pass in range(2):
+        glColor4f(min(1.0, night_a * 1.6),
+                  min(1.0, night_a * 1.45),
+                  min(1.0, night_a * 1.10),
+                  1.0)
+        for s, side, key, tx, ty, tz, yaw, variant in slots:
+            v = building_lists[variant]
+            list_id = v["list"]
+            glPushMatrix()
+            glTranslatef(tx, ty, tz)
+            glRotatef(yaw, 0, 1, 0)
+            glCallList(list_id)
+            glPopMatrix()
 
+    # Rooftop beacons: red blinking aviation warning light on each
+    # building's antenna, sync'd to a slow pulse. Sprites are drawn as
+    # simple additive quads since they're a single pixel's worth of
+    # emphasis on the skyline.
+    beacon_pulse = 0.5 + 0.5 * math.sin(t_time * 2.6)
+    glDisable(GL_TEXTURE_2D)
+    glColor4f(min(1.0, 1.0 * beacon_pulse * night_a),
+              min(1.0, 0.15 * beacon_pulse * night_a),
+              min(1.0, 0.10 * beacon_pulse * night_a),
+              1.0)
     for s, side, key, tx, ty, tz, yaw, variant in slots:
-        list_id, _dims = building_lists[variant]
+        v = building_lists[variant]
+        bx, by, bz = v["beacon"]
         glPushMatrix()
         glTranslatef(tx, ty, tz)
         glRotatef(yaw, 0, 1, 0)
-        glCallList(list_id)
+        glTranslatef(bx, by + 0.25, bz)
+        # Two crossed billboards so the beacon reads from any angle.
+        size = 0.55
+        glBegin(GL_QUADS)
+        for rot in (0.0, 90.0):
+            c = math.cos(math.radians(rot))
+            s2 = math.sin(math.radians(rot))
+            glVertex3f(-size * c, -size, -size * s2)
+            glVertex3f(size * c, -size, size * s2)
+            glVertex3f(size * c, size, size * s2)
+            glVertex3f(-size * c, size, -size * s2)
+        glEnd()
         glPopMatrix()
+    glEnable(GL_TEXTURE_2D)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
 
+    glDepthFunc(GL_LESS)
     glDepthMask(GL_TRUE)
     glDisable(GL_BLEND)
+    glEnable(GL_FOG)
 
 
 # --- Procedural cars ---
@@ -5789,8 +6168,21 @@ def main():
     # Volumetric dust — reuse the soft-disc snowflake texture (same shape,
     # we tint it warm at draw time) to avoid another tiny RGBA upload.
     dust_state = init_dust()
-    facade_tex = upload_texture(make_facade_texture())
-    emission_tex = upload_texture(make_facade_emission_texture(), internal=GL_RGBA, src=GL_RGBA)
+    # One facade texture per palette — buildings pick an index per variant
+    # so the skyline shows brick next to limestone next to dark glass
+    # without each building needing its own bespoke tile set.
+    facade_texes = [
+        upload_texture(make_facade_texture(palette=p,
+                                            seed=51 + i * 11))
+        for i, p in enumerate(FACADE_PALETTES)
+    ]
+    # Emission uploaded *without* mipmaps: lit windows occupy only a few
+    # texels; mip minification averages them with transparent neighbours
+    # and the glow fades to nothing as the tex drops mip levels. Linear
+    # min filter preserves the punch.
+    emission_tex = upload_texture(make_facade_emission_texture(),
+                                    internal=GL_RGBA, src=GL_RGBA,
+                                    mipmaps=False)
     building_lists = build_building_variants()
     concrete_tex = upload_texture(make_concrete_texture())
     # Rural houses — four wall textures × three roof textures worth of
@@ -6145,7 +6537,10 @@ def main():
                            core_alpha=moon_alpha)
 
         draw_terrain(terrain_tex, snow_ground_tex, s_car, t_time, amb)
-        draw_city(s_car, building_lists, facade_tex, emission_tex, amb, night_a)
+        draw_city(s_car, building_lists, facade_texes, emission_tex,
+                  amb, night_a, t_time,
+                  storm_i=storm_i, frost_i=frost_i,
+                  snow_tex=snow_ground_tex)
         # Wind strength drives tree sway. Built from the same ingredients as
         # wind audio: storm intensity dominates, open biomes add exposure,
         # camera speed a touch. Clamped so peak sway stays around 3-4°.
@@ -6167,7 +6562,7 @@ def main():
         # Rural houses: farther than trees, closer than city skyscrapers.
         # Snow accumulates on roofs during frost biome, melts off when
         # the biome transitions back to plain/forest.
-        draw_houses(s_car, house_variants, snow_ground_tex, amb)
+        draw_houses(s_car, house_variants, snow_ground_tex, amb, night_a)
         # Flowers along the shoulders — same wind as the trees so the
         # whole landscape pulses together when a gust rolls through.
         draw_flowers(s_car, flower_variants, amb, t_time, wind_strength)
