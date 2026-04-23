@@ -25,8 +25,11 @@ Keybindings while interactive:
   Esc / Q         quit
   Arrow keys      orbit (left/right yaw, up/down pitch)
   +  /  -         zoom in / zoom out
-  S               save a screenshot (path comes from --screenshot, else
+  P               save a screenshot (path comes from --screenshot, else
                   `view_<object>_<seed>_<timestamp>.png`)
+  R               toggle rain on/off
+  Shift+R         toggle storm on/off
+  S               toggle snow on/off
   Space           reset camera to default
 
 The renderer follows app.py's conventions: fixed-function OpenGL,
@@ -62,8 +65,8 @@ import numpy as np
 import pygame
 from pygame.locals import (
     DOUBLEBUF, OPENGL, FULLSCREEN, QUIT, KEYDOWN,
-    K_ESCAPE, K_q, K_s, K_SPACE, K_UP, K_DOWN, K_LEFT, K_RIGHT,
-    K_PLUS, K_EQUALS, K_MINUS, K_KP_PLUS, K_KP_MINUS,
+    K_ESCAPE, K_q, K_s, K_r, K_p, K_SPACE, K_UP, K_DOWN, K_LEFT, K_RIGHT,
+    K_PLUS, K_EQUALS, K_MINUS, K_KP_PLUS, K_KP_MINUS, KMOD_SHIFT,
 )
 from OpenGL.GL import *
 from OpenGL.GLU import gluPerspective, gluLookAt
@@ -126,7 +129,7 @@ def build_parser():
                    help="Initial camera pitch in degrees.")
     p.add_argument("--screenshot", type=str, default=None,
                    metavar="PATH",
-                   help="Save a screenshot on S key or on --exit-after. "
+                   help="Save a screenshot on P key or on --exit-after. "
                         "With --angles, PATH becomes a prefix and the "
                         "angle is appended.")
     p.add_argument("--angles", type=str, default=None,
@@ -697,7 +700,9 @@ def run():
     burst_active = bool(burst)
     burst_delay = 0.20  # give fog/sprites a tick to settle per frame
 
-    storm_i, rain_i, snow_i, frost_i = weather_to_params(args.weather)
+    # Current weather (live — togglable via r / R / s keys at runtime).
+    weather = args.weather
+    storm_i, rain_i, snow_i, frost_i = weather_to_params(weather)
 
     while running:
         dt = clock.tick(args.fps) / 1000.0
@@ -710,11 +715,24 @@ def run():
             elif e.type == KEYDOWN:
                 if e.key in (K_ESCAPE, K_q):
                     running = False
-                elif e.key == K_s:
+                elif e.key == K_p:
+                    # Screenshot — moved from 's' so 's' can toggle snow.
                     path = args.screenshot or (
                         f"view_{args.object}_s{args.seed}_"
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
                     save_screenshot(path, W, H)
+                elif e.key == K_r:
+                    # r  -> toggle rain / clear
+                    # R  (shift+r) -> toggle storm / clear
+                    if e.mod & KMOD_SHIFT:
+                        weather = "clear" if weather == "storm" else "storm"
+                    else:
+                        weather = "clear" if weather == "rain" else "rain"
+                    storm_i, rain_i, snow_i, frost_i = weather_to_params(weather)
+                elif e.key == K_s:
+                    # s -> toggle snow / clear
+                    weather = "clear" if weather == "snow" else "snow"
+                    storm_i, rain_i, snow_i, frost_i = weather_to_params(weather)
                 elif e.key == K_SPACE:
                     yaw, pitch, zoom = args.yaw, args.pitch, args.zoom
                 elif e.key in (K_PLUS, K_EQUALS, K_KP_PLUS):
