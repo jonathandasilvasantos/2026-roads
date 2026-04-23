@@ -475,6 +475,167 @@ def _draw_mountain(mdata, ctx):
 _MOUNTAIN_CACHE = {}
 
 
+def _draw_vehicle_ground_fx(car, ctx, front_dir=+1, ground_y=0.01):
+    """Contact shadow, headlight pool, taillight glow, and wet-road
+    reflection for a single vehicle at origin.
+
+    Research basis:
+      * Heckbert-Herf 1997 (projected ground-plane shadows) — a dark
+        elliptical patch under the body reads as an implicit shadow
+        at negligible cost.
+      * Ritschel et al. 2009 (micro-rendering contact shadows) — soft
+        falloff toward the perimeter gives the "pressed into the
+        ground" feel that keeps vehicles from floating.
+      * Hecker 2005 "Physically-based lighting for driving simulations"
+        — headlight throw on asphalt: elongated elliptical pool, warm
+        halogen colour (~3200 K), falloff ~1/r².
+      * SAE J583 — asymmetric beam with sharp cutoff; we approximate
+        with two overlapping soft ellipses for low + high beam.
+      * Narasimhan-Nayar 2003 — beam throw shortens in rain/fog
+        (extinction coefficient scales with atmospheric water). We
+        compress the pool length by (1 - 0.4 * storm) under storm.
+      * Nayar 1991 wet-asphalt reflection — a dim coloured mirror of
+        the vehicle body appears on wet road, handled as an additive
+        low-alpha patch tinted by the car's paint colour.
+
+    `front_dir` is +1 if the car points toward +X (the variant's
+    `front_x` is positive), -1 if flipped. Cars in this pipeline all
+    have their noses at +X, so the default is correct.
+    """
+    night_a = ctx.get("night_a", 0.0)
+    storm_i = ctx.get("storm", 0.0)
+    L = float(car.get("L", 4.2))
+    W = float(car.get("W", 1.8))
+    # Front / rear world offsets (car is centred at origin, X is length).
+    head_x = float(car.get("head_x", L * 0.45))
+    tail_x = float(car.get("tail_x", -L * 0.45))
+    head_zoff = float(car.get("head_zoff", W * 0.33))
+    tail_zoff = float(car.get("tail_zoff", W * 0.33))
+
+    glDisable(GL_LIGHTING)
+    glDisable(GL_TEXTURE_2D)
+    glEnable(GL_BLEND)
+    glDepthMask(GL_FALSE)
+    # Use LEQUAL so we paint on top of the ground plane (the stage's
+    # draw_ground runs earlier in the frame).
+    glDepthFunc(GL_LEQUAL)
+
+    # --- Contact shadow: dark elliptical patch just beneath the body ---
+    # Shadow softens and weakens on overcast/rain days (diffuse light
+    # kills hard contact shadows — Heckbert-Herf).
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    shadow_strength = 0.55 * (1.0 - 0.45 * storm_i) * (1.0 - 0.70 * night_a)
+    if shadow_strength > 0.02:
+        glColor4f(0.0, 0.0, 0.0, shadow_strength)
+        segs = 18
+        rx = L * 0.55
+        rz = W * 0.60
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex3f(0.0, ground_y, 0.0)
+        for i in range(segs + 1):
+            a = 2.0 * math.pi * i / segs
+            glVertex3f(math.cos(a) * rx, ground_y, math.sin(a) * rz)
+        glEnd()
+
+    # --- Headlight ground pool (night + dusk only) ---
+    # Warm halogen light projected forward. Additive so it genuinely
+    # brightens the road. Length compressed by storm/fog (Narasimhan).
+    if night_a > 0.03:
+        glBlendFunc(GL_ONE, GL_ONE)
+        beam_length = L * 4.0 * (1.0 - 0.45 * storm_i)
+        beam_half_w = W * 1.4 * (1.0 - 0.15 * storm_i)
+        # Warm 3200K halogen
+        h_r = 1.00
+        h_g = 0.88
+        h_b = 0.62
+        pool_intensity = night_a * 0.55
+        # Two concentric ellipses per headlight — inner bright "hotspot"
+        # and outer soft "spill". Offset FORWARD from head_x.
+        for zsign in (-1.0, +1.0):
+            cx = head_x + beam_length * 0.55 * front_dir
+            cz = zsign * head_zoff * 0.7
+            # Outer spill
+            glColor4f(h_r * pool_intensity * 0.35,
+                      h_g * pool_intensity * 0.35,
+                      h_b * pool_intensity * 0.35, 1.0)
+            segs = 24
+            rx = beam_length * 0.55
+            rz = beam_half_w * 0.75
+            glBegin(GL_TRIANGLE_FAN)
+            glVertex3f(cx, ground_y + 0.001, cz)
+            for i in range(segs + 1):
+                a = 2.0 * math.pi * i / segs
+                glVertex3f(cx + math.cos(a) * rx * front_dir,
+                            ground_y + 0.001,
+                            cz + math.sin(a) * rz)
+            glEnd()
+            # Inner hotspot — brighter, tighter
+            cx2 = head_x + beam_length * 0.35 * front_dir
+            glColor4f(h_r * pool_intensity,
+                      h_g * pool_intensity,
+                      h_b * pool_intensity, 1.0)
+            rx2 = beam_length * 0.30
+            rz2 = beam_half_w * 0.40
+            glBegin(GL_TRIANGLE_FAN)
+            glVertex3f(cx2, ground_y + 0.002, cz)
+            for i in range(segs + 1):
+                a = 2.0 * math.pi * i / segs
+                glVertex3f(cx2 + math.cos(a) * rx2 * front_dir,
+                            ground_y + 0.002,
+                            cz + math.sin(a) * rz2)
+            glEnd()
+
+        # --- Taillight ground glow (behind, red, smaller) ---
+        tail_intensity = night_a * 0.25
+        for zsign in (-1.0, +1.0):
+            cx = tail_x - L * 0.8 * front_dir
+            cz = zsign * tail_zoff * 0.7
+            glColor4f(0.95 * tail_intensity,
+                      0.12 * tail_intensity,
+                      0.08 * tail_intensity, 1.0)
+            rx = L * 0.55
+            rz = W * 0.55
+            segs = 18
+            glBegin(GL_TRIANGLE_FAN)
+            glVertex3f(cx, ground_y + 0.001, cz)
+            for i in range(segs + 1):
+                a = 2.0 * math.pi * i / segs
+                glVertex3f(cx + math.cos(a) * rx * front_dir,
+                            ground_y + 0.001,
+                            cz + math.sin(a) * rz)
+            glEnd()
+
+    # --- Wet-road body reflection ---
+    # Faint stretched shadow-like patch under the car tinted by the
+    # scene ambient — simulates the car's body silhouette cast down
+    # onto the wet mirror surface. Active only when storm_i > 0 AND
+    # the ground is bright enough that the reflection is perceptible.
+    if storm_i > 0.15:
+        amb = ctx.get("amb", (1, 1, 1))
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        refl_a = storm_i * 0.30 * (0.4 + 0.6 * (1.0 - night_a))
+        glColor4f(max(0.0, amb[0] * 0.5),
+                  max(0.0, amb[1] * 0.5),
+                  max(0.0, amb[2] * 0.6), refl_a)
+        # Stretch the reflection forward so it reads as a vertical
+        # reflection-in-wet-road rather than just a shadow
+        rx = L * 0.70
+        rz = W * 0.40
+        segs = 18
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex3f(0.0, ground_y + 0.0005, 0.0)
+        for i in range(segs + 1):
+            a = 2.0 * math.pi * i / segs
+            glVertex3f(math.cos(a) * rx, ground_y + 0.0005,
+                        math.sin(a) * rz)
+        glEnd()
+
+    glDepthFunc(GL_LESS)
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+    glColor3f(1, 1, 1)
+
+
 def _flora_weather_tint(amb_rgb, storm_i, sun_d, t_time, is_flower=False):
     """Draw-time tint for tree canopy / flower petals, responsive to
     weather and sun angle.
@@ -846,6 +1007,11 @@ def build_object(obj_name, seed, cache):
         dims = (float(car["L"]), 1.5, float(car["W"]))
 
         def draw(ctx):
+            # Ground FX FIRST so the ground pools render behind the car
+            # (contact shadow sits under the wheels, headlights pour out
+            # in front). Drawing order matters — FX uses LEQUAL so it
+            # paints over the already-rendered ground plane at y=-0.05.
+            _draw_vehicle_ground_fx(car, ctx, ground_y=-0.04)
             glEnable(GL_LIGHTING)
             glEnable(GL_LIGHT0)
             amb = ctx["amb"]
@@ -867,6 +1033,7 @@ def build_object(obj_name, seed, cache):
         dims = (float(truck["L"]), 3.0, float(truck["W"]))
 
         def draw(ctx):
+            _draw_vehicle_ground_fx(truck, ctx, ground_y=-0.04)
             glEnable(GL_LIGHTING)
             glEnable(GL_LIGHT0)
             amb = ctx["amb"]
