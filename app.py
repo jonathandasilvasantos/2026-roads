@@ -380,12 +380,36 @@ def sky_colors_at(t_day, storm=0.0, flash=0.0):
             break
     if zen is None:
         zen, horz = SKY_KEYS[0][1], SKY_KEYS[0][2]
-    # storm darkens the whole dome toward neutral gray
+    # --- Storm-weather dome ---
+    # Clear-sky Preetham-style: zenith far brighter & bluer than horizon.
+    # Overcast (CIE Moon & Spencer 1942 / Preetham high-turbidity):
+    #   * Luminance ratio collapses — zenith only ~1.15× horizon, not 10×
+    #   * Rayleigh blue fades (Nishita 1996 multi-scatter): multi-bounce
+    #     off water droplets desaturates sharply toward neutral gray with
+    #     a faint green cast
+    #   * Under heavy storm horizon can actually EXCEED zenith (the
+    #     dome-light effect) — a narrow band of diffused sun still leaks
+    #     around the overcast deck's edge
     if storm > 0.001:
-        sz = (0.12, 0.13, 0.17)
-        sh = (0.22, 0.22, 0.26)
-        zen = _lerp3(zen, sz, storm * 0.75)
-        horz = _lerp3(horz, sh, storm * 0.75)
+        # Target overcast colours. Green-gray (matches bruised
+        # stratocumulus), with horizon slightly brighter than zenith so
+        # the gradient FLATTENS rather than reverses — the signature
+        # "flat gray dome" look of a rainy afternoon.
+        sz = (0.22, 0.23, 0.22)   # overcast zenith — gray-green
+        sh = (0.28, 0.29, 0.28)   # overcast horizon — a touch brighter
+        # Smoothstep so gradient reshaping kicks in strongly beyond ~0.3.
+        s = storm * storm * (3 - 2 * storm) * 0.92
+        zen = _lerp3(zen, sz, s)
+        horz = _lerp3(horz, sh, s)
+        # Extra desaturation pull: blend toward the average of zenith &
+        # horizon luminance so colour contrast flattens further.
+        if storm > 0.4:
+            avg = ((zen[0] + horz[0]) * 0.5,
+                   (zen[1] + horz[1]) * 0.5,
+                   (zen[2] + horz[2]) * 0.5)
+            k = (storm - 0.4) / 0.6 * 0.35
+            zen = _lerp3(zen, avg, k)
+            horz = _lerp3(horz, avg, k)
     # lightning flash briefly whites out the sky
     if flash > 0.001:
         zen = (min(1.0, zen[0] + flash * 0.45),
@@ -431,10 +455,23 @@ def cloud_tint_at(t_day, storm=0.0):
     g = base_g + 0.10 * warm
     b = base_b - 0.05 * warm
     if storm > 0.001:
-        dark = (0.22, 0.22, 0.26)
+        # Storm cloud tint: darker, greener-gray than fair-weather tint,
+        # following the multi-scatter aerosol story (less Rayleigh blue).
+        # The same direction applied to `make_overcast_texture` so the
+        # two cloud layers read as the same material under the same
+        # illumination.
+        dark = (0.26, 0.28, 0.27)
         r = r * (1 - storm) + dark[0] * storm
         g = g * (1 - storm) + dark[1] * storm
         b = b * (1 - storm) + dark[2] * storm
+        # At very high storm intensity, pull the whole tint toward its
+        # mean (desaturate further) so the cloud mass reads as grayer.
+        if storm > 0.35:
+            k = (storm - 0.35) / 0.65 * 0.40
+            m = (r + g + b) / 3.0
+            r = r * (1 - k) + m * k
+            g = g * (1 - k) + m * k
+            b = b * (1 - k) + m * k
     return (min(1.0, r), min(1.0, g), min(1.0, b))
 
 
@@ -2129,6 +2166,69 @@ def make_cloud_texture(w=1024, h=512):
     return (rgba * 255).astype(np.uint8)
 
 
+def make_overcast_texture(w=1024, h=512, seed=71):
+    """Dense storm cloud layer: near-full coverage (~95% alpha) with
+    heavy mottled bruising and self-shadowing that reads as turbulent,
+    low-altitude stratocumulus. Blended on top of the base cloud layer
+    at draw time with an alpha proportional to storm_intensity.
+
+    Design criteria from Dobashi 2000 / Harris & Lastra 2001: storm cloud
+    coverage is ~100% with strong low-frequency luminance variation
+    (whites bleed into darker grays) rather than discrete cloud puffs.
+    Mask is biased to concentrate mid-sky rather than at the zenith so
+    the horizon still feels 'weathered' rather than cut off.
+    """
+    rng = np.random.default_rng(seed)
+    noise = np.zeros((h, w), dtype=np.float32)
+    amp_sum = 0.0
+    # Frequency pyramid tuned for visual density at typical viewing FOV.
+    # Old (3,2)..(48,24) spanned only 3-48 features around the whole
+    # dome — a 60° view only sees ~1/6 of the azimuth → 0.5 to 8 feature
+    # cycles visible, the low end reading as FLAT. New pyramid peaks at
+    # 16-32 features so even the lowest band shows meaningful variation
+    # across a single frame.
+    for fx, fy, amp in [(8, 4, 0.45), (16, 8, 0.35), (32, 16, 0.25),
+                        (64, 32, 0.15), (128, 64, 0.08)]:
+        noise += _wrap_noise(h, w, fx, fy, rng) * amp
+        amp_sum += amp
+    noise /= amp_sum
+    noise = (noise - noise.min()) / (noise.max() - noise.min() + 1e-9)
+    # Boost contrast of the noise so light/dark patches are pronounced
+    noise = np.clip((noise - 0.35) / 0.30, 0, 1)
+
+    v = np.linspace(0.0, 1.0, h, dtype=np.float32)
+    # Altitude mask: near-full coverage from mid-sky to zenith; fade
+    # off near horizon so the overcast deck meets the horizon fog smoothly
+    # (without a hard seam). CRUCIAL difference from the fair-weather
+    # mask: we do NOT drop alpha at the zenith — real overcast skies are
+    # thickest directly overhead, not thinning at the top.
+    mask = np.clip((v - 0.02) * 4.0, 0, 1)  # ramps 0..1 by v=0.27, then 1
+
+    # Alpha: dense with strong mottling — bright clumps (alpha~0.96)
+    # next to thinner patches (alpha~0.45), driven by the contrast-
+    # boosted noise so you can SEE where cloud masses are heavier.
+    alpha = (0.45 + 0.52 * noise) * mask[:, None]
+
+    # Self-shadow: noise-derived shading. Keep RGB near 1.0 with
+    # moderate variation — the cloud_tint modulation at draw time then
+    # darkens it to the correct "stormy gray" colour. If we pre-dark it
+    # here the tint * shade product compounds and the cloud pattern
+    # disappears into a flat gray wash.
+    shadow = np.roll(noise, 10, axis=0) - noise
+    shade = np.clip(0.95 - shadow * 2.8, 0.45, 1.0)
+
+    rgba = np.zeros((h, w, 4), dtype=np.float32)
+    # Slightly warmer-green highlights, cool in shadow — so when the
+    # draw-time tint is neutral-gray the lit cloud tops still read as
+    # silver-green against charcoal shadows.
+    rgba[..., 0] = 0.98 * shade
+    rgba[..., 1] = 1.00 * shade
+    rgba[..., 2] = 0.96 * shade
+    rgba[..., 3] = np.clip(alpha, 0.0, 0.97)
+    rgba = np.clip(rgba, 0.0, 1.0)
+    return (rgba * 255).astype(np.uint8)
+
+
 def make_stars_texture(w=1024, h=512):
     """Sparse star field with varying brightness. u wraps horizontally.
 
@@ -2253,7 +2353,14 @@ def compute_dome_colors(vfrac, zenith, horizon):
 
 def draw_sky(sky_state, cam_x, cam_y, cam_z, t_time, t_day,
              storm=0.0, flash=0.0):
-    verts, tcs, vfrac, idx, cloud_tex, stars_tex = sky_state
+    # sky_state can optionally include a 7th element (overcast_tex) for
+    # the dense storm cloud layer. Older callers that pass only 6 still
+    # work — we just skip the overcast pass.
+    if len(sky_state) >= 7:
+        verts, tcs, vfrac, idx, cloud_tex, stars_tex, overcast_tex = sky_state[:7]
+    else:
+        verts, tcs, vfrac, idx, cloud_tex, stars_tex = sky_state
+        overcast_tex = None
     zenith, horizon = sky_colors_at(t_day, storm, flash)
     colors = compute_dome_colors(vfrac, zenith, horizon)
     night_a = night_factor_at(t_day)
@@ -2297,23 +2404,70 @@ def draw_sky(sky_state, cam_x, cam_y, cam_z, t_time, t_day,
         glDisableClientState(GL_TEXTURE_COORD_ARRAY)
         glDisable(GL_BLEND)
 
-    # Pass 3: clouds (alpha blended, tinted by sky/sun)
-    glEnable(GL_TEXTURE_2D)
-    glBindTexture(GL_TEXTURE_2D, cloud_tex)
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
-    glEnable(GL_BLEND)
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-    glColor4f(cloud_tint[0], cloud_tint[1], cloud_tint[2], 1.0)
-    glEnableClientState(GL_TEXTURE_COORD_ARRAY)
-    glTexCoordPointer(2, GL_FLOAT, 0, tcs)
-    glMatrixMode(GL_TEXTURE)
-    glLoadIdentity()
-    glTranslatef(t_time * 0.004, 0.0, 0.0)
-    glMatrixMode(GL_MODELVIEW)
-    glDrawElements(GL_TRIANGLES, len(idx), GL_UNSIGNED_INT, idx)
-    glMatrixMode(GL_TEXTURE); glLoadIdentity(); glMatrixMode(GL_MODELVIEW)
-    glDisableClientState(GL_TEXTURE_COORD_ARRAY)
-    glDisable(GL_BLEND)
+    # Pass 3: fair-weather clouds (alpha blended, tinted by sky/sun).
+    # Cloud drift speeds up proportionally to storm_intensity — the
+    # same front that darkens the sky also pushes it — but the fair-
+    # weather layer fades OUT as the overcast takes over so we don't
+    # see two competing cloud patterns once the storm is fully in.
+    fair_alpha = max(0.0, 1.0 - storm * 1.2)
+    if fair_alpha > 0.02:
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, cloud_tex)
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glColor4f(cloud_tint[0], cloud_tint[1], cloud_tint[2], fair_alpha)
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY)
+        glTexCoordPointer(2, GL_FLOAT, 0, tcs)
+        glMatrixMode(GL_TEXTURE)
+        glLoadIdentity()
+        glTranslatef(t_time * 0.004 * (1.0 + 1.5 * storm), 0.0, 0.0)
+        glMatrixMode(GL_MODELVIEW)
+        glDrawElements(GL_TRIANGLES, len(idx), GL_UNSIGNED_INT, idx)
+        glMatrixMode(GL_TEXTURE); glLoadIdentity(); glMatrixMode(GL_MODELVIEW)
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY)
+        glDisable(GL_BLEND)
+
+    # Pass 4: overcast cloud deck (only when storm > ~0.05). Drifts
+    # faster and in a different direction than the fair-weather layer
+    # so the two don't parallax in lockstep during the transition. Its
+    # own alpha ramps from 0 at the storm threshold to near-full at
+    # storm = 1.
+    if overcast_tex is not None and storm > 0.04:
+        # Smoothstep so the deck fades in with physical softness rather
+        # than a hard edge as storm crosses the threshold.
+        s = max(0.0, min(1.0, (storm - 0.04) / 0.96))
+        over_alpha = s * s * (3 - 2 * s)
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, overcast_tex)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        # Use the cloud tint directly — the overcast texture's own
+        # desaturated RGB will darken it further through MODULATE.
+        glColor4f(cloud_tint[0], cloud_tint[1], cloud_tint[2], over_alpha)
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY)
+        glTexCoordPointer(2, GL_FLOAT, 0, tcs)
+        glMatrixMode(GL_TEXTURE)
+        glLoadIdentity()
+        # Different scroll axis + speed than fair-weather clouds.
+        glTranslatef(t_time * 0.0055, t_time * 0.0012, 0.0)
+        glMatrixMode(GL_MODELVIEW)
+        glDrawElements(GL_TRIANGLES, len(idx), GL_UNSIGNED_INT, idx)
+        # Second pass of the same texture at a different offset when the
+        # storm is heavy — piles density on for a churning look.
+        if storm > 0.55:
+            k = (storm - 0.55) / 0.45
+            glColor4f(cloud_tint[0], cloud_tint[1], cloud_tint[2],
+                      0.55 * k * over_alpha)
+            glLoadIdentity()
+            glTranslatef(t_time * 0.0030 + 0.37, -t_time * 0.0008, 0.0)
+            glMatrixMode(GL_MODELVIEW)
+            glDrawElements(GL_TRIANGLES, len(idx), GL_UNSIGNED_INT, idx)
+            glMatrixMode(GL_TEXTURE)
+        glLoadIdentity()
+        glMatrixMode(GL_MODELVIEW)
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY)
+        glDisable(GL_BLEND)
 
     glDisableClientState(GL_VERTEX_ARRAY)
     glPopMatrix()
@@ -6479,6 +6633,8 @@ def main():
     road_tex = upload_texture(make_road_texture())
     terrain_tex = upload_texture(make_terrain_texture())
     cloud_tex = upload_texture(make_cloud_texture(), internal=GL_RGBA, src=GL_RGBA)
+    overcast_tex = upload_texture(make_overcast_texture(),
+                                    internal=GL_RGBA, src=GL_RGBA)
     # No mipmaps on the stars texture — mipmap averaging blurs the
     # single-pixel star peaks into soft patches at distance.
     stars_tex = upload_texture(make_stars_texture(), mipmaps=False)
@@ -6630,7 +6786,7 @@ def main():
     # Seed the EMA with the starting storm value so we don't ramp in from 0
     storm_smoothed = storm_intensity_at(0.0)
     sv, stc, sfr, sidx = build_sky_dome()
-    sky_state = (sv, stc, sfr, sidx, cloud_tex, stars_tex)
+    sky_state = (sv, stc, sfr, sidx, cloud_tex, stars_tex, overcast_tex)
 
     clock = pygame.time.Clock()
     s_car = 0.0

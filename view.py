@@ -650,8 +650,10 @@ def run():
     sv, stc, sfr, sidx = app.build_sky_dome()
     cloud_tex = app.upload_texture(app.make_cloud_texture(),
                                     internal=GL_RGBA, src=GL_RGBA)
+    overcast_tex = app.upload_texture(app.make_overcast_texture(),
+                                        internal=GL_RGBA, src=GL_RGBA)
     stars_tex = app.upload_texture(app.make_stars_texture(), mipmaps=False)
-    sky_state = (sv, stc, sfr, sidx, cloud_tex, stars_tex)
+    sky_state = (sv, stc, sfr, sidx, cloud_tex, stars_tex, overcast_tex)
 
     clock = pygame.time.Clock()
     t_day = time_hours_to_t_day(args.time)
