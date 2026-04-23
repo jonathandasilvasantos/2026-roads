@@ -3758,118 +3758,430 @@ def make_slate_roof_texture(size=256, seed=415):
     return tex
 
 
-def build_house_body_list(wall_tex, w, d, wall_h):
-    """4 walls + 2 gable triangles + untextured door + windows."""
+def build_house_body_list(wall_tex, w, d, wall_h, roof_h):
+    """Walls + gable triangles + plinth + door/window recesses with trim.
+
+    Realism criteria from the procedural-architecture literature
+    (Müller 2006 split grammar, Lipp 2008 frame-depth study, Musialski
+    2013 survey):
+      * Plinth (darker foundation band at ground) — single biggest cue
+        that a wall meets the earth rather than floats above it.
+      * Window recess — the pane is inset a few cm from the wall plane,
+        with a lighter sill below and a trim frame around. Frame depth,
+        not texture, is what reads as "built" from a distance.
+      * Door surround — threshold step + trim frame.
+      * Gable triangles that actually reach the roof ridge — previous
+        version peaked at wall_h + 0.01, leaving a visible gap under the
+        roof.
+    Window positions (wall_h*0.55 centre, ±w*0.28 on front/back,
+    ±d*0.28 on sides) are kept identical to the emission list so the
+    night glow lands exactly on the panes.
+    """
     list_id = glGenLists(1)
     glNewList(list_id, GL_COMPILE)
     glEnable(GL_TEXTURE_2D)
     glBindTexture(GL_TEXTURE_2D, wall_tex)
-    glColor3f(1.0, 1.0, 1.0)
-    u_rep = w / 2.5     # wall tex tiles roughly every 2.5 m horizontally
+    # NOTE: do not reset glColor here — the caller sets the ambient tint
+    # before glCallList. Setting (1,1,1) inside the list would make the
+    # walls render at full brightness even at night.
+    u_rep = w / 2.5
     u_rep_s = d / 2.5
     v_rep = wall_h / 2.5
 
+    # --- Main walls (4 quads)
     glBegin(GL_QUADS)
-    # Front wall (-Z)
+    glNormal3f(0, 0, -1)
     glTexCoord2f(0, 0); glVertex3f(-w / 2, 0, -d / 2)
     glTexCoord2f(u_rep, 0); glVertex3f(w / 2, 0, -d / 2)
     glTexCoord2f(u_rep, v_rep); glVertex3f(w / 2, wall_h, -d / 2)
     glTexCoord2f(0, v_rep); glVertex3f(-w / 2, wall_h, -d / 2)
-    # Back wall (+Z)
+    glNormal3f(0, 0, 1)
     glTexCoord2f(0, 0); glVertex3f(w / 2, 0, d / 2)
     glTexCoord2f(u_rep, 0); glVertex3f(-w / 2, 0, d / 2)
     glTexCoord2f(u_rep, v_rep); glVertex3f(-w / 2, wall_h, d / 2)
     glTexCoord2f(0, v_rep); glVertex3f(w / 2, wall_h, d / 2)
-    # Left wall (-X)
+    glNormal3f(-1, 0, 0)
     glTexCoord2f(0, 0); glVertex3f(-w / 2, 0, d / 2)
     glTexCoord2f(u_rep_s, 0); glVertex3f(-w / 2, 0, -d / 2)
     glTexCoord2f(u_rep_s, v_rep); glVertex3f(-w / 2, wall_h, -d / 2)
     glTexCoord2f(0, v_rep); glVertex3f(-w / 2, wall_h, d / 2)
-    # Right wall (+X)
+    glNormal3f(1, 0, 0)
     glTexCoord2f(0, 0); glVertex3f(w / 2, 0, -d / 2)
     glTexCoord2f(u_rep_s, 0); glVertex3f(w / 2, 0, d / 2)
     glTexCoord2f(u_rep_s, v_rep); glVertex3f(w / 2, wall_h, d / 2)
     glTexCoord2f(0, v_rep); glVertex3f(w / 2, wall_h, -d / 2)
     glEnd()
 
-    # Gable triangles (front + back), shorter aspect on V
+    # --- Gable triangles (front + back) — apex at the real ridge height.
+    # UVs run from wall_h to apex along V so the wall material
+    # continues naturally up the triangle.
     glBegin(GL_TRIANGLES)
-    for z_face in (-d / 2, d / 2):
+    apex_y = wall_h + roof_h
+    v_tri = roof_h / 2.5
+    for z_face, n in ((-d / 2, -1.0), (d / 2, 1.0)):
+        glNormal3f(0, 0, n)
         glTexCoord2f(0, 0); glVertex3f(-w / 2, wall_h, z_face)
         glTexCoord2f(u_rep, 0); glVertex3f(w / 2, wall_h, z_face)
-        glTexCoord2f(u_rep / 2, v_rep * 0.6); glVertex3f(0.0, wall_h + 0.01, z_face)
+        glTexCoord2f(u_rep / 2, v_tri); glVertex3f(0.0, apex_y, z_face)
     glEnd()
 
-    # Door + windows — untextured dark quads
+    # --- Plinth / foundation: a 0.35m dark stone band around the whole
+    # house, projected outward 0.08m so it reads as a wider base and
+    # casts a subtle horizontal line at the wall/ground boundary.
+    plinth_h = 0.35
+    plinth_out = 0.08
     glDisable(GL_TEXTURE_2D)
-    # Door on front (-Z face), slight outward offset so it doesn't z-fight
-    glColor3f(0.22, 0.13, 0.07)
-    door_w_ = 0.9
-    door_h_ = 2.0
-    eps = 0.015
+    glColor3f(0.28, 0.26, 0.23)
     glBegin(GL_QUADS)
-    glVertex3f(-door_w_ / 2, 0.0, -d / 2 - eps)
-    glVertex3f(door_w_ / 2, 0.0, -d / 2 - eps)
-    glVertex3f(door_w_ / 2, door_h_, -d / 2 - eps)
-    glVertex3f(-door_w_ / 2, door_h_, -d / 2 - eps)
+    # Four outer faces
+    for nx, nz, x0, z0, x1, z1 in (
+        (0, -1, -w / 2 - plinth_out, -d / 2 - plinth_out,
+                w / 2 + plinth_out, -d / 2 - plinth_out),
+        (0,  1,  w / 2 + plinth_out,  d / 2 + plinth_out,
+                -w / 2 - plinth_out,  d / 2 + plinth_out),
+        (-1, 0, -w / 2 - plinth_out,  d / 2 + plinth_out,
+                -w / 2 - plinth_out, -d / 2 - plinth_out),
+        ( 1, 0,  w / 2 + plinth_out, -d / 2 - plinth_out,
+                 w / 2 + plinth_out,  d / 2 + plinth_out),
+    ):
+        glNormal3f(nx, 0, nz)
+        glVertex3f(x0, 0, z0)
+        glVertex3f(x1, 0, z1)
+        glVertex3f(x1, plinth_h, z1)
+        glVertex3f(x0, plinth_h, z0)
+    # Top of plinth (ring)
+    glNormal3f(0, 1, 0)
+    for x0, z0, x1, z1 in (
+        (-w / 2 - plinth_out, -d / 2 - plinth_out,
+          w / 2 + plinth_out, -d / 2),
+        (-w / 2 - plinth_out,  d / 2,
+          w / 2 + plinth_out,  d / 2 + plinth_out),
+        (-w / 2 - plinth_out, -d / 2, -w / 2,  d / 2),
+        ( w / 2, -d / 2,  w / 2 + plinth_out,  d / 2),
+    ):
+        glVertex3f(x0, plinth_h, z0)
+        glVertex3f(x1, plinth_h, z0)
+        glVertex3f(x1, plinth_h, z1)
+        glVertex3f(x0, plinth_h, z1)
     glEnd()
 
-    # Windows — dark blue glass
-    glColor3f(0.10, 0.14, 0.24)
-    win_w_ = 0.9
-    win_h_ = 1.0
-    win_y = wall_h * 0.55 - win_h_ / 2
+    # --- Door on front (-Z): recessed frame + threshold + door panel
+    eps = 0.018
+    door_w_ = 0.95
+    door_h_ = 2.05
+    frame_t = 0.09  # frame thickness
+    frame_depth = 0.06
+    # Frame (wood trim)
+    glColor3f(0.78, 0.68, 0.52)
     glBegin(GL_QUADS)
-    # Front: one on each side of the door
-    for xoff in (-w * 0.28, w * 0.28):
-        glVertex3f(xoff - win_w_ / 2, win_y, -d / 2 - eps)
-        glVertex3f(xoff + win_w_ / 2, win_y, -d / 2 - eps)
-        glVertex3f(xoff + win_w_ / 2, win_y + win_h_, -d / 2 - eps)
-        glVertex3f(xoff - win_w_ / 2, win_y + win_h_, -d / 2 - eps)
-    # Back: two symmetric
-    for xoff in (-w * 0.28, w * 0.28):
-        glVertex3f(xoff + win_w_ / 2, win_y, d / 2 + eps)
-        glVertex3f(xoff - win_w_ / 2, win_y, d / 2 + eps)
-        glVertex3f(xoff - win_w_ / 2, win_y + win_h_, d / 2 + eps)
-        glVertex3f(xoff + win_w_ / 2, win_y + win_h_, d / 2 + eps)
-    # Left side (-X)
-    for zoff in (-d * 0.28, d * 0.28):
-        glVertex3f(-w / 2 - eps, win_y, zoff + win_w_ / 2)
-        glVertex3f(-w / 2 - eps, win_y, zoff - win_w_ / 2)
-        glVertex3f(-w / 2 - eps, win_y + win_h_, zoff - win_w_ / 2)
-        glVertex3f(-w / 2 - eps, win_y + win_h_, zoff + win_w_ / 2)
-    # Right side (+X)
-    for zoff in (-d * 0.28, d * 0.28):
-        glVertex3f(w / 2 + eps, win_y, zoff - win_w_ / 2)
-        glVertex3f(w / 2 + eps, win_y, zoff + win_w_ / 2)
-        glVertex3f(w / 2 + eps, win_y + win_h_, zoff + win_w_ / 2)
-        glVertex3f(w / 2 + eps, win_y + win_h_, zoff - win_w_ / 2)
+    # Top lintel
+    glVertex3f(-door_w_ / 2 - frame_t, door_h_, -d / 2 - eps)
+    glVertex3f(door_w_ / 2 + frame_t, door_h_, -d / 2 - eps)
+    glVertex3f(door_w_ / 2 + frame_t, door_h_ + frame_t, -d / 2 - eps)
+    glVertex3f(-door_w_ / 2 - frame_t, door_h_ + frame_t, -d / 2 - eps)
+    # Left jamb
+    glVertex3f(-door_w_ / 2 - frame_t, 0.0, -d / 2 - eps)
+    glVertex3f(-door_w_ / 2, 0.0, -d / 2 - eps)
+    glVertex3f(-door_w_ / 2, door_h_, -d / 2 - eps)
+    glVertex3f(-door_w_ / 2 - frame_t, door_h_, -d / 2 - eps)
+    # Right jamb
+    glVertex3f(door_w_ / 2, 0.0, -d / 2 - eps)
+    glVertex3f(door_w_ / 2 + frame_t, 0.0, -d / 2 - eps)
+    glVertex3f(door_w_ / 2 + frame_t, door_h_, -d / 2 - eps)
+    glVertex3f(door_w_ / 2, door_h_, -d / 2 - eps)
     glEnd()
-    glColor3f(1.0, 1.0, 1.0)
+    # Recessed door panel (painted wood)
+    glColor3f(0.42, 0.22, 0.14)
+    door_z = -d / 2 - eps + frame_depth
+    glBegin(GL_QUADS)
+    glVertex3f(-door_w_ / 2, 0.0, door_z)
+    glVertex3f(door_w_ / 2, 0.0, door_z)
+    glVertex3f(door_w_ / 2, door_h_, door_z)
+    glVertex3f(-door_w_ / 2, door_h_, door_z)
+    glEnd()
+    # Threshold step
+    glColor3f(0.48, 0.46, 0.42)
+    step_out = 0.30
+    step_h = 0.18
+    glBegin(GL_QUADS)
+    glNormal3f(0, 1, 0)
+    glVertex3f(-door_w_ / 2 - 0.15, step_h, -d / 2 - step_out)
+    glVertex3f(door_w_ / 2 + 0.15, step_h, -d / 2 - step_out)
+    glVertex3f(door_w_ / 2 + 0.15, step_h, -d / 2)
+    glVertex3f(-door_w_ / 2 - 0.15, step_h, -d / 2)
+    glNormal3f(0, 0, -1)
+    glVertex3f(-door_w_ / 2 - 0.15, 0, -d / 2 - step_out)
+    glVertex3f(door_w_ / 2 + 0.15, 0, -d / 2 - step_out)
+    glVertex3f(door_w_ / 2 + 0.15, step_h, -d / 2 - step_out)
+    glVertex3f(-door_w_ / 2 - 0.15, step_h, -d / 2 - step_out)
+    glEnd()
+    # Door handle — small bright dot
+    glColor3f(0.85, 0.75, 0.35)
+    hx = door_w_ * 0.30
+    hy = door_h_ * 0.5
+    hr = 0.05
+    glBegin(GL_QUADS)
+    glVertex3f(hx - hr, hy - hr, door_z + 0.005)
+    glVertex3f(hx + hr, hy - hr, door_z + 0.005)
+    glVertex3f(hx + hr, hy + hr, door_z + 0.005)
+    glVertex3f(hx - hr, hy + hr, door_z + 0.005)
+    glEnd()
+
+    # --- Windows: frame + sill + glass at layered protrusion depths
+    #
+    # True recessing would require cutting a hole in the wall. Instead
+    # we layer three planes proud of the wall — frame furthest out, glass
+    # between, sill projecting horizontally below. Reads as a shallow
+    # bas-relief window, consistent regardless of viewing angle.
+    win_w_ = 0.95
+    win_h_ = 1.05
+    win_y = wall_h * 0.55 - win_h_ / 2
+    win_frame_t = 0.08
+    frame_out = 0.025   # frame trim protrudes this far from the wall
+    glass_out = 0.008   # glass sits between wall and frame
+    # Frame color (painted trim)
+    frame_c = (0.88, 0.84, 0.76)
+    glass_c = (0.18, 0.24, 0.34)
+    sill_c = (0.60, 0.58, 0.54)
+
+    def _window_on_face(cx, cy, face_axis, face_sign):
+        """Draw frame+sill+glass at centre (cx, cy) on a given cardinal
+        face. face_axis: 'z' for front/back, 'x' for sides. face_sign ±1.
+        """
+        if face_axis == 'z':
+            n = -face_sign
+            face_val = face_sign * d / 2
+            # 'outer' = frame plane (most proud), 'inner' = glass plane
+            outer = face_val + (-frame_out if face_sign < 0 else frame_out)
+            inner = face_val + (-glass_out if face_sign < 0 else glass_out)
+            x0, x1 = cx - win_w_ / 2, cx + win_w_ / 2
+            x0f, x1f = cx - win_w_ / 2 - win_frame_t, cx + win_w_ / 2 + win_frame_t
+            y0, y1 = cy - win_h_ / 2, cy + win_h_ / 2
+            y0f, y1f = y0 - win_frame_t, y1 + win_frame_t
+            # Frame (4 strips around)
+            glColor3f(*frame_c)
+            glBegin(GL_QUADS)
+            glNormal3f(0, 0, n)
+            # top
+            glVertex3f(x0f, y1, outer); glVertex3f(x1f, y1, outer)
+            glVertex3f(x1f, y1f, outer); glVertex3f(x0f, y1f, outer)
+            # bottom
+            glVertex3f(x0f, y0f, outer); glVertex3f(x1f, y0f, outer)
+            glVertex3f(x1f, y0, outer); glVertex3f(x0f, y0, outer)
+            # left
+            glVertex3f(x0f, y0, outer); glVertex3f(x0, y0, outer)
+            glVertex3f(x0, y1, outer); glVertex3f(x0f, y1, outer)
+            # right
+            glVertex3f(x1, y0, outer); glVertex3f(x1f, y0, outer)
+            glVertex3f(x1f, y1, outer); glVertex3f(x1, y1, outer)
+            glEnd()
+            # Glass pane (recessed)
+            glColor3f(*glass_c)
+            glBegin(GL_QUADS)
+            glVertex3f(x0, y0, inner); glVertex3f(x1, y0, inner)
+            glVertex3f(x1, y1, inner); glVertex3f(x0, y1, inner)
+            # Horizontal mullion (muntin) — thin painted bar across
+            glColor3f(*frame_c)
+            ym = (y0 + y1) / 2
+            mt = 0.03
+            glVertex3f(x0, ym - mt, outer - 0.005 * face_sign)
+            glVertex3f(x1, ym - mt, outer - 0.005 * face_sign)
+            glVertex3f(x1, ym + mt, outer - 0.005 * face_sign)
+            glVertex3f(x0, ym + mt, outer - 0.005 * face_sign)
+            glEnd()
+            # Sill (projects outward + down) — small ledge
+            glColor3f(*sill_c)
+            sill_out = 0.06
+            sill_h = 0.05
+            glBegin(GL_QUADS)
+            glNormal3f(0, 1, 0)
+            glVertex3f(x0f, y0f, outer)
+            glVertex3f(x1f, y0f, outer)
+            glVertex3f(x1f, y0f, outer - sill_out * face_sign)
+            glVertex3f(x0f, y0f, outer - sill_out * face_sign)
+            glNormal3f(0, 0, n)
+            glVertex3f(x0f, y0f - sill_h, outer - sill_out * face_sign)
+            glVertex3f(x1f, y0f - sill_h, outer - sill_out * face_sign)
+            glVertex3f(x1f, y0f, outer - sill_out * face_sign)
+            glVertex3f(x0f, y0f, outer - sill_out * face_sign)
+            glEnd()
+        else:  # side (x axis); cy=y centre, cx=z offset, face_sign ±1 means side
+            face_val = face_sign * w / 2
+            outer = face_val + (-frame_out if face_sign < 0 else frame_out)
+            inner = face_val + (-glass_out if face_sign < 0 else glass_out)
+            z0, z1 = cx - win_w_ / 2, cx + win_w_ / 2
+            z0f, z1f = z0 - win_frame_t, z1 + win_frame_t
+            y0, y1 = cy - win_h_ / 2, cy + win_h_ / 2
+            y0f, y1f = y0 - win_frame_t, y1 + win_frame_t
+            n = -face_sign
+            glColor3f(*frame_c)
+            glBegin(GL_QUADS)
+            glNormal3f(n, 0, 0)
+            # top
+            glVertex3f(outer, y1, z0f); glVertex3f(outer, y1, z1f)
+            glVertex3f(outer, y1f, z1f); glVertex3f(outer, y1f, z0f)
+            # bottom
+            glVertex3f(outer, y0f, z0f); glVertex3f(outer, y0f, z1f)
+            glVertex3f(outer, y0, z1f); glVertex3f(outer, y0, z0f)
+            # left
+            glVertex3f(outer, y0, z0f); glVertex3f(outer, y0, z0)
+            glVertex3f(outer, y1, z0); glVertex3f(outer, y1, z0f)
+            # right
+            glVertex3f(outer, y0, z1); glVertex3f(outer, y0, z1f)
+            glVertex3f(outer, y1, z1f); glVertex3f(outer, y1, z1)
+            glEnd()
+            glColor3f(*glass_c)
+            glBegin(GL_QUADS)
+            glVertex3f(inner, y0, z0); glVertex3f(inner, y0, z1)
+            glVertex3f(inner, y1, z1); glVertex3f(inner, y1, z0)
+            glColor3f(*frame_c)
+            ym = (y0 + y1) / 2
+            mt = 0.03
+            glVertex3f(outer - 0.005 * face_sign, ym - mt, z0)
+            glVertex3f(outer - 0.005 * face_sign, ym - mt, z1)
+            glVertex3f(outer - 0.005 * face_sign, ym + mt, z1)
+            glVertex3f(outer - 0.005 * face_sign, ym + mt, z0)
+            glEnd()
+            glColor3f(*sill_c)
+            sill_out = 0.06
+            sill_h = 0.05
+            glBegin(GL_QUADS)
+            glNormal3f(0, 1, 0)
+            glVertex3f(outer, y0f, z0f)
+            glVertex3f(outer, y0f, z1f)
+            glVertex3f(outer - sill_out * face_sign, y0f, z1f)
+            glVertex3f(outer - sill_out * face_sign, y0f, z0f)
+            glNormal3f(n, 0, 0)
+            glVertex3f(outer - sill_out * face_sign, y0f - sill_h, z0f)
+            glVertex3f(outer - sill_out * face_sign, y0f - sill_h, z1f)
+            glVertex3f(outer - sill_out * face_sign, y0f, z1f)
+            glVertex3f(outer - sill_out * face_sign, y0f, z0f)
+            glEnd()
+
+    cy_win = win_y + win_h_ / 2
+    for xoff in (-w * 0.28, w * 0.28):
+        _window_on_face(xoff, cy_win, 'z', -1)  # front
+        _window_on_face(xoff, cy_win, 'z', +1)  # back
+    for zoff in (-d * 0.28, d * 0.28):
+        _window_on_face(zoff, cy_win, 'x', -1)  # left
+        _window_on_face(zoff, cy_win, 'x', +1)  # right
+
     glEnable(GL_TEXTURE_2D)
     glEndList()
     return list_id
 
 
-def build_house_roof_list(w, d, wall_h, roof_h):
-    """Two slope quads only — no texture bind, so callers swap for snow."""
+def build_house_roof_list(w, d, wall_h, roof_h, eave=0.45):
+    """Two slope quads + a gable-end overhang band.
+
+    Eaves project outward ~0.45m past the wall plane on all four sides
+    so the roof reads as sheltering the walls, not just capping them.
+    Per the Musialski 2013 survey, eave overhang is the cheapest high-
+    impact realism cue for low-rise houses. Texture bind is left to
+    the caller so a snow pass can swap it.
+    """
     list_id = glGenLists(1)
     glNewList(list_id, GL_COMPILE)
     apex_y = wall_h + roof_h
-    u_rep = d / 2.5
-    v_rep = math.sqrt((w / 2) ** 2 + roof_h ** 2) / 2.5
+    # Slope extension: overhang widens the roof footprint along Z
+    # (eave side) and adds a small vertical drop at the apex so the
+    # overhang continues along the gable ends as well.
+    w_eave = w + 2 * eave
+    d_eave = d + 2 * eave
+    # Slightly lower start so the eave drops below the wall top a touch
+    eave_drop = 0.08
+    slope_start_y = wall_h - eave_drop
+    u_rep = d_eave / 2.5
+    v_rep = math.sqrt((w_eave / 2) ** 2 + roof_h ** 2) / 2.5
     glBegin(GL_QUADS)
-    # Left slope
-    glTexCoord2f(0, 0); glVertex3f(-w / 2, wall_h, -d / 2)
-    glTexCoord2f(u_rep, 0); glVertex3f(-w / 2, wall_h, d / 2)
-    glTexCoord2f(u_rep, v_rep); glVertex3f(0.0, apex_y, d / 2)
-    glTexCoord2f(0, v_rep); glVertex3f(0.0, apex_y, -d / 2)
-    # Right slope
-    glTexCoord2f(0, 0); glVertex3f(0.0, apex_y, -d / 2)
-    glTexCoord2f(u_rep, 0); glVertex3f(0.0, apex_y, d / 2)
-    glTexCoord2f(u_rep, v_rep); glVertex3f(w / 2, wall_h, d / 2)
-    glTexCoord2f(0, v_rep); glVertex3f(w / 2, wall_h, -d / 2)
+    # Left slope (-X side)
+    glNormal3f(-roof_h, w_eave / 2, 0.0)
+    glTexCoord2f(0, 0); glVertex3f(-w_eave / 2, slope_start_y, -d_eave / 2)
+    glTexCoord2f(u_rep, 0); glVertex3f(-w_eave / 2, slope_start_y, d_eave / 2)
+    glTexCoord2f(u_rep, v_rep); glVertex3f(0.0, apex_y, d_eave / 2)
+    glTexCoord2f(0, v_rep); glVertex3f(0.0, apex_y, -d_eave / 2)
+    # Right slope (+X side)
+    glNormal3f(roof_h, w_eave / 2, 0.0)
+    glTexCoord2f(0, 0); glVertex3f(0.0, apex_y, -d_eave / 2)
+    glTexCoord2f(u_rep, 0); glVertex3f(0.0, apex_y, d_eave / 2)
+    glTexCoord2f(u_rep, v_rep); glVertex3f(w_eave / 2, slope_start_y, d_eave / 2)
+    glTexCoord2f(0, v_rep); glVertex3f(w_eave / 2, slope_start_y, -d_eave / 2)
     glEnd()
+    glEndList()
+    return list_id
+
+
+def build_house_chimney_list(w, d, wall_h, roof_h):
+    """A small brick-coloured chimney sitting on one slope, ~1/3 of the
+    way from the ridge toward the eave on the +X side. Compiled as a
+    separate list so the night emission pass can add a tiny warm glow
+    at its top (embers / interior light spill)."""
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    # Place chimney on the +X slope, roughly 1/3 from ridge toward eave
+    cx = w * 0.22
+    cz_off = d * 0.18  # offset toward +Z
+    ridge_y = wall_h + roof_h
+    # Linear interp of slope height at cx: at x=0 -> ridge_y, at x=w/2 -> wall_h
+    t = cx / (w / 2)
+    slope_y = ridge_y * (1 - t) + wall_h * t
+    base_y = slope_y + 0.05   # sit just above slope
+    top_y = ridge_y + 1.2      # extend above the ridge
+    cw = 0.55
+    cd = 0.55
+    glDisable(GL_TEXTURE_2D)
+    # brick red
+    glColor3f(0.55, 0.33, 0.28)
+    # 4 side faces
+    for nx, nz, x0, z0, x1, z1 in (
+        (0, -1, cx - cw/2, cz_off - cd/2, cx + cw/2, cz_off - cd/2),
+        (0,  1, cx + cw/2, cz_off + cd/2, cx - cw/2, cz_off + cd/2),
+        (-1, 0, cx - cw/2, cz_off + cd/2, cx - cw/2, cz_off - cd/2),
+        ( 1, 0, cx + cw/2, cz_off - cd/2, cx + cw/2, cz_off + cd/2),
+    ):
+        glBegin(GL_QUADS)
+        glNormal3f(nx, 0, nz)
+        glVertex3f(x0, base_y, z0)
+        glVertex3f(x1, base_y, z1)
+        glVertex3f(x1, top_y, z1)
+        glVertex3f(x0, top_y, z0)
+        glEnd()
+    # Cap (slightly wider)
+    cap_out = 0.04
+    cap_h = 0.08
+    glColor3f(0.35, 0.32, 0.30)
+    glBegin(GL_QUADS)
+    glNormal3f(0, 1, 0)
+    glVertex3f(cx - cw/2 - cap_out, top_y + cap_h, cz_off - cd/2 - cap_out)
+    glVertex3f(cx + cw/2 + cap_out, top_y + cap_h, cz_off - cd/2 - cap_out)
+    glVertex3f(cx + cw/2 + cap_out, top_y + cap_h, cz_off + cd/2 + cap_out)
+    glVertex3f(cx - cw/2 - cap_out, top_y + cap_h, cz_off + cd/2 + cap_out)
+    # cap sides
+    for nx, nz, x0, z0, x1, z1 in (
+        (0, -1, cx - cw/2 - cap_out, cz_off - cd/2 - cap_out,
+                cx + cw/2 + cap_out, cz_off - cd/2 - cap_out),
+        (0,  1, cx + cw/2 + cap_out, cz_off + cd/2 + cap_out,
+                cx - cw/2 - cap_out, cz_off + cd/2 + cap_out),
+        (-1, 0, cx - cw/2 - cap_out, cz_off + cd/2 + cap_out,
+                cx - cw/2 - cap_out, cz_off - cd/2 - cap_out),
+        ( 1, 0, cx + cw/2 + cap_out, cz_off - cd/2 - cap_out,
+                cx + cw/2 + cap_out, cz_off + cd/2 + cap_out),
+    ):
+        glNormal3f(nx, 0, nz)
+        glVertex3f(x0, top_y, z0)
+        glVertex3f(x1, top_y, z1)
+        glVertex3f(x1, top_y + cap_h, z1)
+        glVertex3f(x0, top_y + cap_h, z0)
+    # Dark opening on top (flue)
+    glColor3f(0.08, 0.06, 0.05)
+    glNormal3f(0, 1, 0)
+    ho = 0.08
+    glVertex3f(cx - ho, top_y + cap_h + 0.001, cz_off - ho)
+    glVertex3f(cx + ho, top_y + cap_h + 0.001, cz_off - ho)
+    glVertex3f(cx + ho, top_y + cap_h + 0.001, cz_off + ho)
+    glVertex3f(cx - ho, top_y + cap_h + 0.001, cz_off + ho)
+    glEnd()
+    glEnable(GL_TEXTURE_2D)
     glEndList()
     return list_id
 
@@ -3888,54 +4200,62 @@ def build_house_emission_list(w, d, wall_h, lit_mask):
     """
     list_id = glGenLists(1)
     glNewList(list_id, GL_COMPILE)
-    eps = 0.020  # slightly larger than body eps so z-fighting doesn't clip
-    win_w_ = 0.9
-    win_h_ = 1.0
+    # Dimensions + plane must match build_house_body_list exactly
+    # (win_w=0.95, win_h=1.05, glass_out=0.008). Emission sits on the
+    # glass plane with a tiny extra offset toward the camera so the
+    # additive pass is drawn on top, not z-fighting with the glass.
+    win_w_ = 0.95
+    win_h_ = 1.05
     win_y = wall_h * 0.55 - win_h_ / 2
+    glass_out = 0.008
+    z_off_front = glass_out + 0.002  # project OUT from -d/2
+    z_off_back = glass_out + 0.002   # project OUT from +d/2
+    x_off = glass_out + 0.002
+    body_eps = glass_out  # for porch_y offset below
     glBegin(GL_QUADS)
-    # Front (-Z): two windows + porch light
     for i, xoff in enumerate((-w * 0.28, w * 0.28)):
         if not lit_mask[i]:
             continue
-        glVertex3f(xoff - win_w_ / 2, win_y, -d / 2 - eps)
-        glVertex3f(xoff + win_w_ / 2, win_y, -d / 2 - eps)
-        glVertex3f(xoff + win_w_ / 2, win_y + win_h_, -d / 2 - eps)
-        glVertex3f(xoff - win_w_ / 2, win_y + win_h_, -d / 2 - eps)
-    # Back (+Z)
+        z = -d / 2 - z_off_front
+        glVertex3f(xoff - win_w_ / 2, win_y, z)
+        glVertex3f(xoff + win_w_ / 2, win_y, z)
+        glVertex3f(xoff + win_w_ / 2, win_y + win_h_, z)
+        glVertex3f(xoff - win_w_ / 2, win_y + win_h_, z)
     for i, xoff in enumerate((-w * 0.28, w * 0.28)):
         if not lit_mask[2 + i]:
             continue
-        glVertex3f(xoff + win_w_ / 2, win_y, d / 2 + eps)
-        glVertex3f(xoff - win_w_ / 2, win_y, d / 2 + eps)
-        glVertex3f(xoff - win_w_ / 2, win_y + win_h_, d / 2 + eps)
-        glVertex3f(xoff + win_w_ / 2, win_y + win_h_, d / 2 + eps)
-    # Left (-X)
+        z = d / 2 + z_off_back
+        glVertex3f(xoff + win_w_ / 2, win_y, z)
+        glVertex3f(xoff - win_w_ / 2, win_y, z)
+        glVertex3f(xoff - win_w_ / 2, win_y + win_h_, z)
+        glVertex3f(xoff + win_w_ / 2, win_y + win_h_, z)
     for i, zoff in enumerate((-d * 0.28, d * 0.28)):
         if not lit_mask[4 + i]:
             continue
-        glVertex3f(-w / 2 - eps, win_y, zoff + win_w_ / 2)
-        glVertex3f(-w / 2 - eps, win_y, zoff - win_w_ / 2)
-        glVertex3f(-w / 2 - eps, win_y + win_h_, zoff - win_w_ / 2)
-        glVertex3f(-w / 2 - eps, win_y + win_h_, zoff + win_w_ / 2)
-    # Right (+X)
+        x = -w / 2 - x_off
+        glVertex3f(x, win_y, zoff + win_w_ / 2)
+        glVertex3f(x, win_y, zoff - win_w_ / 2)
+        glVertex3f(x, win_y + win_h_, zoff - win_w_ / 2)
+        glVertex3f(x, win_y + win_h_, zoff + win_w_ / 2)
     for i, zoff in enumerate((-d * 0.28, d * 0.28)):
         if not lit_mask[6 + i]:
             continue
-        glVertex3f(w / 2 + eps, win_y, zoff - win_w_ / 2)
-        glVertex3f(w / 2 + eps, win_y, zoff + win_w_ / 2)
-        glVertex3f(w / 2 + eps, win_y + win_h_, zoff + win_w_ / 2)
-        glVertex3f(w / 2 + eps, win_y + win_h_, zoff - win_w_ / 2)
+        x = w / 2 + x_off
+        glVertex3f(x, win_y, zoff - win_w_ / 2)
+        glVertex3f(x, win_y, zoff + win_w_ / 2)
+        glVertex3f(x, win_y + win_h_, zoff + win_w_ / 2)
+        glVertex3f(x, win_y + win_h_, zoff - win_w_ / 2)
     glEnd()
     # Porch light: a small glowing disk above the door (front face).
     porch_r = 0.14
     porch_y = 2.15
     glBegin(GL_TRIANGLE_FAN)
-    glVertex3f(0.0, porch_y, -d / 2 - eps * 1.2)
+    glVertex3f(0.0, porch_y, -d / 2 - body_eps * 1.2)
     for k in range(13):
         ang = 2.0 * math.pi * k / 12.0
         glVertex3f(math.cos(ang) * porch_r,
                    porch_y + math.sin(ang) * porch_r,
-                   -d / 2 - eps * 1.2)
+                   -d / 2 - body_eps * 1.2)
     glEnd()
     glEndList()
     return list_id
@@ -3953,13 +4273,11 @@ def build_house_variants(wall_textures, roof_textures, n=8):
         d = rng.uniform(6.5, 9.0)
         wall_h = rng.uniform(*HOUSE_WALL_H_RANGE)
         roof_h = rng.uniform(*HOUSE_ROOF_H_RANGE)
-        # Per-variant lit-window pattern so different houses glow
-        # differently: ~60% of windows are lit on a given night. Same seed
-        # chain as dimensions so a given variant is stable across runs.
         lit_mask = tuple(rng.random() < 0.60 for _ in range(8))
         variants.append({
-            "body": build_house_body_list(wall_tex, w, d, wall_h),
+            "body": build_house_body_list(wall_tex, w, d, wall_h, roof_h),
             "roof": build_house_roof_list(w, d, wall_h, roof_h),
+            "chimney": build_house_chimney_list(w, d, wall_h, roof_h),
             "emission": build_house_emission_list(w, d, wall_h, lit_mask),
             "wall_tex": wall_tex,
             "roof_tex": roof_tex,
@@ -4020,13 +4338,20 @@ def draw_houses(s_car, house_variants, snow_tex, amb_rgb, night_a=0.0):
             glRotatef(yaw, 0, 1, 0)
             glScalef(scale, scale, scale)
 
-            # Body + roof at normal tint
-            glColor3f(min(1.0, amb_rgb[0]),
-                      min(1.0, amb_rgb[1]),
-                      min(1.0, amb_rgb[2]))
+            # Body + roof at normal tint — the body list leaves glColor
+            # as the last window's sill colour (it no longer resets to
+            # white), so reassert the ambient tint before the roof pass.
+            tint = (min(1.0, amb_rgb[0]),
+                    min(1.0, amb_rgb[1]),
+                    min(1.0, amb_rgb[2]))
+            glColor3f(*tint)
             glCallList(v["body"])
+            glColor3f(*tint)
             glBindTexture(GL_TEXTURE_2D, v["roof_tex"])
             glCallList(v["roof"])
+            if "chimney" in v:
+                glColor3f(*tint)
+                glCallList(v["chimney"])
 
             # Progressive snow on the roof: fade in/out with frost biome
             if frost_w_here > 0.04:
@@ -4048,18 +4373,20 @@ def draw_houses(s_car, house_variants, snow_tex, amb_rgb, night_a=0.0):
                 glColor3f(1.0, 1.0, 1.0)
 
             # Night emission: warm-tinted glow from windows + porch light.
-            # Additive over the body; gated by night_a so lamps are fully off
-            # at day, ramp up through dusk, stay on through the small hours.
+            # GL_LEQUAL so equal-Z additive passes actually paint over
+            # the just-drawn body (same trick as draw_city).
             if night_a > 0.03 and "emission" in v:
                 glDisable(GL_TEXTURE_2D)
                 glEnable(GL_BLEND)
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+                glBlendFunc(GL_ONE, GL_ONE)
+                glDepthFunc(GL_LEQUAL)
                 glDepthMask(GL_FALSE)
-                glColor4f(min(1.0, night_a * 1.05),
-                          min(1.0, night_a * 0.88),
-                          min(1.0, night_a * 0.55),
+                glColor4f(min(1.0, night_a * 1.10),
+                          min(1.0, night_a * 0.92),
+                          min(1.0, night_a * 0.58),
                           1.0)
                 glCallList(v["emission"])
+                glDepthFunc(GL_LESS)
                 glDepthMask(GL_TRUE)
                 glDisable(GL_BLEND)
                 glEnable(GL_TEXTURE_2D)

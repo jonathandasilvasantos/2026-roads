@@ -265,10 +265,22 @@ def build_object(obj_name, seed, cache):
             glEnable(GL_TEXTURE_2D)
             glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
             amb = ctx["amb"]
-            glColor3f(min(1.0, amb[0]), min(1.0, amb[1]), min(1.0, amb[2]))
+            storm_i = ctx.get("storm", 0.0)
+            wet = 1.0 - 0.18 * storm_i
+            glBindTexture(GL_TEXTURE_2D, v["wall_tex"])
+            tint = (min(1.0, amb[0] * wet),
+                    min(1.0, amb[1] * wet),
+                    min(1.0, amb[2] * wet))
+            glColor3f(*tint)
             glCallList(v["body"])
+            # body list no longer restores glColor; reassert tint before
+            # each subsequent list so roof/chimney are also dim at night.
+            glColor3f(*tint)
             glBindTexture(GL_TEXTURE_2D, v["roof_tex"])
             glCallList(v["roof"])
+            if "chimney" in v:
+                glColor3f(*tint)
+                glCallList(v["chimney"])
             if ctx["frost"] > 0.04:
                 glBindTexture(GL_TEXTURE_2D, hc["snow"])
                 glEnable(GL_BLEND)
@@ -287,12 +299,14 @@ def build_object(obj_name, seed, cache):
             if night_a > 0.03:
                 glDisable(GL_TEXTURE_2D)
                 glEnable(GL_BLEND)
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+                glBlendFunc(GL_ONE, GL_ONE)
+                glDepthFunc(GL_LEQUAL)
                 glDepthMask(GL_FALSE)
-                glColor4f(min(1.0, night_a * 1.05),
-                          min(1.0, night_a * 0.88),
-                          min(1.0, night_a * 0.55), 1.0)
+                glColor4f(min(1.0, night_a * 1.10),
+                          min(1.0, night_a * 0.92),
+                          min(1.0, night_a * 0.58), 1.0)
                 glCallList(v["emission"])
+                glDepthFunc(GL_LESS)
                 glDepthMask(GL_TRUE)
                 glDisable(GL_BLEND)
                 glEnable(GL_TEXTURE_2D)
