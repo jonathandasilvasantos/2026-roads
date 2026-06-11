@@ -234,6 +234,73 @@ research as the design criterion. Per-cycle snapshots live under
   - Taillight rear glow (red ellipses, 0.25 × night_a intensity).
   - Wet-road body reflection under the vehicle when `storm > 0.15`.
 
+### Traffic behaviour (light branch — plan.txt Phase 1)
+- **IDM car-following** (Treiber-Hennecke-Helbing 2000): every vehicle
+  accelerates/brakes toward a personal desired speed while holding a
+  speed-dependent safe gap to its leader. Cars and trucks share one
+  physics pass (`update_traffic`) so leader search spans both pools —
+  platooning and slowdown waves emerge at rush-hour density.
+- **Driver personalities**: 20% aggressive / 60% normal / 20% calm,
+  rolled per spawn with jitter — scales desired speed, time headway,
+  acceleration, braking comfort and lane-change eagerness.
+- **Two sub-lanes per direction + MOBIL lane changes**: an outer
+  cruising lane and inner overtaking lane; changes need an incentive
+  (gain vs. eagerness threshold) and a safety check (new follower never
+  forced past 2.5 m/s²), animated over ~2.8 s with a steering tilt.
+  Keep-right discipline returns vehicles to the outer lane when free.
+- **Mixed-pace same-direction traffic**: desired speeds straddle the
+  player's cruise speed — faster drivers spawn behind and overtake,
+  slower ones spawn ahead and get reeled in (no more "every car outruns
+  the camera" treadmill).
+- **Condition coupling**: desired speed scales with the São Paulo
+  congestion curve and drops in rain (−22%), frost (−32%) and at night
+  (−7%); headways stretch +40% on a wet road.
+- **Brake lights**: IDM deceleration past 0.5 m/s² lights and swells the
+  rear lenses — daylight too, so slowing platoons cascade red.
+- **Headlight discipline**: per-driver dusk threshold (lights pop on
+  progressively across the fleet, not all at once) plus a storm
+  threshold for lights-on in heavy rain at midday.
+
+### Road-user & roadside diversity (light branch — plan.txt Phase 2)
+- **Motorcycles** (24 variants: bike + leaning rider, single head/tail
+  lamp): roll into curves by `atan(v²·κ/g)`, and lane-split ("corredor")
+  down the divider when the flow crawls below 15 m/s — falling back
+  into a lane only when a front+rear clear slot exists. Their density
+  over-indexes at the peaks (motofrete hours).
+- **Delivery vans** (24 variants, white-fleet palette) on a commerce-
+  hours density curve (10-16h plateau, near-zero madrugada).
+- **City buses** (12 variants: SPTrans-style white shell + coloured
+  waist stripe, window band, roof AC, lit route board). Buses serve
+  hashed bus-stop slots inside city zones: pull to the curb, dwell 5-10s
+  with a gentle ~0.9 m/s² approach, then merge back out — followers
+  brake or overtake around them. Warm window-strip glow at night.
+- **Emergency unit** (ambulance/police, roof lightbar): dormant most of
+  the time, then launches behind the camera every 1.5-4 minutes and
+  runs the inner lane hot with alternating red/blue strobes while
+  same-direction traffic ahead pulls to the outer lane and slows.
+- **Truck cargo & condition**: new `tanker` style (chrome fuel /
+  painted chemical barrel + hatches), ~60% of semis haul coloured
+  corrugated shipping containers, ~65% of dump trucks run loaded with
+  an earth mound, and every truck carries per-variant grime (cars get a
+  light wash-state version).
+- **Pedestrians**: procedural billboard people (10 variants × skin/
+  shirt/pants/hair palettes) on hashed sidewalk slots in city zones,
+  driven by a street-life hourly curve that peaks 18-22h. The whole
+  crowd raises umbrellas when storm intensity passes 0.3. Idle sway +
+  occasional pairs/trios; night shop-light lift so they never go black.
+- **Wildlife**: bird flocks circle over plain/forest/river biomes with
+  three-axis drift and wing-flap line rendering — lightning startles
+  every flock into a fast burst climb; they roost at night. Deer (at
+  forest edges) and capybara (at the water line, terrain-anchored)
+  appear only in crepuscular windows around dawn and dusk. Moths circle
+  the street-lamp heads at night.
+- **Traffic-physics hardening** (found by the expanded smoke test):
+  spawn clearance and forced merges (yield, bus pull-out, corredor
+  exit) are now closing-speed aware (braking distance, not flat
+  margins); a mid-change vehicle respects the leaders of *both*
+  sub-lanes it straddles; lane-change targets count as occupied from
+  decision time; cut-ins keep an absolute 4 m bumper floor.
+
 ### São Paulo traffic model
 - `TRAFFIC_DENSITY_SP` — 24-hour density table [0..1] calibrated from
   CET-SP bulletins, Metrô 2017 O-D survey, Waze for Cities aggregates.
