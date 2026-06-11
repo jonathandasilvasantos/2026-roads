@@ -173,8 +173,10 @@ TERRAIN_EDGE_D = 0.0   # terrain begins flush with road edge — no seam
 ZONE_LEN = 280.0
 TRANS_LEN = 95.0       # long smoothstep between zones so biomes shift gently
 (BIOME_PLAIN, BIOME_HILL, BIOME_MOUNTAIN, BIOME_RIVER,
- BIOME_FOREST, BIOME_FROST, BIOME_CITY) = 0, 1, 2, 3, 4, 5, 6
-BIOME_COUNT = 7
+ BIOME_FOREST, BIOME_FROST, BIOME_CITY,
+ BIOME_FARM, BIOME_WETLAND, BIOME_CERRADO,
+ BIOME_INDUSTRIAL) = range(11)
+BIOME_COUNT = 11
 
 BIOME_COLOR = np.array([
     [0.46, 0.70, 0.26],   # plain grass
@@ -184,6 +186,10 @@ BIOME_COLOR = np.array([
     [0.20, 0.36, 0.14],   # forest floor (dark undergrowth)
     [0.88, 0.92, 1.00],   # frost (snow field, cold blue-white)
     [0.30, 0.30, 0.33],   # city (concrete/asphalt near-ground)
+    [0.56, 0.52, 0.24],   # farmland (straw / ripening crop rows)
+    [0.30, 0.45, 0.31],   # wetland marsh (wet green-gray)
+    [0.60, 0.37, 0.23],   # cerrado (red laterite soil)
+    [0.37, 0.36, 0.35],   # industrial (gravel yard / concrete apron)
 ], dtype=np.float32)
 
 # --- Forest / trees ---
@@ -226,6 +232,46 @@ def curve_y_np(s):
 
 
 # --- Biomes ---
+def _zone_hash(zone_idx, salt=0):
+    """Well-mixed 32-bit zone hash. The raw multiplicative key used
+    previously is nearly SEQUENTIAL mod small divisors (the multiplier
+    is ≡1 mod 12), which made `key % BIOME_COUNT` cycle through biomes
+    in order and locked the two road sides into a fixed offset — so
+    adjacency-dependent biomes could never roll. Proper avalanche
+    mixing (Ellis 2016 'triple32') restores uniform, independent rolls."""
+    h = (zone_idx * 2654435761 + salt) & 0xFFFFFFFF
+    h ^= h >> 16
+    h = (h * 0x7FEB352D) & 0xFFFFFFFF
+    h ^= h >> 15
+    h = (h * 0x846CA68B) & 0xFFFFFFFF
+    h ^= h >> 16
+    return h
+
+
+def _zone_rolls_city(zone_idx):
+    """Raw (pre-rule) biome roll check: does either side of this zone
+    roll city? Used for adjacency rules without recursing into the
+    full biome_at pipeline."""
+    kl = _zone_hash(zone_idx) % BIOME_COUNT
+    kr = _zone_hash(zone_idx, 9277) % BIOME_COUNT
+    return kl == BIOME_CITY or kr == BIOME_CITY
+
+
+def _adjust_new_biome(b, key, zone_idx):
+    if b == BIOME_INDUSTRIAL:
+        if not (_zone_rolls_city(zone_idx - 1)
+                or _zone_rolls_city(zone_idx + 1)):
+            return BIOME_INDUSTRIAL if ((key >> 13) & 1) else BIOME_PLAIN
+    return b
+
+
+# Zone biomes are fully deterministic (hash + zone-anchored season), so
+# memoise them — biome_weights_vec drives >1M biome_at calls per frame
+# across terrain/trees/flowers/scenery, and the seasonal gating added
+# trig to each. Invalidated only if the CLI season offset changes.
+_BIOME_CACHE = {}
+
+
 def biome_at(zone_idx, side):
     """Per-zone biome, with one coherence rule: frost zones are always
     symmetric across the road. If either side would roll frost, both do,
@@ -234,8 +280,18 @@ def biome_at(zone_idx, side):
     biomes still vary per side so you can get mountain on the left and
     plain on the right for scenic variety.
     """
-    key_l = (zone_idx * 2654435761) & 0xFFFFFFFF
-    key_r = (zone_idx * 2654435761 + 9277) & 0xFFFFFFFF
+    ck = (zone_idx, side < 0)
+    cached = _BIOME_CACHE.get(ck)
+    if cached is not None:
+        return cached
+    result = _biome_at_uncached(zone_idx, side)
+    _BIOME_CACHE[ck] = result
+    return result
+
+
+def _biome_at_uncached(zone_idx, side):
+    key_l = _zone_hash(zone_idx)
+    key_r = _zone_hash(zone_idx, 9277)
     bl = key_l % BIOME_COUNT
     br = key_r % BIOME_COUNT
     # Seasonal frost gating, anchored to the ZONE's position on the
@@ -257,6 +313,11 @@ def biome_at(zone_idx, side):
     elif (wint > 0.70 and (bl == BIOME_PLAIN or br == BIOME_PLAIN)
             and ((key_l >> 20) & 0xFF) / 255.0 < (wint - 0.70) * 1.2):
         return BIOME_FROST
+    # Geographic coherence for the phase-4 biomes: industrial parks
+    # cluster near the city, but a lone one survives ~half the time
+    # (they do exist out on the highway).
+    bl = _adjust_new_biome(bl, key_l, zone_idx)
+    br = _adjust_new_biome(br, key_r, zone_idx)
     return bl if side < 0 else br
 
 
@@ -345,7 +406,21 @@ def terrain_heights(s, d, t_time):
              + 0.20 * np.sin(s * 0.19))
     # city: flat paved ground with tiny variation (sidewalks + pavement)
     city = -0.22 + 0.05 * np.sin(s * 0.35 + d * 0.25)
-    return plain, hill, mountain, river, forest, frost, city
+    # farmland: flat fields with a fine perpendicular crop-row ripple
+    farm = (-0.26 + 0.12 * np.sin(d * 1.6)
+            + 0.05 * np.sin(s * 0.05))
+    # wetland: low waterlogged marsh, soft hummocks
+    wetland = (-0.55 + 0.15 * np.sin(s * 0.13 + d * 0.21)
+               + 0.10 * np.sin(d * 0.5 + s * 0.02))
+    # cerrado: gently rolling red-soil savanna
+    cerrado = (-0.25
+               + 0.9 * np.sin(s * 0.045 + d * 0.06)
+                 * np.clip(d / 50.0, 0.0, 1.0)
+               + 0.25 * np.sin(s * 0.16 + d * 0.30))
+    # industrial: graded flat yards
+    industrial = -0.24 + 0.04 * np.sin(s * 0.30 + d * 0.20)
+    return (plain, hill, mountain, river, forest, frost, city,
+            farm, wetland, cerrado, industrial)
 
 
 # --- Day/Night model ---
@@ -3015,11 +3090,10 @@ def build_side_arrays(s_arr, s_car, side, t_time, amb_rgb):
     weights = biome_weights_vec(s_arr, side)
     s2 = s_arr[:, None]
     d2 = d[None, :]
-    plain, hill, mnt, river, forest, frost, city = terrain_heights(s2, d2, t_time)
-    off = (weights[:, 0:1] * plain + weights[:, 1:2] * hill
-           + weights[:, 2:3] * mnt + weights[:, 3:4] * river
-           + weights[:, 4:5] * forest + weights[:, 5:6] * frost
-           + weights[:, 6:7] * city)
+    hs = terrain_heights(s2, d2, t_time)
+    off = weights[:, 0:1] * hs[0]
+    for j in range(1, BIOME_COUNT):
+        off = off + weights[:, j:j + 1] * hs[j]
     # Seamless shoulder: ramp the biome height offset from 0 at the road
     # edge up to full strength over the first ~3m perpendicular. Eliminates
     # the curb drop at the pavement (each biome profile naturally sits a bit
@@ -3225,6 +3299,131 @@ def _draw_bridges(s_arr, bridge_w, base_col, frost_i, s_car):
         _emit_strip_segments(s_arr, bridge_w, 0.25, emit)
 
 
+# --- Road surface zones (Phase 4.1) ---------------------------------------
+# The pavement itself varies along the route: fresh asphalt (default),
+# sun-bleached old asphalt (lighter, cracked, potholed, patched) and
+# concrete sections (much lighter, transverse expansion joints). Zones
+# sit on their own grid, independent of biomes, with short smoothstep
+# transitions — like real resurfacing contracts that end mid-nowhere.
+SURF_ZONE_LEN = 560.0
+SURF_TRANS = 28.0
+SURF_ASPHALT, SURF_OLD, SURF_CONCRETE = 0, 1, 2
+
+
+def surf_type_at_zone(zone_idx):
+    h = _zone_hash(zone_idx, 4242) % 10
+    if h < 5:
+        return SURF_ASPHALT
+    if h < 8:
+        return SURF_OLD
+    return SURF_CONCRETE
+
+
+def surf_weights_at(s):
+    """Blend weights (asphalt, old, concrete) at road position s."""
+    idx = int(s // SURF_ZONE_LEN)
+    pos = s - idx * SURF_ZONE_LEN
+    cur = surf_type_at_zone(idx)
+    w = [0.0, 0.0, 0.0]
+    if pos < SURF_TRANS:
+        prev = surf_type_at_zone(idx - 1)
+        t = pos / SURF_TRANS
+        t = t * t * (3 - 2 * t)
+        w[prev] += 1.0 - t
+        w[cur] += t
+    elif pos > SURF_ZONE_LEN - SURF_TRANS:
+        nxt = surf_type_at_zone(idx + 1)
+        t = (SURF_ZONE_LEN - pos) / SURF_TRANS
+        t = t * t * (3 - 2 * t)
+        w[cur] += t
+        w[nxt] += 1.0 - t
+    else:
+        w[cur] = 1.0
+    return w
+
+
+def _surf_tint(s):
+    """Per-vertex multiplier over the asphalt texture: old asphalt is
+    sun-bleached lighter and warmer, concrete much lighter/cooler."""
+    w = surf_weights_at(s)
+    return (1.0 + 0.14 * w[1] + 0.42 * w[2],
+            1.0 + 0.13 * w[1] + 0.40 * w[2],
+            1.0 + 0.10 * w[1] + 0.34 * w[2])
+
+
+def draw_surface_details(s_car, amb_rgb):
+    """Decal pass over the pavement: transverse expansion joints on
+    concrete sections; potholes and tar patches on old asphalt."""
+    glDisable(GL_TEXTURE_2D)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glDepthMask(GL_FALSE)
+    glEnable(GL_POLYGON_OFFSET_FILL)
+    glPolygonOffset(-1.0, -1.0)
+
+    # Concrete joints: a dark seam across the road every 12 m.
+    s0 = math.ceil(s_car / 12.0) * 12.0
+    glBegin(GL_QUADS)
+    for i in range(int(420.0 / 12.0)):
+        s = s0 + i * 12.0
+        wc = surf_weights_at(s)[SURF_CONCRETE]
+        if wc < 0.5:
+            continue
+        x = curve_x(s)
+        y = curve_y(s) + 0.035
+        z = -(s - s_car)
+        glColor4f(0.04, 0.04, 0.05, 0.45 * wc)
+        glVertex3f(x - ROAD_WIDTH / 2, y, z + 0.05)
+        glVertex3f(x + ROAD_WIDTH / 2, y, z + 0.05)
+        glVertex3f(x + ROAD_WIDTH / 2, y, z - 0.05)
+        glVertex3f(x - ROAD_WIDTH / 2, y, z - 0.05)
+    glEnd()
+
+    # Old-asphalt damage: potholes (dark ellipses) + tar patches
+    # (large slightly-darker rectangles), hash-slotted.
+    s0 = math.ceil(s_car / 16.0) * 16.0
+    for i in range(int(380.0 / 16.0)):
+        s = s0 + i * 16.0
+        wo = surf_weights_at(s)[SURF_OLD]
+        if wo < 0.5:
+            continue
+        key = (int(s * 13) * 2654435761 + 777) & 0xFFFFFFFF
+        if (key & 0xFF) / 255.0 > 0.45:
+            continue
+        lat = (((key >> 8) & 0xFF) / 255.0 - 0.5) * (ROAD_WIDTH - 2.6)
+        x = curve_x(s) + lat
+        y = curve_y(s) + 0.034
+        z = -(s - s_car)
+        if ((key >> 16) & 1) == 0:
+            # pothole — dark ragged ellipse
+            rx = 0.22 + ((key >> 20) & 0x7) / 7.0 * 0.35
+            rz = rx * (1.2 + ((key >> 23) & 0x3) / 3.0 * 0.5)
+            glColor4f(0.05, 0.05, 0.055, 0.62 * wo)
+            glBegin(GL_TRIANGLE_FAN)
+            glVertex3f(x, y, z)
+            for k in range(13):
+                a = 2 * math.pi * k / 12
+                rr = 1.0 + 0.18 * math.sin(a * 3 + key)
+                glVertex3f(x + math.cos(a) * rx * rr, y,
+                           z + math.sin(a) * rz * rr)
+            glEnd()
+        else:
+            # tar patch — fresher black rectangle over the bleach
+            pw = 0.9 + ((key >> 20) & 0x7) / 7.0 * 0.9
+            pl = 1.6 + ((key >> 23) & 0x7) / 7.0 * 1.8
+            glColor4f(0.07, 0.07, 0.08, 0.38 * wo)
+            glBegin(GL_QUADS)
+            glVertex3f(x - pw, y, z + pl)
+            glVertex3f(x + pw, y, z + pl)
+            glVertex3f(x + pw, y, z - pl)
+            glVertex3f(x - pw, y, z - pl)
+            glEnd()
+
+    glDisable(GL_POLYGON_OFFSET_FILL)
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+
+
 def _asphalt_diffuse(amb_rgb, storm_i):
     """Diffuse wet/dry asphalt tint (modulated onto the texture).
 
@@ -3299,7 +3498,6 @@ def draw_road(tex_id, s_car, amb_rgb, storm_i=0.0, horizon_rgb=None):
     glEnable(GL_TEXTURE_2D)
     glBindTexture(GL_TEXTURE_2D, tex_id)
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
-    glColor3f(dr, dg, db)
     glBegin(GL_QUAD_STRIP)
     for i in range(N_SEG + 1):
         s = s_car - NEAR_EXTEND + i * SEG_LEN
@@ -3307,6 +3505,11 @@ def draw_road(tex_id, s_car, amb_rgb, storm_i=0.0, horizon_rgb=None):
         y = curve_y(s)
         z = -(s - s_car)
         v = s * 0.12
+        # Per-vertex surface-zone tint (Phase 4.1): bleached old
+        # asphalt and lighter concrete sections slide by smoothly.
+        tr, tg, tb = _surf_tint(s)
+        glColor3f(min(1.0, dr * tr), min(1.0, dg * tg),
+                  min(1.0, db * tb))
         glTexCoord2f(0.0, v); glVertex3f(x - ROAD_WIDTH / 2, y + 0.03, z)
         glTexCoord2f(1.0, v); glVertex3f(x + ROAD_WIDTH / 2, y + 0.03, z)
     glEnd()
@@ -5049,9 +5252,16 @@ def build_house_variants(wall_textures, roof_textures, n=8):
     return variants
 
 
-def draw_houses(s_car, house_variants, snow_tex, amb_rgb, night_a=0.0):
+def draw_houses(s_car, house_variants, snow_tex, amb_rgb, night_a=0.0,
+                t_day=None, t_time=0.0, cold_smoke=0.0, wind_x=0.0):
     """Instance rural houses across flat-ground biomes, with a per-house
-    roof snow pass scaled by the frost weight at that s."""
+    roof snow pass scaled by the frost weight at that s.
+
+    Phase 4.4 living-structure touches: each house follows a daily
+    window-light schedule (lit through the evening, dark in the small
+    hours, a brief early-riser glow before dawn — jittered per house so
+    the hamlet doesn't switch like one breaker), and chimneys smoke on
+    cold mornings / in frost zones, drifting with the shared wind."""
     s_start = math.floor(s_car / HOUSE_SPACING) * HOUSE_SPACING
     max_s = s_car + N_SEG * SEG_LEN
     n_steps = int((max_s - s_start) / HOUSE_SPACING) + 1
@@ -5139,14 +5349,30 @@ def draw_houses(s_car, house_variants, snow_tex, amb_rgb, night_a=0.0):
             # GL_LEQUAL so equal-Z additive passes actually paint over
             # the just-drawn body (same trick as draw_city).
             if night_a > 0.03 and "emission" in v:
+                # Daily lighting schedule (4.4): on through the evening
+                # (~17:30-23:00 + per-house jitter), porch-only in the
+                # small hours, a brief early-riser window before dawn.
+                sched = 1.0
+                if t_day is not None:
+                    hour = (t_day % 1.0) * 24.0
+                    hx = hour if hour > 12.0 else hour + 24.0
+                    jit = ((key >> 9) & 0xFF) / 255.0
+                    on_eve = 17.2 + jit * 1.6
+                    off_n = 22.3 + jit * 3.0
+                    if on_eve <= hx < off_n:
+                        sched = 1.0
+                    elif 5.0 + jit * 1.2 <= hour < 6.8:
+                        sched = 0.55          # early risers
+                    else:
+                        sched = 0.10          # porch light only
                 glDisable(GL_TEXTURE_2D)
                 glEnable(GL_BLEND)
                 glBlendFunc(GL_ONE, GL_ONE)
                 glDepthFunc(GL_LEQUAL)
                 glDepthMask(GL_FALSE)
-                glColor4f(min(1.0, night_a * 1.10),
-                          min(1.0, night_a * 0.92),
-                          min(1.0, night_a * 0.58),
+                glColor4f(min(1.0, night_a * 1.10 * sched),
+                          min(1.0, night_a * 0.92 * sched),
+                          min(1.0, night_a * 0.58 * sched),
                           1.0)
                 glCallList(v["emission"])
                 glDepthFunc(GL_LESS)
@@ -5156,6 +5382,40 @@ def draw_houses(s_car, house_variants, snow_tex, amb_rgb, night_a=0.0):
                 glColor3f(1.0, 1.0, 1.0)
 
             glPopMatrix()
+
+            # Chimney smoke (4.4): cold mornings and frost zones put a
+            # drifting puff column over ~half the houses.
+            smoke_w = max(cold_smoke, frost_w_here * 0.8)
+            if smoke_w > 0.04 and ((key >> 11) & 0xFF) / 255.0 < 0.55:
+                glDisable(GL_TEXTURE_2D)
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                glDepthMask(GL_FALSE)
+                ox = tx
+                oy = ty + 3.05 * scale
+                oz = tz
+                phase = (key & 0xFF) / 255.0
+                glBegin(GL_QUADS)
+                for k in range(5):
+                    age = (t_time * 0.22 + phase + k / 5.0) % 1.0
+                    pa = (1.0 - age) * 0.34 * smoke_w
+                    if pa < 0.01:
+                        continue
+                    psz = 0.30 + age * 1.5
+                    pxp = ox + wind_x * age * 1.4
+                    pyp = oy + age * 4.2
+                    sm = min(1.0, amb_rgb[0] * 0.9 + 0.25)
+                    glColor4f(sm, sm, sm, pa)
+                    for rot in ((psz, 0.0), (0.0, psz)):
+                        glVertex3f(pxp - rot[0], pyp - psz, oz - rot[1])
+                        glVertex3f(pxp + rot[0], pyp - psz, oz + rot[1])
+                        glVertex3f(pxp + rot[0], pyp + psz, oz + rot[1])
+                        glVertex3f(pxp - rot[0], pyp + psz, oz - rot[1])
+                glEnd()
+                glDepthMask(GL_TRUE)
+                glDisable(GL_BLEND)
+                glEnable(GL_TEXTURE_2D)
+                glColor3f(1.0, 1.0, 1.0)
 
 
 # --- Cityscape biome ---
@@ -8839,6 +9099,846 @@ def draw_lamp_moths(s_car, night_a, t_time):
     glDisable(GL_BLEND)
 
 
+# --- Phase 4: roadside furniture, new-biome scenery, living structures ---
+# Everything places on the same deterministic hash-slot pattern as the
+# trees (same slot → same object, no storage), and bakes geometry into
+# display lists at startup. 3D props render inside a small sun-tracking
+# lighting block (same recipe as the vehicles); flat panels and flora
+# billboards render lighting-off with an ambient glColor tint.
+
+def _prop_light_begin(amb_rgb, sun_dir):
+    # Untextured material props — a stale enabled texture from the
+    # previous draw pass would MODULATE the materials toward black.
+    glDisable(GL_TEXTURE_2D)
+    glEnable(GL_LIGHTING)
+    glEnable(GL_LIGHT0)
+    glEnable(GL_NORMALIZE)
+    glDisable(GL_COLOR_MATERIAL)
+    sx = float(sun_dir[0])
+    sy = max(0.25, float(sun_dir[1]))
+    sz = float(sun_dir[2])
+    glLightfv(GL_LIGHT0, GL_POSITION, (sx, sy, sz, 0.0))
+    glLightfv(GL_LIGHT0, GL_AMBIENT,
+              (amb_rgb[0] * 0.55, amb_rgb[1] * 0.55,
+               amb_rgb[2] * 0.58, 1.0))
+    glLightfv(GL_LIGHT0, GL_DIFFUSE,
+              (min(1.0, amb_rgb[0] * 1.10),
+               min(1.0, amb_rgb[1] * 1.08),
+               min(1.0, amb_rgb[2] * 1.00), 1.0))
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT,
+                   (amb_rgb[0] * 0.35, amb_rgb[1] * 0.35,
+                    amb_rgb[2] * 0.38, 1.0))
+
+
+def _prop_light_end():
+    _car_mat_clear()
+    glDisable(GL_LIGHTING)
+    glDisable(GL_LIGHT0)
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, (0.2, 0.2, 0.2, 1.0))
+
+
+# --- sign / billboard face textures ---------------------------------------
+def make_sign_face(kind, w=96, h=96):
+    """Procedural traffic-sign faces. Blocky shapes only — at roadside
+    distance a pixel-art '80' reads perfectly."""
+    img = np.zeros((h, w, 4), dtype=np.uint8)
+    yy, xx = np.mgrid[0:h, 0:w]
+    cx, cy = w // 2, h // 2
+
+    def fill(mask, col):
+        img[mask, :3] = [int(c * 255) for c in col]
+        img[mask, 3] = 255
+
+    if kind in ('curve_l', 'curve_r'):
+        diamond = (np.abs(xx - cx) + np.abs(yy - cy)) <= 44
+        fill(diamond, (0.95, 0.75, 0.05))
+        border = ((np.abs(xx - cx) + np.abs(yy - cy)) <= 44) \
+            & ((np.abs(xx - cx) + np.abs(yy - cy)) >= 39)
+        fill(border, (0.05, 0.05, 0.05))
+        # bent arrow: vertical shaft + hook toward the curve direction
+        shaft = (np.abs(xx - cx) <= 4) & (yy > 26) & (yy < 58)
+        fill(shaft, (0.05, 0.05, 0.05))
+        dirn = -1 if kind == 'curve_l' else 1
+        hook = (np.abs(yy - 58) <= 4) & ((xx - cx) * dirn >= 0) \
+            & ((xx - cx) * dirn <= 18)
+        fill(hook, (0.05, 0.05, 0.05))
+        tipx = cx + dirn * 18
+        tip = (np.abs(xx - tipx) <= 7 - (yy - 58).clip(0, 7)) \
+            & (yy >= 58) & (yy <= 70)
+        fill(tip, (0.05, 0.05, 0.05))
+    elif kind == 'speed':
+        disc = (xx - cx) ** 2 + (yy - cy) ** 2 <= 44 ** 2
+        fill(disc, (0.95, 0.95, 0.95))
+        ring = (((xx - cx) ** 2 + (yy - cy) ** 2 <= 44 ** 2)
+                & ((xx - cx) ** 2 + (yy - cy) ** 2 >= 35 ** 2))
+        fill(ring, (0.80, 0.08, 0.08))
+        # blocky "80"
+        for dx0, hole_split in ((-20, True), (4, False)):
+            gx0, gx1 = cx + dx0, cx + dx0 + 16
+            digit = (xx >= gx0) & (xx < gx1) & (yy >= cy - 18) & (yy < cy + 18)
+            fill(digit, (0.05, 0.05, 0.05))
+            hole = (xx >= gx0 + 4) & (xx < gx1 - 4)
+            if hole_split:   # "8": two holes
+                fill(hole & (yy >= cy - 13) & (yy < cy - 3),
+                     (0.95, 0.95, 0.95))
+                fill(hole & (yy >= cy + 3) & (yy < cy + 13),
+                     (0.95, 0.95, 0.95))
+            else:            # "0": one hole
+                fill(hole & (yy >= cy - 13) & (yy < cy + 13),
+                     (0.95, 0.95, 0.95))
+    elif kind == 'city':
+        panel = (xx >= 4) & (xx < w - 4) & (yy >= 26) & (yy < h - 26)
+        fill(panel, (0.05, 0.35, 0.16))
+        edge = panel & ((xx < 8) | (xx >= w - 8) | (yy < 30) | (yy >= h - 30))
+        fill(edge, (0.92, 0.92, 0.92))
+        # fake name: white text bars
+        fill((xx >= 14) & (xx < 62) & (yy >= 52) & (yy < 60),
+             (0.95, 0.95, 0.95))
+        fill((xx >= 14) & (xx < 46) & (yy >= 38) & (yy < 44),
+             (0.95, 0.95, 0.95))
+    return img
+
+
+def make_ad_texture(seed, w=128, h=64):
+    """Fake billboard creative: saturated background, headline bars,
+    accent disc. Reads as 'an ad' without being one."""
+    rng = np.random.default_rng(seed)
+    pal = [(0.85, 0.20, 0.15), (0.15, 0.35, 0.75), (0.95, 0.65, 0.10),
+           (0.20, 0.60, 0.35), (0.55, 0.15, 0.55), (0.92, 0.92, 0.90)]
+    bg = pal[int(rng.integers(0, len(pal)))]
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    img[:, :] = [int(c * 255) for c in bg]
+    fg = (0.95, 0.95, 0.95) if sum(bg) < 1.8 else (0.10, 0.10, 0.12)
+    yy, xx = np.mgrid[0:h, 0:w]
+    y0 = int(rng.integers(34, 44))
+    img[(yy >= y0) & (yy < y0 + 7) & (xx >= 10) & (xx < 78), :] = \
+        [int(c * 255) for c in fg]
+    img[(yy >= y0 - 12) & (yy < y0 - 6) & (xx >= 10) & (xx < 56), :] = \
+        [int(c * 255) for c in fg]
+    ax, ay = int(rng.integers(92, 112)), int(rng.integers(20, 40))
+    acc = pal[int(rng.integers(0, len(pal)))]
+    disc = (xx - ax) ** 2 + (yy - ay) ** 2 <= 13 ** 2
+    img[disc, :] = [int(c * 255) for c in acc]
+    return img
+
+
+def make_reed_texture(seed, w=64, h=128):
+    rng = np.random.default_rng(seed)
+    img = np.zeros((h, w, 4), dtype=np.uint8)
+    for _ in range(14):
+        x0 = int(rng.integers(6, w - 6))
+        lean = float(rng.uniform(-0.12, 0.12))
+        hgt = int(rng.integers(int(h * 0.55), h - 4))
+        g = float(rng.uniform(0.35, 0.55))
+        col = [int(255 * c) for c in (0.24, g, 0.20)]
+        for y in range(hgt):
+            x = int(x0 + lean * y)
+            if 0 <= x < w - 1:
+                img[y, x:x + 2, :3] = col
+                img[y, x:x + 2, 3] = 255
+        # seed head
+        if rng.random() < 0.6:
+            x = int(x0 + lean * hgt)
+            img[max(0, hgt - 10):hgt + 4, max(0, x - 2):x + 3, :3] = \
+                [120, 90, 50]
+            img[max(0, hgt - 10):hgt + 4, max(0, x - 2):x + 3, 3] = 255
+    return img
+
+
+def make_scrub_texture(seed, w=64, h=64):
+    rng = np.random.default_rng(seed)
+    img = np.zeros((h, w, 4), dtype=np.uint8)
+    yy, xx = np.mgrid[0:h, 0:w]
+    for _ in range(8):
+        bx = int(rng.integers(14, w - 14))
+        by = int(rng.integers(14, 44))
+        r = int(rng.integers(7, 13))
+        blob = (xx - bx) ** 2 + (yy - by) ** 2 <= r * r
+        g = float(rng.uniform(0.30, 0.45))
+        img[blob, :3] = [int(255 * c) for c in (0.30, g, 0.16)]
+        img[blob, 3] = 255
+    # twiggy trunk
+    img[0:18, w // 2 - 1:w // 2 + 1, :3] = [70, 50, 35]
+    img[0:18, w // 2 - 1:w // 2 + 1, 3] = 255
+    return img
+
+
+def build_phase4_props():
+    """Bake every Phase-4 prop into display lists. Returns a dict."""
+    P = {}
+    # Sign pole (no baked colour — outer glColor tints it).
+    lid = glGenLists(1)
+    glNewList(lid, GL_COMPILE)
+    _truck_draw_box(-0.05, 0.05, 0.0, 2.45, -0.05, 0.05)
+    glEndList()
+    P['pole'] = lid
+    # Sign panels: textured quads, double-sided, no baked colour.
+    for kind in ('curve_l', 'curve_r', 'speed', 'city'):
+        tex = upload_texture(make_sign_face(kind),
+                             internal=GL_RGBA, src=GL_RGBA)
+        lid = glGenLists(1)
+        glNewList(lid, GL_COMPILE)
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, tex)
+        glEnable(GL_ALPHA_TEST)
+        glAlphaFunc(GL_GREATER, 0.4)
+        hw = 0.55 if kind != 'city' else 0.95
+        glBegin(GL_QUADS)
+        glTexCoord2f(0, 0); glVertex3f(-hw, 2.45, 0.0)
+        glTexCoord2f(1, 0); glVertex3f(hw, 2.45, 0.0)
+        glTexCoord2f(1, 1); glVertex3f(hw, 2.45 + 2 * hw, 0.0)
+        glTexCoord2f(0, 1); glVertex3f(-hw, 2.45 + 2 * hw, 0.0)
+        glEnd()
+        glDisable(GL_ALPHA_TEST)
+        glDisable(GL_TEXTURE_2D)
+        glEndList()
+        P['panel_' + kind] = lid
+    # km marker: little white post with a green cap band.
+    lid = glGenLists(1)
+    glNewList(lid, GL_COMPILE)
+    glColor3f(0.92, 0.92, 0.92)
+    _truck_draw_box(-0.07, 0.07, 0.0, 1.0, -0.07, 0.07)
+    glColor3f(0.05, 0.40, 0.18)
+    _truck_draw_box(-0.075, 0.075, 0.78, 1.0, -0.075, 0.075)
+    glEndList()
+    P['km'] = lid
+    # Billboard frame (no colour) + ad panels.
+    lid = glGenLists(1)
+    glNewList(lid, GL_COMPILE)
+    for px in (-2.6, 2.6):
+        _truck_draw_box(px - 0.10, px + 0.10, 0.0, 4.4, -0.10, 0.10)
+    _truck_draw_box(-3.4, 3.4, 4.2, 4.36, -0.12, 0.12)
+    _truck_draw_box(-3.4, 3.4, 7.55, 7.70, -0.12, 0.12)
+    glEndList()
+    P['bb_frame'] = lid
+    P['bb_panels'] = []
+    for i in range(5):
+        tex = upload_texture(make_ad_texture(8800 + i))
+        lid = glGenLists(1)
+        glNewList(lid, GL_COMPILE)
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, tex)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0, 0); glVertex3f(-3.4, 4.36, 0.0)
+        glTexCoord2f(1, 0); glVertex3f(3.4, 4.36, 0.0)
+        glTexCoord2f(1, 1); glVertex3f(3.4, 7.55, 0.0)
+        glTexCoord2f(0, 1); glVertex3f(-3.4, 7.55, 0.0)
+        glEnd()
+        glDisable(GL_TEXTURE_2D)
+        glEndList()
+        P['bb_panels'].append(lid)
+    # Bus shelter (no colour: frame + roof + bench; glass omitted).
+    lid = glGenLists(1)
+    glNewList(lid, GL_COMPILE)
+    for px in (-1.7, 1.7):
+        _truck_draw_box(px - 0.06, px + 0.06, 0.0, 2.3, -0.05, 0.05)
+        _truck_draw_box(px - 0.06, px + 0.06, 0.0, 2.3, 0.95, 1.05)
+    _truck_draw_box(-1.9, 1.9, 2.3, 2.42, -0.25, 1.25)   # roof
+    _truck_draw_box(-1.8, 1.8, 0.0, 1.3, 1.02, 1.08)     # back wall
+    _truck_draw_box(-1.5, 1.5, 0.48, 0.56, 0.55, 0.95)   # bench
+    glEndList()
+    P['shelter'] = lid
+
+    # --- lit 3D props (materials + lighting) ---
+    def _mat(col, shine=18.0, spec=0.15):
+        _car_mat((col[0] * 0.5, col[1] * 0.5, col[2] * 0.5), col,
+                 (spec, spec, spec), shine)
+
+    # Barns ×2
+    for i, body_col in enumerate(((0.62, 0.16, 0.12), (0.55, 0.38, 0.22))):
+        lid = glGenLists(1)
+        glNewList(lid, GL_COMPILE)
+        _mat(body_col)
+        _truck_draw_box(-4.0, 4.0, 0.0, 3.2, -2.6, 2.6)
+        _mat((0.90, 0.90, 0.88))
+        _truck_draw_box(-4.05, 4.05, 0.0, 0.35, -2.65, 2.65)  # plinth
+        _truck_draw_box(-0.8, 0.8, 0.0, 2.4, 2.55, 2.66)      # door trim
+        _mat((0.45, 0.44, 0.42), shine=8.0)
+        # gable roof: two slabs
+        glBegin(GL_QUADS)
+        glNormal3f(0, 0.8, 0.6)
+        glVertex3f(-4.3, 3.1, 2.9); glVertex3f(4.3, 3.1, 2.9)
+        glVertex3f(4.3, 4.6, 0.0); glVertex3f(-4.3, 4.6, 0.0)
+        glNormal3f(0, 0.8, -0.6)
+        glVertex3f(-4.3, 4.6, 0.0); glVertex3f(4.3, 4.6, 0.0)
+        glVertex3f(4.3, 3.1, -2.9); glVertex3f(-4.3, 3.1, -2.9)
+        glEnd()
+        glEndList()
+        P['barn%d' % i] = lid
+    # Hay bale (cylinder on its side)
+    lid = glGenLists(1)
+    glNewList(lid, GL_COMPILE)
+    _mat((0.78, 0.66, 0.30), shine=4.0)
+    q = gluNewQuadric()
+    gluQuadricNormals(q, GLU_SMOOTH)
+    glPushMatrix()
+    glTranslatef(-0.6, 0.75, 0.0)
+    glRotatef(90, 0, 1, 0)
+    gluCylinder(q, 0.75, 0.75, 1.2, 14, 1)
+    gluDisk(q, 0, 0.75, 12, 1)
+    glTranslatef(0, 0, 1.2)
+    gluDisk(q, 0, 0.75, 12, 1)
+    glPopMatrix()
+    gluDeleteQuadric(q)
+    glEndList()
+    P['hay'] = lid
+    # Termite mound (squat cone)
+    lid = glGenLists(1)
+    glNewList(lid, GL_COMPILE)
+    _mat((0.52, 0.30, 0.18), shine=4.0)
+    q = gluNewQuadric()
+    gluQuadricNormals(q, GLU_SMOOTH)
+    glPushMatrix()
+    glRotatef(-90, 1, 0, 0)
+    gluCylinder(q, 0.65, 0.06, 1.5, 10, 2)
+    glPopMatrix()
+    gluDeleteQuadric(q)
+    glEndList()
+    P['mound'] = lid
+    # Warehouses ×2
+    for i, wcol in enumerate(((0.55, 0.57, 0.60), (0.62, 0.58, 0.50))):
+        lid = glGenLists(1)
+        glNewList(lid, GL_COMPILE)
+        _mat(wcol, shine=30.0, spec=0.35)
+        _truck_draw_box(-9.0, 9.0, 0.0, 5.2, -5.5, 5.5)
+        _mat((wcol[0] * 0.6, wcol[1] * 0.6, wcol[2] * 0.6))
+        _truck_draw_box(-9.1, 9.1, 5.0, 5.45, -5.6, 5.6)      # roof cap
+        _mat((0.18, 0.20, 0.24))
+        for dx in (-5.0, 0.0, 5.0):
+            _truck_draw_box(dx - 1.6, dx + 1.6, 0.0, 3.6, 5.45, 5.58)
+        glEndList()
+        P['warehouse%d' % i] = lid
+    # Smokestack
+    lid = glGenLists(1)
+    glNewList(lid, GL_COMPILE)
+    _mat((0.58, 0.42, 0.36))
+    q = gluNewQuadric()
+    gluQuadricNormals(q, GLU_SMOOTH)
+    glPushMatrix()
+    glRotatef(-90, 1, 0, 0)
+    gluCylinder(q, 1.0, 0.62, 16.0, 12, 2)
+    glPopMatrix()
+    gluDeleteQuadric(q)
+    _mat((0.85, 0.20, 0.15))
+    _truck_draw_box(-0.7, 0.7, 14.6, 15.3, -0.7, 0.7)
+    glEndList()
+    P['stack'] = lid
+    # Storage tank
+    lid = glGenLists(1)
+    glNewList(lid, GL_COMPILE)
+    _mat((0.85, 0.86, 0.88), shine=50.0, spec=0.5)
+    q = gluNewQuadric()
+    gluQuadricNormals(q, GLU_SMOOTH)
+    glPushMatrix()
+    glRotatef(-90, 1, 0, 0)
+    gluCylinder(q, 3.2, 3.2, 4.5, 16, 1)
+    glTranslatef(0, 0, 4.5)
+    gluDisk(q, 0, 3.2, 16, 1)
+    glPopMatrix()
+    gluDeleteQuadric(q)
+    glEndList()
+    P['tank'] = lid
+    # Wind turbine: tower + nacelle, blades separate (spun at draw).
+    lid = glGenLists(1)
+    glNewList(lid, GL_COMPILE)
+    _mat((0.92, 0.93, 0.95), shine=40.0, spec=0.4)
+    q = gluNewQuadric()
+    gluQuadricNormals(q, GLU_SMOOTH)
+    glPushMatrix()
+    glRotatef(-90, 1, 0, 0)
+    gluCylinder(q, 0.85, 0.45, 22.0, 12, 2)
+    glPopMatrix()
+    gluDeleteQuadric(q)
+    _truck_draw_box(-1.5, 1.5, 21.6, 23.0, -0.8, 0.8)
+    glEndList()
+    P['turbine_tower'] = lid
+    lid = glGenLists(1)
+    glNewList(lid, GL_COMPILE)
+    _mat((0.95, 0.95, 0.97), shine=40.0, spec=0.4)
+    for k in range(3):
+        glPushMatrix()
+        glRotatef(120.0 * k, 0, 0, 1)
+        _truck_draw_box(-0.35, 0.35, 0.0, 9.5, -0.10, 0.10)
+        glPopMatrix()
+    glEndList()
+    P['turbine_blades'] = lid
+    # Flora billboards
+    tex = upload_texture(make_reed_texture(3311),
+                         internal=GL_RGBA, src=GL_RGBA)
+    P['reed'] = _build_billboard_list(tex, aspect=0.5)
+    tex = upload_texture(make_scrub_texture(3322),
+                         internal=GL_RGBA, src=GL_RGBA)
+    P['scrub'] = _build_billboard_list(tex, aspect=1.0)
+    return P
+
+
+def _ground_y(s, side, d, w_b, t_time):
+    hs = terrain_heights(float(s), float(d), t_time)
+    return curve_y(s) + sum(float(w_b[j]) * float(hs[j])
+                            for j in range(BIOME_COUNT))
+
+
+def draw_guardrails(s_car, amb_rgb):
+    """Steel W-beam barriers where the terrain actually drops away:
+    mountain ledges and river banks."""
+    NS = 90
+    s_arr = (np.arange(NS, dtype=np.float32) * 4.0) + s_car
+    wL = biome_weights_vec(s_arr, -1)
+    wR = biome_weights_vec(s_arr, +1)
+    glDisable(GL_TEXTURE_2D)
+    rail = (min(1.0, amb_rgb[0] * 0.80), min(1.0, amb_rgb[1] * 0.82),
+            min(1.0, amb_rgb[2] * 0.86))
+    post = (amb_rgb[0] * 0.35, amb_rgb[1] * 0.35, amb_rgb[2] * 0.38)
+    for side, w in ((-1, wL), (+1, wR)):
+        drop = w[:, BIOME_MOUNTAIN] + w[:, BIOME_RIVER]
+
+        def emit(i, alpha, side=side):
+            s = float(s_arr[i])
+            x = curve_x(s) + side * (ROAD_WIDTH / 2 + 0.45)
+            y = curve_y(s)
+            z = -(s - s_car)
+            glColor4f(rail[0], rail[1], rail[2], alpha)
+            glVertex3f(x, y + 0.50, z)
+            glVertex3f(x, y + 0.78, z)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        _emit_strip_segments(s_arr, drop, 0.45, emit)
+        glDisable(GL_BLEND)
+        # posts every other sample
+        glColor3f(*post)
+        glBegin(GL_QUADS)
+        for i in range(0, NS, 2):
+            if float(drop[i]) < 0.45:
+                continue
+            s = float(s_arr[i])
+            x = curve_x(s) + side * (ROAD_WIDTH / 2 + 0.45)
+            y = curve_y(s)
+            z = -(s - s_car)
+            glVertex3f(x - 0.05, y, z + 0.05)
+            glVertex3f(x + 0.05, y, z - 0.05)
+            glVertex3f(x + 0.05, y + 0.52, z - 0.05)
+            glVertex3f(x - 0.05, y + 0.52, z + 0.05)
+        glEnd()
+
+
+def _road_yaw_deg(s):
+    ds = 1.0
+    dxds = (curve_x(s + ds) - curve_x(s - ds)) / (2.0 * ds)
+    return math.degrees(math.atan2(1.0, dxds))
+
+
+def _curvature_at(s):
+    return abs(curve_x(s + 8.0) - 2.0 * curve_x(s) + curve_x(s - 8.0)) / 64.0
+
+
+def draw_road_signs(s_car, P, amb_rgb, night_a):
+    """Hash-slot signage that MEANS something: curve warnings stand
+    before genuinely sharp bends (sampled from the actual path), speed
+    limits on a sparse grid, city-name boards at city-zone entries, km
+    marker posts on a fixed grid. Panels are retroreflective: they
+    flare up at night as the camera (headlights) gets close."""
+    pole_col = (amb_rgb[0] * 0.55, amb_rgb[1] * 0.55, amb_rgb[2] * 0.58)
+    s0 = math.ceil((s_car + 20.0) / 50.0) * 50.0
+    for i in range(8):
+        s = s0 + i * 50.0
+        d = s - s_car
+        panel = None
+        # Curve warning: sharp bend 70-150 m past the sign, calm here.
+        k_ahead = max(_curvature_at(s + 80.0), _curvature_at(s + 120.0))
+        if k_ahead > 0.0019 and _curvature_at(s + 15.0) < 0.0012:
+            bend = (curve_x(s + 110.0) - 2.0 * curve_x(s + 100.0)
+                    + curve_x(s + 90.0))
+            panel = 'panel_curve_r' if bend > 0 else 'panel_curve_l'
+        else:
+            key = (int(s // 50.0) * 2654435761 + 31) & 0xFFFFFFFF
+            if (key & 0xFF) / 255.0 < 0.055:
+                panel = 'panel_speed'
+            elif (city_weight_at(s + 150.0, +1) > 0.6
+                    and city_weight_at(s + 20.0, +1) < 0.25):
+                panel = 'panel_city'
+        if panel is None:
+            continue
+        x = curve_x(s) + (ROAD_WIDTH / 2 + 1.3)
+        y = curve_y(s)
+        z = -d
+        retro = night_a * max(0.0, min(1.0, (90.0 - d) / 70.0))
+        glPushMatrix()
+        glTranslatef(x, y, z)
+        glRotatef(_road_yaw_deg(s) + 90.0, 0, 1, 0)
+        glColor3f(*pole_col)
+        glCallList(P['pole'])
+        glColor3f(min(1.0, amb_rgb[0] * (1.0 + 1.8 * retro)),
+                  min(1.0, amb_rgb[1] * (1.0 + 1.8 * retro)),
+                  min(1.0, amb_rgb[2] * (1.0 + 1.6 * retro)))
+        glCallList(P[panel])
+        glPopMatrix()
+    # km markers every 500 m.
+    s_km = math.ceil(s_car / 500.0) * 500.0
+    if s_km - s_car < 400.0:
+        x = curve_x(s_km) + (ROAD_WIDTH / 2 + 1.0)
+        glPushMatrix()
+        glTranslatef(x, curve_y(s_km), -(s_km - s_car))
+        glRotatef(_road_yaw_deg(s_km) + 90.0, 0, 1, 0)
+        glColor3f(min(1.0, amb_rgb[0]), min(1.0, amb_rgb[1]),
+                  min(1.0, amb_rgb[2]))
+        glCallList(P['km'])
+        glPopMatrix()
+
+
+def draw_power_lines(s_car, amb_rgb):
+    """Wooden poles + sagging catenary wires along rural stretches."""
+    POLE_STEP = 60.0
+    s0 = math.ceil(s_car / POLE_STEP) * POLE_STEP
+    n = 7
+    pts = []
+    for i in range(n + 1):
+        s = s0 + i * POLE_STEP
+        w = biome_weights_vec(np.array([s], dtype=np.float32), -1)[0]
+        rural = float(w[BIOME_PLAIN] + w[BIOME_FARM] + w[BIOME_CERRADO]
+                      + w[BIOME_HILL])
+        if rural < 0.6:
+            pts.append(None)
+            continue
+        x = curve_x(s) - (ROAD_WIDTH / 2 + 13.0)
+        y = curve_y(s) + float(sum(
+            float(w[j]) * float(terrain_heights(float(s), 13.0, 0.0)[j])
+            for j in range(BIOME_COUNT)))
+        pts.append((x, y, -(s - s_car)))
+    glDisable(GL_TEXTURE_2D)
+    pole_c = (amb_rgb[0] * 0.30, amb_rgb[1] * 0.26, amb_rgb[2] * 0.22)
+    glColor3f(*pole_c)
+    glBegin(GL_QUADS)
+    for p in pts:
+        if p is None:
+            continue
+        x, y, z = p
+        glVertex3f(x - 0.09, y, z + 0.09)
+        glVertex3f(x + 0.09, y, z - 0.09)
+        glVertex3f(x + 0.09, y + 8.8, z - 0.09)
+        glVertex3f(x - 0.09, y + 8.8, z + 0.09)
+        # crossarm
+        glVertex3f(x - 1.0, y + 8.2, z - 0.06)
+        glVertex3f(x + 1.0, y + 8.2, z - 0.06)
+        glVertex3f(x + 1.0, y + 8.45, z + 0.06)
+        glVertex3f(x - 1.0, y + 8.45, z + 0.06)
+    glEnd()
+    # catenary wires between consecutive live poles
+    glLineWidth(1.0)
+    glColor3f(amb_rgb[0] * 0.12, amb_rgb[1] * 0.12, amb_rgb[2] * 0.13)
+    glBegin(GL_LINES)
+    for i in range(n):
+        a, b = pts[i], pts[i + 1]
+        if a is None or b is None:
+            continue
+        for wy in (-0.7, 0.7):
+            prev = None
+            for k in range(7):
+                t = k / 6.0
+                px = a[0] + (b[0] - a[0]) * t + wy * 0.0
+                py = (a[1] + (b[1] - a[1]) * t + 8.35
+                      - 1.1 * 4.0 * t * (1.0 - t))
+                pz = a[2] + (b[2] - a[2]) * t
+                cur = (px + wy, py, pz)
+                if prev is not None:
+                    glVertex3f(*prev)
+                    glVertex3f(*cur)
+                prev = cur
+    glEnd()
+
+
+def draw_billboards_shelters(s_car, P, amb_rgb, night_a, t_time):
+    # Billboards on a sparse rural grid.
+    BB_STEP = 450.0
+    s0 = math.ceil(s_car / BB_STEP) * BB_STEP
+    for i in range(2):
+        s = s0 + i * BB_STEP
+        key = (int(s // BB_STEP) * 2654435761 + 555) & 0xFFFFFFFF
+        if (key & 0xFF) / 255.0 > 0.55:
+            continue
+        side = -1 if ((key >> 9) & 1) else +1
+        w = biome_weights_vec(np.array([s], dtype=np.float32), side)[0]
+        if float(w[BIOME_PLAIN] + w[BIOME_HILL] + w[BIOME_FARM]
+                 + w[BIOME_CERRADO]) < 0.55:
+            continue
+        d_off = 16.0 + ((key >> 16) & 0xFF) / 255.0 * 10.0
+        x = curve_x(s) + side * (ROAD_WIDTH / 2 + d_off)
+        y = _ground_y(s, side, d_off, w, t_time)
+        glPushMatrix()
+        glTranslatef(x, y, -(s - s_car))
+        glRotatef(_road_yaw_deg(s) + (90.0 if side < 0 else -90.0),
+                  0, 1, 0)
+        glColor3f(amb_rgb[0] * 0.40, amb_rgb[1] * 0.40, amb_rgb[2] * 0.42)
+        glCallList(P['bb_frame'])
+        # Real billboards are floodlit after dark.
+        lift = 1.0 + 0.55 * night_a
+        glColor3f(min(1.0, amb_rgb[0] * lift),
+                  min(1.0, amb_rgb[1] * lift),
+                  min(1.0, amb_rgb[2] * lift))
+        glCallList(P['bb_panels'][((key >> 20) & 0xFF)
+                                  % len(P['bb_panels'])])
+        glPopMatrix()
+    # Bus shelters at the phase-2 bus-stop slots inside city zones.
+    s0 = math.ceil(s_car / BUS_STOP_SPACING) * BUS_STOP_SPACING
+    for i in range(2):
+        s = s0 + i * BUS_STOP_SPACING
+        for side in (-1, +1):
+            if city_weight_at(s, side) <= 0.5:
+                continue
+            x = curve_x(s) + side * (ROAD_WIDTH / 2 + 1.6)
+            glPushMatrix()
+            glTranslatef(x, curve_y(s) - 0.18, -(s - s_car))
+            glRotatef(_road_yaw_deg(s) + (270.0 if side < 0 else 90.0),
+                      0, 1, 0)
+            glColor3f(amb_rgb[0] * 0.62, amb_rgb[1] * 0.63,
+                      amb_rgb[2] * 0.66)
+            glCallList(P['shelter'])
+            glPopMatrix()
+
+
+OVERPASS_SPACING = 2300.0
+
+
+def draw_overpasses(s_car, concrete_tex, amb_rgb, frost_i):
+    """Rare concrete overpasses spanning the road — the single biggest
+    'this is a real highway' silhouette."""
+    s0 = math.ceil(s_car / OVERPASS_SPACING) * OVERPASS_SPACING
+    s = s0
+    key = (int(s // OVERPASS_SPACING) * 2654435761 + 99) & 0xFFFFFFFF
+    if (key & 0xFF) / 255.0 > 0.60:
+        return
+    d = s - s_car
+    if d > 800.0 or d < -10.0:
+        return
+    base = _structure_tint(amb_rgb, 0.0)
+    x = curve_x(s)
+    y = curve_y(s)
+    z = -d
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, concrete_tex)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glColor3f(*base)
+    span = ROAD_WIDTH / 2 + 9.0
+    glPushMatrix()
+    glTranslatef(x, y, z)
+    glRotatef(_road_yaw_deg(s) - 90.0, 0, 1, 0)
+    # deck + parapets (local x along the deck, z along the road)
+    _truck_draw_box(-span, span, 5.4, 6.3, -3.5, 3.5)
+    _truck_draw_box(-span, span, 6.3, 7.2, -3.6, -3.3)
+    _truck_draw_box(-span, span, 6.3, 7.2, 3.3, 3.6)
+    # abutments clear of the shoulders
+    for ax in (-(ROAD_WIDTH / 2 + 3.4), ROAD_WIDTH / 2 + 3.4):
+        _truck_draw_box(ax - 1.1, ax + 1.1, -0.5, 5.4, -2.8, 2.8)
+    glPopMatrix()
+    glDisable(GL_TEXTURE_2D)
+
+
+def draw_biome_scenery(s_car, P, amb_rgb, sun_d, night_a, t_time,
+                       cold_smoke=0.0):
+    """Per-biome props for the phase-4 zones: barns/hay on farmland,
+    reeds in the wetland, scrub + termite mounds in the cerrado,
+    warehouses/stacks/tanks in industrial zones, wind turbines on open
+    hills. One prop pass with sun-tracked lighting, then a billboard
+    pass for the flora."""
+    STEP = 18.0
+    s0 = math.floor(s_car / STEP) * STEP
+    n = int(360.0 / STEP)
+    slots = []
+    for i in range(n):
+        s = s0 + i * STEP
+        if s < s_car + 4.0:
+            continue
+        for side in (-1, +1):
+            w = biome_weights_vec(np.array([s], dtype=np.float32),
+                                  side)[0]
+            slots.append((s, side, w))
+
+    # --- lit 3D props ---
+    _prop_light_begin(amb_rgb, sun_d)
+    for (s, side, w) in slots:
+        key = (int(s * 5) * 2654435761
+               + (0 if side < 0 else 12347)) & 0xFFFFFFFF
+        r0 = (key & 0xFF) / 255.0
+        if float(w[BIOME_FARM]) > 0.6:
+            if r0 < 0.10:    # barn
+                d_off = 18.0 + ((key >> 8) & 0xFF) / 255.0 * 22.0
+                glPushMatrix()
+                glTranslatef(curve_x(s) + side * (ROAD_WIDTH / 2 + d_off),
+                             _ground_y(s, side, d_off, w, t_time),
+                             -(s - s_car))
+                glRotatef(((key >> 16) & 0xFF) / 255.0 * 360.0, 0, 1, 0)
+                glCallList(P['barn%d' % ((key >> 5) & 1)])
+                glPopMatrix()
+            elif r0 < 0.42:  # hay bales
+                for k in range(1 + ((key >> 10) & 1)):
+                    d_off = 8.0 + (((key >> (8 + k * 6)) & 0x3F) / 63.0) * 24.0
+                    glPushMatrix()
+                    glTranslatef(
+                        curve_x(s) + side * (ROAD_WIDTH / 2 + d_off),
+                        _ground_y(s, side, d_off, w, t_time),
+                        -(s - s_car) + k * 2.2)
+                    glRotatef(((key >> 18) & 0xFF) / 255.0 * 360.0,
+                              0, 1, 0)
+                    glCallList(P['hay'])
+                    glPopMatrix()
+        elif float(w[BIOME_CERRADO]) > 0.6 and r0 < 0.14:
+            d_off = 7.0 + ((key >> 8) & 0xFF) / 255.0 * 22.0
+            glPushMatrix()
+            glTranslatef(curve_x(s) + side * (ROAD_WIDTH / 2 + d_off),
+                         _ground_y(s, side, d_off, w, t_time),
+                         -(s - s_car))
+            sc = 0.7 + ((key >> 20) & 0x7) / 7.0 * 0.8
+            glScalef(sc, sc, sc)
+            glCallList(P['mound'])
+            glPopMatrix()
+        elif float(w[BIOME_INDUSTRIAL]) > 0.6:
+            if r0 < 0.09:     # warehouse
+                d_off = 24.0 + ((key >> 8) & 0xFF) / 255.0 * 18.0
+                glPushMatrix()
+                glTranslatef(curve_x(s) + side * (ROAD_WIDTH / 2 + d_off),
+                             _ground_y(s, side, d_off, w, t_time),
+                             -(s - s_car))
+                glRotatef(_road_yaw_deg(s) - 90.0, 0, 1, 0)
+                glCallList(P['warehouse%d' % ((key >> 5) & 1)])
+                glPopMatrix()
+            elif r0 < 0.13:   # smokestack
+                d_off = 20.0 + ((key >> 8) & 0xFF) / 255.0 * 16.0
+                glPushMatrix()
+                glTranslatef(curve_x(s) + side * (ROAD_WIDTH / 2 + d_off),
+                             _ground_y(s, side, d_off, w, t_time),
+                             -(s - s_car))
+                glCallList(P['stack'])
+                glPopMatrix()
+            elif r0 < 0.19:   # tank pair
+                d_off = 16.0 + ((key >> 8) & 0xFF) / 255.0 * 14.0
+                for k in (0, 1):
+                    glPushMatrix()
+                    glTranslatef(
+                        curve_x(s) + side * (ROAD_WIDTH / 2 + d_off
+                                             + k * 7.5),
+                        _ground_y(s, side, d_off, w, t_time),
+                        -(s - s_car))
+                    glCallList(P['tank'])
+                    glPopMatrix()
+        elif (float(w[BIOME_HILL] + w[BIOME_MOUNTAIN]) > 0.6
+                and r0 < 0.030):
+            # wind turbine on the ridge
+            d_off = 52.0 + ((key >> 8) & 0xFF) / 255.0 * 22.0
+            glPushMatrix()
+            glTranslatef(curve_x(s) + side * (ROAD_WIDTH / 2 + d_off),
+                         _ground_y(s, side, d_off, w, t_time),
+                         -(s - s_car))
+            glRotatef(_road_yaw_deg(s) + (90.0 if side < 0 else -90.0),
+                      0, 1, 0)
+            glCallList(P['turbine_tower'])
+            glTranslatef(0.0, 22.3, 1.0)
+            glRotatef(t_time * 65.0 + (key & 0x3F) * 5.0, 0, 0, 1)
+            glCallList(P['turbine_blades'])
+            glPopMatrix()
+    _prop_light_end()
+
+    # --- flora billboards + industrial smoke (lighting off) ---
+    glEnable(GL_TEXTURE_2D)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glColor3f(min(1.0, amb_rgb[0]), min(1.0, amb_rgb[1]),
+              min(1.0, amb_rgb[2]))
+    for (s, side, w) in slots:
+        key = (int(s * 5) * 2654435761
+               + (0 if side < 0 else 12347) + 401) & 0xFFFFFFFF
+        if float(w[BIOME_WETLAND]) > 0.55 and (key & 0xFF) / 255.0 < 0.85:
+            for k in range(2 + ((key >> 9) & 0x3)):
+                kk = (key * 0x9E3779B1 + k * 0x85EBCA77) & 0xFFFFFFFF
+                d_off = 3.0 + ((kk & 0xFF) / 255.0) * 24.0
+                glPushMatrix()
+                glTranslatef(
+                    curve_x(s) + side * (ROAD_WIDTH / 2 + d_off),
+                    _ground_y(s, side, d_off, w, t_time) - 0.10,
+                    -(s - s_car) + (((kk >> 8) & 0xF) - 7.5) * 1.0)
+                sc = 1.0 + ((kk >> 16) & 0x7) / 7.0 * 0.9
+                glScalef(sc, sc, sc)
+                glCallList(P['reed'])
+                glPopMatrix()
+        elif (float(w[BIOME_CERRADO]) > 0.55
+                and (key & 0xFF) / 255.0 < 0.40):
+            d_off = 5.0 + ((key >> 8) & 0xFF) / 255.0 * 34.0
+            glPushMatrix()
+            glTranslatef(curve_x(s) + side * (ROAD_WIDTH / 2 + d_off),
+                         _ground_y(s, side, d_off, w, t_time) - 0.05,
+                         -(s - s_car))
+            sc = 0.9 + ((key >> 16) & 0x7) / 7.0 * 1.1
+            glScalef(sc, sc, sc)
+            glCallList(P['scrub'])
+            glPopMatrix()
+    glDisable(GL_TEXTURE_2D)
+
+
+# --- Aircraft (Phase 4.4): high-altitude crosser with contrail -------------
+def update_aircraft(plane, dt, rng, s_car):
+    if plane is None:
+        return None
+    plane['u'] += dt
+    if plane['u'] > plane['dur']:
+        return None
+    return plane
+
+
+def spawn_aircraft(rng, s_car):
+    heading = float(rng.uniform(0.0, 2.0 * math.pi))
+    speed = float(rng.uniform(55.0, 80.0))
+    # start well to one side, crossing high over the road ahead
+    s_ref = s_car + float(rng.uniform(150.0, 450.0))
+    cx0 = curve_x(s_ref)
+    return {
+        'x': cx0 - math.cos(heading) * 1400.0,
+        'z': -(s_ref - s_car) - math.sin(heading) * 1400.0,
+        's_ref': s_ref,
+        'alt': float(rng.uniform(230.0, 330.0)),
+        'vx': math.cos(heading) * speed,
+        'vz': math.sin(heading) * speed,
+        'u': 0.0,
+        'dur': float(rng.uniform(40.0, 60.0)),
+    }
+
+
+def draw_aircraft(plane, s_car, night_a, t_time):
+    """Silver dot + fading contrail + blinking strobe at night. The
+    plane lives in camera-relative XZ (it's far enough that parallax
+    against the moving camera is negligible over its life)."""
+    px = plane['x'] + plane['vx'] * plane['u']
+    pz = plane['z'] + plane['vz'] * plane['u']
+    py = plane['alt']
+    glDisable(GL_TEXTURE_2D)
+    glDisable(GL_FOG)
+    glDepthMask(GL_FALSE)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    # contrail: a fading ribbon of the last ~25 s of path
+    glLineWidth(1.6)
+    glBegin(GL_LINE_STRIP)
+    for k in range(12):
+        back = k * 2.2
+        a = max(0.0, 0.40 - k * 0.035) * min(1.0, plane['u'] / 4.0)
+        glColor4f(0.95, 0.96, 1.0, a)
+        glVertex3f(px - plane['vx'] * back, py + 0.0,
+                   pz - plane['vz'] * back)
+    glEnd()
+    # fuselage glint
+    glPointSize(2.5)
+    glBegin(GL_POINTS)
+    glColor4f(0.95, 0.95, 1.0, 0.9)
+    glVertex3f(px, py, pz)
+    glEnd()
+    # anti-collision strobe at night
+    if night_a > 0.2 and math.sin(t_time * 2 * math.pi * 1.2) > 0.82:
+        glPointSize(3.5)
+        glBegin(GL_POINTS)
+        glColor4f(1.0, 0.15, 0.12, 0.95 * night_a)
+        glVertex3f(px, py - 1.0, pz)
+        glEnd()
+    glDisable(GL_BLEND)
+    glDepthMask(GL_TRUE)
+    glEnable(GL_FOG)
+
+
 # ---------------------------------------------------------------------
 # Cinematic post-processing (fixed-function — CPU readback + writeback)
 # ---------------------------------------------------------------------
@@ -9235,6 +10335,11 @@ def main(argv=None):
     ped_lists, ped_umb_lists = build_pedestrian_variants()
     animal_variants = build_animal_variants()
     bird_state = init_birds()
+    # Phase-4 world diversity: signage/billboard/shelter/turbine and
+    # new-biome scenery display lists, plus the aircraft event state.
+    phase4_props = build_phase4_props()
+    aircraft = None
+    aircraft_timer = 45.0
     # Flowers: six colour palettes, each compiled as a crossed-quad
     # billboard display list.
     flower_variants = []
@@ -9346,6 +10451,7 @@ def main(argv=None):
                 ENV['season_off'] = float(args.season) % 1.0
         except ValueError:
             ENV['season_off'] = 0.0
+        _BIOME_CACHE.clear()   # zone biomes depend on the season offset
     sv, stc, sfr, sidx = build_sky_dome()
     sky_state = (sv, stc, sfr, sidx, cloud_tex, stars_tex, overcast_tex)
 
@@ -9521,8 +10627,9 @@ def main(argv=None):
         # mid-morning — strongest over river/plain zones.
         dawn_w = max(0.0, 1.0 - abs(t_day - 0.265) / 0.05)
         low_ground = 0.5 * float(
-            wL_c[BIOME_PLAIN] + wL_c[BIOME_RIVER]
-            + wR_c[BIOME_PLAIN] + wR_c[BIOME_RIVER])
+            wL_c[BIOME_PLAIN] + wL_c[BIOME_RIVER] + wL_c[BIOME_WETLAND]
+            + wR_c[BIOME_PLAIN] + wR_c[BIOME_RIVER]
+            + wR_c[BIOME_WETLAND])
         dawn_fog = dawn_w * low_ground * (1.0 - storm_i)
         # Frost biome, heavy storm and dawn fog all reduce visibility:
         # shrink the fog-end distance so the linear ramp ends sooner.
@@ -9709,6 +10816,18 @@ def main(argv=None):
         if shooting_star is not None:
             draw_shooting_star(shooting_star, cx, cy, cz)
 
+        # Rare high-altitude aircraft (4.4): contrail + strobe.
+        if aircraft is None:
+            aircraft_timer -= dt
+            if aircraft_timer <= 0.0:
+                aircraft_timer = float(bolt_rng.uniform(90.0, 210.0))
+                if storm_i < 0.45:
+                    aircraft = spawn_aircraft(bolt_rng, s_car)
+        else:
+            aircraft = update_aircraft(aircraft, dt, bolt_rng, s_car)
+            if aircraft is not None:
+                draw_aircraft(aircraft, s_car, night_a, t_time)
+
         draw_terrain(terrain_tex, snow_ground_tex, s_car, t_time, amb)
         draw_city(s_car, building_lists, facade_texes, emission_tex,
                   amb, night_a, t_time,
@@ -9731,8 +10850,17 @@ def main(argv=None):
                     t_time, wind_strength)
         # Rural houses: farther than trees, closer than city skyscrapers.
         # Snow accumulates on roofs during frost biome, melts off when
-        # the biome transitions back to plain/forest.
-        draw_houses(s_car, house_variants, snow_ground_tex, amb, night_a)
+        # the biome transitions back to plain/forest. Windows follow a
+        # daily schedule; chimneys smoke on cold mornings (4.4).
+        morning_w = max(0.0, 1.0 - abs(t_day - 0.30) / 0.07)
+        cold_smoke = max(frost_i, ENV['winter'] * morning_w * 0.9)
+        draw_houses(s_car, house_variants, snow_ground_tex, amb, night_a,
+                    t_day=t_day, t_time=t_time, cold_smoke=cold_smoke,
+                    wind_x=wind_x)
+        # New-biome scenery: barns/hay, reeds, scrub + termite mounds,
+        # warehouses/stacks/tanks, wind turbines (4.3).
+        draw_biome_scenery(s_car, phase4_props, amb, sun_d, night_a,
+                           t_time, cold_smoke=cold_smoke)
         # Flowers along the shoulders — same wind as the trees so the
         # whole landscape pulses together when a gust rolls through.
         draw_flowers(s_car, flower_variants, flora_amb, t_time,
@@ -9742,6 +10870,9 @@ def main(argv=None):
         # instantaneous storm), then the snow overlay pass fades in/out
         # with frost biome transitions.
         draw_road(road_tex, s_car, amb, wetness, horizon_rgb=horizon)
+        # Surface-zone decals (4.1): concrete expansion joints, potholes
+        # and tar patches on the bleached old-asphalt sections.
+        draw_surface_details(s_car, amb)
         draw_road_snow_overlay(snow_ground_tex, s_car, amb)
         # Ponds draw *after* the road so any puddle sits on top of the
         # pavement (including its imperfections and snow overlay).
@@ -9752,6 +10883,15 @@ def main(argv=None):
         # so they never collide with trees, buildings, or other structures.
         # Concrete tint wet-darkens off the same wetness memory.
         draw_civil_structures(s_car, concrete_tex, amb, wetness, frost_i)
+        # Roadside furniture (4.2): rare concrete overpasses, guardrails
+        # on drop-offs, meaningful signage, rural power lines, billboards
+        # and bus shelters at the phase-2 stop slots.
+        draw_overpasses(s_car, concrete_tex, amb, frost_i)
+        draw_guardrails(s_car, amb)
+        draw_road_signs(s_car, phase4_props, amb, night_a)
+        draw_power_lines(s_car, amb)
+        draw_billboards_shelters(s_car, phase4_props, amb, night_a,
+                                 t_time)
         draw_snow_shoulders(snow_ground_tex, s_car, amb)
         draw_lamps(s_car, night_a)
         draw_lamp_moths(s_car, night_a, t_time)

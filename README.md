@@ -336,6 +336,41 @@ research as the design criterion. Per-cycle snapshots live under
   accelerate with a front instead of jumping), the ambient wind audio
   layer, and lateral buffeting on trucks/buses/vans/motorcycles.
 
+### World & roadside diversity (light branch — plan.txt Phase 4)
+- **Road surface zones**: the pavement varies on its own 560 m grid —
+  fresh asphalt, sun-bleached old asphalt (lighter per-vertex tint plus
+  pothole and tar-patch decals) and concrete sections (much lighter,
+  dark transverse expansion joints every 12 m) with smoothstep
+  transitions. (Lane-count variation was deferred: it would re-architect
+  the sub-lane traffic geometry for mostly-visual payoff.)
+- **Roadside furniture** (hash-slot deterministic, like the trees):
+  steel guardrails exactly where the terrain drops away (mountain
+  ledges, river banks); traffic signs that *mean something* — curve
+  warnings placed by sampling the actual path curvature 80-120 m ahead
+  (left/right arrow matches the bend), sparse speed limits, city-name
+  boards at city-zone entries — all retroreflective, flaring up at
+  night as the camera closes; km marker posts; wooden power poles with
+  sagging catenary wires along rural stretches; floodlit billboards
+  with procedural ads; bus shelters at the phase-2 bus-stop slots; and
+  rare concrete overpasses spanning the road — the big highway
+  silhouette.
+- **Four new biomes** (zone system extended 7 → 11, with a properly
+  avalanche-mixed zone hash — the old multiplicative key was nearly
+  sequential mod small divisors, which locked biome ordering): farmland
+  (crop-row ripple, barns, hay bales), wetland marsh (reed beds, joins
+  the dawn-fog system), cerrado (red laterite soil, scrub, termite
+  mounds) and industrial outskirts (warehouses, smokestacks, tank
+  farms; clusters near city). Wind turbines spin on open hill/mountain
+  ridges.
+- **Living structures**: house windows follow a daily schedule (lit
+  through the evening, porch-only in the small hours, an early-riser
+  glow before dawn — jittered per house); chimneys smoke on cold
+  mornings and in frost zones, drifting with the unified wind; rare
+  high-altitude aircraft cross the sky with a fading contrail and a
+  blinking anti-collision strobe at night.
+- Perf: zone-biome rolls are now memoised (`_BIOME_CACHE`) — the
+  terrain/flora/scenery stack issues >1M biome lookups per frame.
+
 ### São Paulo traffic model
 - `TRAFFIC_DENSITY_SP` — 24-hour density table [0..1] calibrated from
   CET-SP bulletins, Metrô 2017 O-D survey, Waze for Cities aggregates.
