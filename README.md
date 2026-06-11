@@ -252,7 +252,7 @@ research as the design criterion. Per-cycle snapshots live under
   player's cruise speed — faster drivers spawn behind and overtake,
   slower ones spawn ahead and get reeled in (no more "every car outruns
   the camera" treadmill).
-- **Condition coupling**: desired speed scales with the São Paulo
+- **Condition coupling**: desired speed scales with the metropolitan
   congestion curve and drops in rain (−22%), frost (−32%) and at night
   (−7%); headways stretch +40% on a wet road.
 - **Brake lights**: IDM deceleration past 0.5 m/s² lights and swells the
@@ -269,7 +269,7 @@ research as the design criterion. Per-cycle snapshots live under
   over-indexes at the peaks (motofrete hours).
 - **Delivery vans** (24 variants, white-fleet palette) on a commerce-
   hours density curve (10-16h plateau, near-zero madrugada).
-- **City buses** (12 variants: SPTrans-style white shell + coloured
+- **City buses** (12 variants: transit-style white shell + coloured
   waist stripe, window band, roof AC, lit route board). Buses serve
   hashed bus-stop slots inside city zones: pull to the curb, dwell 5-10s
   with a gentle ~0.9 m/s² approach, then merge back out — followers
@@ -305,8 +305,8 @@ research as the design criterion. Per-cycle snapshots live under
 - **Weather lifecycle machine**: live weather is now a state machine —
   CLEAR → CLOUDING → OVERCAST → RAIN → CLEARING — with humidity carried
   between events (a rain dumps it, clear air recharges it) and the
-  trigger probability peaking on summer afternoons (SP convective
-  pattern). Storms are events you watch build; precipitation only
+  trigger probability peaking on summer afternoons (tropical
+  convective pattern). Storms are events you watch build; precipitation only
   starts once the level passes the rain onset, so the overcast band
   darkens the sky without raining. ~20% of fronts pass dry.
 - **Wet-road memory**: rain soaks the pavement in seconds; drying takes
@@ -336,16 +336,124 @@ research as the design criterion. Per-cycle snapshots live under
   accelerate with a front instead of jumping), the ambient wind audio
   layer, and lateral buffeting on trucks/buses/vans/motorcycles.
 
-### São Paulo traffic model
-- `TRAFFIC_DENSITY_SP` — 24-hour density table [0..1] calibrated from
-  CET-SP bulletins, Metrô 2017 O-D survey, Waze for Cities aggregates.
+### World & roadside diversity (light branch — plan.txt Phase 4)
+- **Road surface zones**: the pavement varies on its own 560 m grid —
+  fresh asphalt, sun-bleached old asphalt (lighter per-vertex tint plus
+  pothole and tar-patch decals) and concrete sections (much lighter,
+  dark transverse expansion joints every 12 m) with smoothstep
+  transitions. (Lane-count variation was deferred: it would re-architect
+  the sub-lane traffic geometry for mostly-visual payoff.)
+- **Roadside furniture** (hash-slot deterministic, like the trees):
+  steel guardrails exactly where the terrain drops away (mountain
+  ledges, river banks); traffic signs that *mean something* — curve
+  warnings placed by sampling the actual path curvature 80-120 m ahead
+  (left/right arrow matches the bend), sparse speed limits, city-name
+  boards at city-zone entries — all retroreflective, flaring up at
+  night as the camera closes; km marker posts; wooden power poles with
+  sagging catenary wires along rural stretches; floodlit billboards
+  with procedural ads; bus shelters at the phase-2 bus-stop slots; and
+  rare concrete overpasses spanning the road — the big highway
+  silhouette.
+- **Four new biomes** (zone system extended 7 → 11, with a properly
+  avalanche-mixed zone hash — the old multiplicative key was nearly
+  sequential mod small divisors, which locked biome ordering): farmland
+  (crop-row ripple, barns, hay bales), wetland marsh (reed beds, joins
+  the dawn-fog system), cerrado (red laterite soil, scrub, termite
+  mounds) and industrial outskirts (warehouses, smokestacks, tank
+  farms; clusters near city). Wind turbines spin on open hill/mountain
+  ridges.
+- **Living structures**: house windows follow a daily schedule (lit
+  through the evening, porch-only in the small hours, an early-riser
+  glow before dawn — jittered per house); chimneys smoke on cold
+  mornings and in frost zones, drifting with the unified wind; rare
+  high-altitude aircraft cross the sky with a fading contrail and a
+  blinking anti-collision strobe at night.
+- Perf: zone-biome rolls are now memoised (`_BIOME_CACHE`) — the
+  terrain/flora/scenery stack issues >1M biome lookups per frame.
+
+### Traffic audio & event soundscape (light branch — plan.txt Phase 5)
+- **Stereo mixer upgrade**: the ambient mixer now outputs two channels
+  with constant-power panned one-shots and registrable ambience loops
+  (with a varispeed mechanism; thunder rides the same event path as
+  before).
+- **Vehicle pass-bys**: every rendered automobile that crosses the
+  camera plane fires a class-specific whoosh — Doppler baked into the
+  clip (bright→dark spectral glide + ~18% pitch drop on the tonal
+  layer), trucks/buses with a soft sub-harmonic rumble. Volume scales
+  with true closing speed, pans to the vehicle's side, and sizzles
+  ~70% louder on a wet road (the phase-3 wetness memory).
+- **Biome ambience**: dawn birdsong over forest/plain zones, silent in
+  storms, crossfaded by the live biome weights at the camera; the wind
+  layer amplifies into a whistle through mountain zones.
+- **Deliberately serene mix** (user preference): mechanical sounds sit
+  at 4% of natural level (`ARTIFICIAL_SOUND_GAIN`), and the noisier
+  phase-5 prototypes — horns, sirens, engine brakes, the cricket/frog
+  night chorus, the city hum and the motorcycle buzz — were removed
+  outright. The soundscape is automobile whooshes + nature (birds,
+  wind, rain, thunder) + the original engine rumble and ensemble.
+
+### Incidents & emergent events (light branch — plan.txt Phase 6)
+- **Breakdowns**: on a slow clock, a same-direction car or van pulls
+  onto the shoulder, eases fully off the carriageway (it stops
+  counting as a lane occupant only once it's genuinely clear), sits
+  with alternating amber hazard flashers for half a minute or more,
+  then recycles. Passing traffic merges away from it while it still
+  straddles the lane — pure MOBIL. `--event breakdown` forces one.
+- **Roadworks zones** (deterministic hash grid, ~45% of 3.1 km cells):
+  an orange cone taper closes one sub-lane, a blinking-chevron arrow
+  board stands at the entrance, the whole zone crawls at ~55% speed,
+  and lane changes INTO the closure are vetoed. The bottleneck and the
+  upstream brake-light wave emerge from the IDM physics — verified:
+  in-zone average 7.6 m/s vs 13.5 m/s free flow, no overlaps.
+- **Speed traps**: a patrol car parked on the shoulder (the phase-2
+  police sedan, lights off — it's a trap); same-direction drivers lift
+  off ~20% through the radar window and resume after, rippling a
+  brake-light flicker through the flow.
+- **Toll plazas** (rare, flat-rural zones only): a free-flow gantry
+  spanning the road with booth islands on both shoulders; every
+  vehicle funnels to a crawl through the booth line and pulls away
+  after. Emergency code-3 runs are exempt.
+- All incidents are silent, per the serene-mix preference.
+
+### Road corners & cornering dynamics (light branch — plan v2 phase 1)
+- **Real bends**: deterministic corner zones layer smoothly-windowed
+  sin³ lateral bumps directly inside `curve_x` (the single source of
+  truth), so the road mesh, terrain, traffic, furniture and camera all
+  inherit them. ~31% of zones wind through chained S-bends, ~12% carry
+  a single sharp bend (curvature budgeted against the local base path
+  and capped at the terrain-skirt fold limit, R ≥ ~95 m), and ~16%
+  damp the global wiggle into genuine straightaways.
+- **Superelevation**: the cross-section rolls into bends (up to 8°,
+  from design-speed × curvature). The banked edge carries through the
+  terrain skirt, lane snow, decals, guardrails, lamps, signs and cones
+  via a shared `road_y_at(s, lateral)`; vehicles sit ON the banked
+  surface and roll with it; the camera's up-vector leans into sweeps,
+  damped and time-smoothed.
+- **Traffic corners like drivers**: each driver rolls a lateral-g
+  budget (aggressive ~3.2 m/s², calm ~2.0; trucks/buses ~60%,
+  motorcycles ~145%), reduced on wet or frosty roads. A curvature
+  look-ahead caps desired speed at `v = sqrt(a_lat/κ)` feeding the
+  IDM — braking into corners (brake lights on entry) and accelerating
+  out of the apex emerge naturally. Verified: 17.2 m/s through a
+  κ=0.0076 hairpin vs 26.3 m/s on the straights, no overlaps.
+  Emergency runs respect physics through bends too.
+- **Corner furniture**: yellow chevron boards stand on the OUTSIDE of
+  sharp bends pointing through them (retroreflective at night);
+  guardrails extend along corner outsides wherever centripetal math
+  says a design-speed vehicle would leave the road; skid-mark decals
+  drift toward the outside through the hardest apexes.
+
+### Metropolitan traffic model
+- `TRAFFIC_DENSITY_SP` — 24-hour density table [0..1] calibrated
+  against public big-city traffic bulletins, origin-destination
+  surveys and aggregate flow data.
   Double peak **08-09h (~0.95)** and **18-19h (~1.00)**, noon trough
   ~0.60, madrugada ~0.05-0.10.
 - Each pool vehicle holds a persistent `vis ∈ [0, 1]` threshold;
   `draw_cars` skips when `vis > density` — at 3 AM only a handful of
-  cars render, at 18h every slot fills (Marginais rush-hour density).
-- Trucks use a softer curve `0.3 + 0.7 × density` reflecting CET
-  cargo-flow studies (freight partially off-peak to avoid rodízio).
+  cars render, at 18h every slot fills (rush-hour density).
+- Trucks use a softer curve `0.3 + 0.7 × density` reflecting urban
+  cargo-flow patterns (freight partially off-peak).
 
 ### Engine / stage plumbing
 - Screenshot capture reads `GL_FRONT` after `glFinish()` so the saved
@@ -413,6 +521,36 @@ tree, so the forest is stable across frames without any storage.
 | **Space** | re-center the camera to the forward view |
 | **T** | trigger a lightning strike (and thunder clap) |
 | **Esc** | quit |
+
+## Performance notes
+
+The GL context is hardware-accelerated (verify with the renderer
+string — e.g. "Apple M4 / 2.1 Metal"); the frame budget is dominated
+by CPU-side work, attacked without touching visual quality:
+
+- **Trees as static VBOs** — display-list replay of immediate-mode
+  trees is CPU-bound in the GL-on-Metal driver (~0.3 ms per tree). The
+  recursive generator's exact rng walk is re-captured into triangle
+  arrays: near trees (<180 m) draw from per-variant VBOs with live
+  wind sway; far trees bake into world-space chunk VBOs (sway eased to
+  zero at the hand-off, where it is sub-pixel anyway). Forest pass:
+  62.8 → 3.3 ms/frame, identical geometry.
+- **Cinematic grade via 256³ LUT** — the colour chain is a pure
+  function of the 8-bit input pixel, so a full-resolution lookup table
+  reproduces it bit-exactly (verified max diff 0) at one gather per
+  pixel; the vignette applies in 16-bit fixed point (±1 LSB at the
+  darkened edges); writeback uses a streaming texture + quad instead
+  of the slow glDrawPixels path. The LUT builds in ~1 s and caches to
+  disk (`.grade_lut_*.npy`, gitignored).
+- **PyOpenGL per-call error checking disabled** (millions of redundant
+  glGetError round-trips per second; the test suites and GL harnesses
+  gate correctness instead).
+- **Memoised world queries** — zone biomes, single-sample biome
+  weights at fixed hash-slot positions, per-slot tree placement
+  decisions, road curvature bins.
+
+Net effect at 720p in a forest zone: ~8 → ~33 fps with the full
+cinematic grade, ~20 → ~100 fps without it.
 
 ## Status
 

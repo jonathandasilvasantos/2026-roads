@@ -10,3 +10,4 @@ __pycache__/
 soundfonts/*.sf2
 soundfonts/*.7z
 plan.txt
+.grade_lut_*.npy
