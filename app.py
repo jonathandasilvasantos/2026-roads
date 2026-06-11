@@ -432,7 +432,7 @@ def terrain_heights(s, d, t_time):
 # across every subsystem without threading ten extra parameters through
 # long-stable signatures.
 ENV = {
-    'winter': 0.0,        # 0 = midsummer .. 1 = deep winter (SP, southern)
+    'winter': 0.0,        # 0 = midsummer .. 1 = deep winter (southern hem.)
     'season_off': 0.0,    # CLI season phase offset [0,1)
     'moon_phase': 0.5,    # 0 = new .. 0.5 = full .. 1 = new again
     'wind_dir': 0.8,      # radians; world-XZ heading the wind blows toward
@@ -597,20 +597,18 @@ def night_factor_at(t_day):
     return _smooth((-el + 0.05) / 0.35)
 
 
-# --- Traffic density model (São Paulo weekday profile) -------------------
+# --- Traffic density model (metropolitan weekday profile) ----------------
 #
-# Hourly density [0, 1] calibrated from CET-SP bulletins ("Desempenho do
-# Sistema Viário Principal"), Metrô SP 2017 Origem-Destino survey, and
-# Waze for Cities aggregate flow data. Double-peak pattern dominates:
+# Hourly density [0, 1] calibrated against public big-city traffic
+# bulletins, origin-destination surveys and aggregate flow data.
+# Double-peak pattern dominates:
 #  * Morning peak ~08:00-09:00 (home -> work / school)
 #  * Evening peak ~18:00-19:00 (return + commerce exodus)
 #  * Noon trough  ~12:00-14:00 (lunch is only a secondary pulse; many
-#    paulistanos eat near work)
+#    commuters eat near work)
 #  * Night minimum 02:00-05:00
-# Rodízio (license-plate rotation) operates 07-10 and 17-20 on weekdays,
-# flattening the peaks slightly from their pre-rodízio levels. The curve
-# captures that attenuation — peaks are ~0.95-1.00 rather than pure 1.0
-# all day long.
+# Weekday license-plate rotation schemes flatten the peaks slightly,
+# so the curve tops out at ~0.95-1.00 rather than pure 1.0 all day.
 #
 # Index = hour of day [0..23]. Use `traffic_density_at(t_day)` for
 # continuous sampling with cosine interpolation between neighbours.
@@ -625,7 +623,7 @@ TRAFFIC_DENSITY_SP = [
 # Delivery vans run on commerce hours, not commuter hours: ramp-up from
 # ~08h, sustained plateau through the 10-16h delivery window (stores
 # open, loading zones legal), tail-off after 18h. Madrugada near zero —
-# São Paulo restricts much night freight anyway.
+# big-city rules restrict much night freight anyway.
 VAN_DENSITY_SP = [
     0.05, 0.03, 0.03, 0.04, 0.08, 0.18,  # 00-05
     0.35, 0.55, 0.75, 0.90, 1.00, 1.00,  # 06-11
@@ -633,7 +631,7 @@ VAN_DENSITY_SP = [
     0.40, 0.28, 0.18, 0.12, 0.08, 0.06,  # 18-23
 ]
 
-# SPTrans-style bus service: near-flat headways through the service day
+# Big-city bus service: near-flat headways through the service day
 # (06h-22h), reinforced at both commuter peaks, thin "corujão" (owl
 # network) overnight service rather than zero.
 BUS_DENSITY_SP = [
@@ -669,7 +667,7 @@ def _hourly_curve_at(table, t_day):
 
 def traffic_density_at(t_day):
     """Continuous 0..1 traffic density for current t_day, following the
-    São Paulo weekday profile."""
+    metropolitan weekday profile."""
     return _hourly_curve_at(TRAFFIC_DENSITY_SP, t_day)
 
 
@@ -694,8 +692,8 @@ def moto_density_at(t_day):
 def traffic_speed_factor_at(t_day):
     """Speed multiplier for oncoming/passing traffic. Drops under heavy
     density (peak hours) to suggest congestion — peak density 1.0 maps
-    to ~0.55× freeflow speed (matches CET ordinary-peak observations on
-    Marginal Tietê, where 70 km/h limits collapse to ~40 km/h).
+    to ~0.55× freeflow speed (matches ordinary-peak observations on
+    urban expressways, where 70 km/h limits collapse to ~40 km/h).
     """
     d = traffic_density_at(t_day)
     return max(0.5, 1.0 - 0.45 * d)
@@ -775,7 +773,7 @@ def storm_intensity_at(t_time):
 # storms are EVENTS with a visible build-up and decay, not a value that
 # drifts. Humidity carries between events (a rain dumps it; clear air
 # slowly recharges it, faster in summer), and the chance of a front
-# forming peaks in the late afternoon (SP convective pattern) and in
+# forming peaks in the late afternoon (tropical convective pattern) and in
 # summer.
 WEATHER_CLEAR = 0
 WEATHER_CLOUDING = 1
@@ -6181,7 +6179,7 @@ LC_B_SAFE = 2.5          # MOBIL safety: max decel imposed on new follower (m/s�
 # spoke / headlight parameters) that near-duplicates are rare.
 N_CAR_VARIANTS = 96
 N_CARS_PER_LANE = 10  # pool size per lane; density gate below controls
-                        # how many actually draw (São Paulo weekday curve).
+                        # how many actually draw (metropolitan weekday curve).
 # Same-direction (player's left) drivers faster than the player enter
 # from behind the camera, pass through, and recede into the distance.
 # Drivers slower than the player enter far ahead instead, so the player
@@ -6260,6 +6258,78 @@ EMERG_GAP_MIN = 90.0
 EMERG_GAP_MAX = 240.0
 EMERG_YIELD_AHEAD = 140.0   # traffic within this range ahead pulls over
 EMERG_PARK_S = 2500.0       # dormant parking offset behind the camera
+
+# --- Incidents & emergent events (Phase 6) -------------------------------
+# Roadworks, toll plazas and speed traps live on deterministic hash
+# grids (same slot → same incident, like the biomes), so they are
+# stable across frames and discoverable for screenshots. Breakdowns
+# are dynamic: a live pool vehicle pulls onto the shoulder, sits with
+# hazard flashers for a while, then recycles.
+ROADWORKS_SPACING = 3100.0
+ROADWORKS_TAPER = 40.0      # cone taper length closing the lane
+ROADWORKS_LEN = 130.0       # total zone length (taper + works + exit)
+TOLL_SPACING = 5400.0
+TRAP_SPACING = 2700.0
+BREAKDOWN_GAP_MIN = 110.0   # seconds between breakdown rolls
+BREAKDOWN_GAP_MAX = 260.0
+BREAKDOWN_DWELL_MIN = 35.0  # how long a broken vehicle sits parked
+BREAKDOWN_DWELL_MAX = 80.0
+SHOULDER_PULL = 1.8         # extra lateral metres beyond the outer lane
+
+
+def roadworks_near(s):
+    """The roadworks zone whose influence could touch position s, or
+    None. One zone per ~3.1 km grid cell, ~45% of cells active."""
+    for k in {int((s - 600.0) // ROADWORKS_SPACING),
+              int((s + 600.0) // ROADWORKS_SPACING)}:
+        key = _zone_hash(k, 6011)
+        if (key & 0xFF) / 255.0 > 0.45:
+            continue
+        s0 = k * ROADWORKS_SPACING \
+            + 800.0 + ((key >> 8) & 0xFF) / 255.0 \
+            * (ROADWORKS_SPACING - 1600.0)
+        if abs(s - (s0 + ROADWORKS_LEN * 0.5)) < 600.0 + ROADWORKS_LEN:
+            return {
+                's0': s0, 's1': s0 + ROADWORKS_LEN,
+                'lane': -1 if ((key >> 16) & 1) else +1,
+                'sub': 0 if ((key >> 17) & 0xFF) < 180 else 1,
+            }
+    return None
+
+
+def toll_near(s):
+    """Toll plaza near s, or None. Skips zones whose ground is not
+    flat-rural (no toll booths on bridges or in city centres)."""
+    for k in {int((s - 700.0) // TOLL_SPACING),
+              int((s + 700.0) // TOLL_SPACING)}:
+        key = _zone_hash(k, 6113)
+        if (key & 0xFF) / 255.0 > 0.50:
+            continue
+        ts = k * TOLL_SPACING + 1000.0 + ((key >> 8) & 0xFF) / 255.0 \
+            * (TOLL_SPACING - 2000.0)
+        w = biome_weights_vec(np.array([ts], dtype=np.float32), -1)[0]
+        flat = float(w[BIOME_PLAIN] + w[BIOME_FARM] + w[BIOME_CERRADO]
+                     + w[BIOME_HILL] + w[BIOME_FOREST])
+        if flat < 0.7:
+            continue
+        if abs(s - ts) < 700.0:
+            return {'s': ts}
+    return None
+
+
+def trap_near(s):
+    """Police speed trap near s, or None — a patrol car parked on the
+    same-direction shoulder."""
+    for k in {int((s - 400.0) // TRAP_SPACING),
+              int((s + 400.0) // TRAP_SPACING)}:
+        key = _zone_hash(k, 6217)
+        if (key & 0xFF) / 255.0 > 0.35:
+            continue
+        ts = k * TRAP_SPACING + 600.0 + ((key >> 8) & 0xFF) / 255.0 \
+            * (TRAP_SPACING - 1200.0)
+        if abs(s - ts) < 450.0:
+            return {'s': ts}
+    return None
 
 # Driver personalities, rolled once per spawned vehicle. T is desired
 # time headway (s); a_max comfortable acceleration and b comfortable
@@ -6997,6 +7067,8 @@ def _occupies(c, sub):
     wide, and a near-miss beside them is corredor, not a crash."""
     if c.get('split'):
         return False
+    if c.get('shoulder', 0.0) > 0.8:
+        return False    # broken down, fully off the carriageway
     if sub == c.get('sub'):
         return True     # committed target lane counts from decision time
     lo, hi = ((0.45, 0.55) if c.get('kind') == 'motorcycle'
@@ -7107,6 +7179,10 @@ def _respawn_vehicle(c, rng, kind, n_variants, s_car, player_speed,
     else:
         c['s'] = s_new
         c['parked'] = False
+    # Clear any incident state from the previous life.
+    c['bd_phase'] = None
+    c['bd_timer'] = 0.0
+    c['shoulder'] = 0.0
     # Kind-specific behaviour state.
     if kind == 'motorcycle':
         c['split'] = False
@@ -7174,7 +7250,8 @@ def _idm_accel(v, v0, gap, dv, T, amax, b):
 
 
 def update_traffic(states, dt, s_car, player_speed,
-                   t_day=0.5, storm_i=0.0, frost_i=0.0, night_a=0.0):
+                   t_day=0.5, storm_i=0.0, frost_i=0.0, night_a=0.0,
+                   incidents=None):
     """Per-frame traffic physics for all vehicle pools together — cars
     and trucks share the road, so leader search must span both pools.
 
@@ -7185,7 +7262,7 @@ def update_traffic(states, dt, s_car, player_speed,
       * Driver personalities rolled at spawn (aggressive/normal/calm).
       * Two sub-lanes per direction with MOBIL-style overtaking and
         keep-right discipline, animated over LC_DURATION seconds.
-      * Desired speed coupled to congestion (São Paulo hourly curve),
+      * Desired speed coupled to congestion (the hourly density curve),
         rain, frost and night; headway opens up on a wet road.
     """
     if dt <= 0.0:
@@ -7203,6 +7280,38 @@ def update_traffic(states, dt, s_car, player_speed,
     T_mult = 1.0 + 0.40 * storm_i + 0.25 * frost_i
 
     all_veh = [c for st in states for c in st['cars']]
+
+    # --- incident zones near the camera (Phase 6) ---
+    # One of each can be live in the active window: a roadworks lane
+    # closure, a toll plaza, a parked speed trap. Computed once per
+    # frame; per-vehicle behaviour below reads them.
+    rw = roadworks_near(s_car)
+    toll = toll_near(s_car)
+    trap = trap_near(s_car)
+
+    # --- breakdown lifecycle (6.1) ---
+    # On a slow clock, one same-direction car/van pulls onto the
+    # shoulder, sits with hazard flashers, then recycles. Passing
+    # traffic merges away from it while it still straddles the lane.
+    if incidents is not None:
+        incidents['bd_timer'] = incidents.get('bd_timer', 60.0) - dt
+        if incidents['bd_timer'] <= 0.0:
+            incidents['bd_timer'] = float(rng.uniform(
+                BREAKDOWN_GAP_MIN, BREAKDOWN_GAP_MAX))
+            active_bd = any(c.get('bd_phase')
+                            for st in states for c in st['cars'])
+            if not active_bd:
+                cands = [c for st in states
+                         if st['kind'] in ('car', 'van')
+                         for c in st['cars']
+                         if (c['lane'] == -1 and not c.get('parked')
+                             and 60.0 < c['s'] - s_car < 500.0)]
+                if cands:
+                    c = cands[int(rng.integers(0, len(cands)))]
+                    c['bd_phase'] = 'pulling'
+                    c['bd_timer'] = float(rng.uniform(
+                        BREAKDOWN_DWELL_MIN, BREAKDOWN_DWELL_MAX))
+                    c['sub'] = 0      # head for the shoulder side
 
     # --- emergency vehicle lifecycle ---
     # Dormant units sit parked far off-screen counting down; when the
@@ -7322,6 +7431,62 @@ def update_traffic(states, dt, s_car, player_speed,
                                 rng.uniform(LC_COOLDOWN_MIN,
                                             LC_COOLDOWN_MAX))
                         break
+
+            # --- breakdown state machine (6.1) ---
+            if c.get('bd_phase') == 'parked':
+                c['accel'] = 0.0
+                c['speed'] = 0.0
+                continue        # frozen on the shoulder, flashers on
+            if c.get('bd_phase') == 'pulling':
+                c['sub'] = 0
+                if c['lf'] < 0.25:      # mostly in the outer lane now
+                    c['shoulder'] = min(1.0, c.get('shoulder', 0.0)
+                                        + dt / 2.5)
+                v0_eff = min(v0_eff,
+                             max(0.0, 13.0 * (1.0 - c['shoulder'])))
+                if c['speed'] < 0.4 and c['shoulder'] >= 0.99:
+                    c['bd_phase'] = 'parked'
+                    c['accel'] = 0.0
+                    c['speed'] = 0.0
+                    continue
+
+            # --- roadworks (6.2): the closed sub-lane merges out, the
+            # whole zone crawls — a genuine bottleneck with the brake
+            # wave propagating upstream out of the IDM physics ---
+            if (rw is not None and lane == rw['lane']
+                    and kind != 'emergency'):
+                dirn_rw = 1.0 if lane == -1 else -1.0
+                ent = rw['s0'] if dirn_rw > 0 else rw['s1']
+                ahead_rw = (ent - c['s']) * dirn_rw
+                in_zone = rw['s0'] - 15.0 <= c['s'] <= rw['s1'] + 15.0
+                if in_zone or 0.0 < ahead_rw < 230.0:
+                    v0_eff *= 0.55
+                    if c['sub'] == rw['sub'] and not c.get('split'):
+                        if lane_clear(i, 1 - rw['sub']):
+                            c['sub'] = 1 - rw['sub']
+                        else:
+                            # boxed in: brake toward the cone taper
+                            gap_t = max(0.0,
+                                        ahead_rw if not in_zone else 0.0)
+                            v0_eff = min(v0_eff, 2.0 + 0.22 * gap_t)
+
+            # --- toll plaza (6.4): everyone funnels to a crawl through
+            # the booth line, then pulls away ---
+            if toll is not None and kind != 'emergency':
+                dirn_t = 1.0 if lane == -1 else -1.0
+                d_toll = (toll['s'] - c['s']) * dirn_t
+                if 0.0 < d_toll < 120.0:
+                    v0_eff = min(v0_eff, 3.5 + d_toll * 0.26)
+                elif -30.0 <= d_toll <= 0.0:
+                    v0_eff = min(v0_eff, 6.5)
+
+            # --- speed trap (6.3): drivers notice the parked patrol
+            # car and lift off — a brake-light flicker runs through
+            # the flow, then everyone resumes ---
+            if trap is not None and lane == -1 and kind != 'emergency':
+                rel_t = trap['s'] - c['s']
+                if -25.0 < rel_t < 220.0:
+                    v0_eff *= 0.80
 
             # --- bus stops: dwell at the curb with the doors open ---
             if kind == 'bus':
@@ -7469,6 +7634,12 @@ def update_traffic(states, dt, s_car, player_speed,
                             and (fgap is None or fgap > 4.0))
                 if safe and ld2 is not None and gap2 is not None:
                     safe = gap2 > 4.0
+                # roadworks veto (6.2): never change INTO the closed
+                # sub-lane while approaching or inside the zone
+                if (safe and rw is not None and lane == rw['lane']
+                        and other == rw['sub']
+                        and rw['s0'] - 230.0 < c['s'] < rw['s1'] + 20.0):
+                    safe = False
                 if safe and other == 1:
                     # Overtake: move inside only when the inner lane is
                     # clearly better. Eager (aggressive) drivers need
@@ -7507,12 +7678,28 @@ def update_traffic(states, dt, s_car, player_speed,
             off = CAR_LANE_OUTER + (CAR_LANE_INNER - CAR_LANE_OUTER) * sm
             if kind == 'bus' and c['curb'] > 0.0:
                 off += BUS_CURB_SHIFT * c['curb']
+            if c.get('shoulder', 0.0) > 0.0:
+                # breakdown pull-out: ease beyond the outer lane edge
+                sh = c['shoulder']
+                off += SHOULDER_PULL * (sh * sh * (3.0 - 2.0 * sh))
             c['doff'] = (off - c['off']) / dt
             c['off'] = off
 
     # --- despawn / respawn (per pool, so each keeps its own rng) ---
     for st in states:
         for c in st['cars']:
+            # Parked breakdowns sit out their dwell, then recycle (or
+            # recycle early once the camera has left them far behind).
+            if c.get('bd_phase') == 'parked':
+                c['bd_timer'] -= dt
+                if c['bd_timer'] <= 0.0 or c['s'] < s_car - 250.0:
+                    _respawn_vehicle(c, st['rng'], st['kind'],
+                                     st['n_variants'], s_car,
+                                     player_speed, cond_v,
+                                     [o for o in all_veh if o is not c])
+                continue
+            if c.get('bd_phase') == 'pulling':
+                continue        # mid-manoeuvre: never recycle under it
             if st['kind'] == 'emergency':
                 # Active units that cleared the horizon go dormant until
                 # the next run; dormant units never recycle normally.
@@ -7577,7 +7764,7 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
         # Traffic-density gate — each car holds a persistent threshold
         # in [0, 1]; it renders only when live density exceeds that
         # value. At 3am density is ~0.05 so only the ~5% of cars with
-        # lowest thresholds appear (empty Marginais feel). At 18h
+        # lowest thresholds appear (empty-expressway feel). At 18h
         # density is 1.0 so every car in the pool shows (rush hour).
         if c.get('vis', 0.0) > density:
             continue
@@ -7651,8 +7838,9 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
                       for c in state['cars'])
     em_any = (kind == 'emergency'
               and any(c.get('em_active') for c in state['cars']))
+    bd_any = any(c.get('bd_phase') for c in state['cars'])
     if (night_a <= 0.03 and storm_i < 0.20 and not braking_any
-            and not em_any):
+            and not em_any and not bd_any):
         return
     glDisable(GL_LIGHTING)
     glEnable(GL_TEXTURE_2D)
@@ -7695,7 +7883,7 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
         head_i = lights_on * (0.40 + 0.60 * night_a)
         tail_i = max(lights_on * (0.30 + 0.70 * night_a),
                      brake_w * 0.95)
-        if head_i < 0.02 and tail_i < 0.02:
+        if head_i < 0.02 and tail_i < 0.02 and not c.get('bd_phase'):
             continue
         cx = curve_x(s)
         cy = curve_y(s)
@@ -7795,6 +7983,22 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
                     emit((px, cy + v['win_y'], pz),
                          (1.0 * wi, 0.85 * wi, 0.58 * wi), 0.26)
                 wx += v['win_step']
+
+        # Breakdown hazard flashers (6.1): alternating left/right amber
+        # at both ends, visible day or night.
+        if c.get('bd_phase'):
+            blink_lat = +1 if math.sin(t_time * 2.0 * math.pi
+                                       * 1.4) > 0.0 else -1
+            amber = (1.0, 0.55, 0.10)
+            hz = 0.55
+            for x_off, y_off, z_off in (
+                    (v['tail_x'], v['tail_y'], v['tail_zoff']),
+                    (v['head_x'], v['head_y'], v['head_zoff'])):
+                px = cx + fx * x_off + rx * z_off * blink_lat
+                pz = cz + fz * x_off + rz * z_off * blink_lat
+                emit((px, cy + y_off, pz),
+                     (amber[0] * hz, amber[1] * hz, amber[2] * hz),
+                     0.50)
 
         # Emergency strobes: alternating red (left) / blue (right)
         # lightbar flashes, visible from every angle, day or night.
@@ -8551,7 +8755,7 @@ RIDER_PALETTE = [
     (0.08, 0.12, 0.22), (0.30, 0.28, 0.26), (0.12, 0.18, 0.12),
 ]
 
-# SPTrans-style bus liveries: white shell + a coloured waist stripe
+# Transit-authority bus liveries: white shell + a coloured waist stripe
 # (the system colour-codes regions: red downtown, dark blue south, ...).
 BUS_STRIPE_PALETTE = [
     (0.78, 0.10, 0.10), (0.10, 0.18, 0.55), (0.10, 0.45, 0.20),
@@ -8778,7 +8982,7 @@ def build_emergency_variant(seed):
         strobe_x = half - 0.95
         strobe_y = 1.92
     else:
-        body = (0.16, 0.18, 0.26)       # PM dark navy
+        body = (0.16, 0.18, 0.26)       # patrol dark navy
         L, W, H = 4.9, 1.85, 1.46
         half, zw = L / 2, W / 2
         paint_tex = make_car_paint_texture(body, rng)
@@ -10137,6 +10341,190 @@ def draw_aircraft(plane, s_car, night_a, t_time):
     glEnable(GL_FOG)
 
 
+# --- Phase 6: incident props ----------------------------------------------
+def build_phase6_props():
+    """Traffic cone and toll-booth display lists (lit-prop materials)."""
+    P = {}
+
+    def _mat(col, shine=14.0, spec=0.15):
+        _car_mat((col[0] * 0.5, col[1] * 0.5, col[2] * 0.5), col,
+                 (spec, spec, spec), shine)
+
+    # Traffic cone: orange taper + white band + square base.
+    lid = glGenLists(1)
+    glNewList(lid, GL_COMPILE)
+    q = gluNewQuadric()
+    gluQuadricNormals(q, GLU_SMOOTH)
+    _mat((0.95, 0.38, 0.05))
+    glPushMatrix()
+    glRotatef(-90, 1, 0, 0)
+    gluCylinder(q, 0.16, 0.03, 0.72, 10, 2)
+    glPopMatrix()
+    _mat((0.92, 0.92, 0.92))
+    glPushMatrix()
+    glTranslatef(0.0, 0.30, 0.0)
+    glRotatef(-90, 1, 0, 0)
+    gluCylinder(q, 0.115, 0.095, 0.13, 10, 1)
+    glPopMatrix()
+    gluDeleteQuadric(q)
+    _mat((0.90, 0.35, 0.05))
+    _truck_draw_box(-0.22, 0.22, 0.0, 0.05, -0.22, 0.22)
+    glEndList()
+    P['cone'] = lid
+
+    # Toll booth: white cabin with a glass band and a small canopy.
+    lid = glGenLists(1)
+    glNewList(lid, GL_COMPILE)
+    _mat((0.90, 0.90, 0.92))
+    _truck_draw_box(-0.9, 0.9, 0.0, 2.6, -0.9, 0.9)
+    _car_mat_glass()
+    _truck_draw_box(-0.92, 0.92, 1.3, 2.1, -0.92, 0.92)
+    _mat((0.85, 0.70, 0.10))
+    _truck_draw_box(-1.1, 1.1, 2.6, 2.85, -1.1, 1.1)
+    glEndList()
+    P['booth'] = lid
+
+    # Arrow-board stand (the blinking chevrons are drawn live).
+    lid = glGenLists(1)
+    glNewList(lid, GL_COMPILE)
+    _mat((0.20, 0.21, 0.24))
+    _truck_draw_box(-1.1, 1.1, 1.1, 2.4, -0.08, 0.08)
+    for px in (-0.8, 0.8):
+        _truck_draw_box(px - 0.06, px + 0.06, 0.0, 1.1, -0.06, 0.06)
+    glEndList()
+    P['arrow_stand'] = lid
+    return P
+
+
+def draw_roadworks(s_car, P6, amb_rgb, sun_d, night_a, t_time):
+    """Cone taper closing one sub-lane, work-zone cone line, and a
+    blinking arrow board at the entrance (6.2)."""
+    rw = roadworks_near(s_car)
+    if rw is None:
+        return
+    if rw['s1'] < s_car - 20.0 or rw['s0'] > s_car + 700.0:
+        return
+    sgn = rw['lane']
+    # lateral offsets (metres from centreline) for open/closed edges
+    if rw['sub'] == 0:    # outer lane closed: taper from shoulder in
+        x_from, x_to = ROAD_WIDTH / 2 - 0.1, 2.62
+    else:                 # inner lane closed: taper from centre out
+        x_from, x_to = 0.35, 2.62
+    dirn = 1.0 if sgn == -1 else -1.0
+    ent = rw['s0'] if dirn > 0 else rw['s1']
+
+    _prop_light_begin(amb_rgb, sun_d)
+    step = 4.0
+    n_taper = int(ROADWORKS_TAPER / step)
+    total = int(ROADWORKS_LEN / step)
+    for i in range(total + 1):
+        s = ent + dirn * i * step
+        if s < s_car - 20.0:
+            continue
+        t_frac = min(1.0, i / max(1, n_taper))
+        x_off = x_from + (x_to - x_from) * t_frac
+        glPushMatrix()
+        glTranslatef(curve_x(s) + sgn * x_off, curve_y(s),
+                     -(s - s_car))
+        glCallList(P6['cone'])
+        glPopMatrix()
+    # arrow board just before the taper, in the closed lane
+    s_ab = ent - dirn * 10.0
+    ab_x = x_from if rw['sub'] == 1 else ROAD_WIDTH / 2 - 1.2
+    glPushMatrix()
+    glTranslatef(curve_x(s_ab) + sgn * ab_x, curve_y(s_ab),
+                 -(s_ab - s_car))
+    glRotatef(_road_yaw_deg(s_ab) + (90.0 if sgn < 0 else -90.0),
+              0, 1, 0)
+    glCallList(P6['arrow_stand'])
+    glPopMatrix()
+    _prop_light_end()
+
+    # blinking chevrons (additive, point toward the open lane)
+    if math.sin(t_time * 2.0 * math.pi * 1.2) > -0.2:
+        glDisable(GL_TEXTURE_2D)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        glDepthMask(GL_FALSE)
+        bx = curve_x(s_ab) + sgn * ab_x
+        by = curve_y(s_ab) + 1.75
+        bz = -(s_ab - s_car)
+        ds = 1.0
+        dxds = (curve_x(s_ab + ds) - curve_x(s_ab - ds)) / (2.0 * ds)
+        rx_, rz_ = -(-1.0 if sgn == -1 else 1.0), dxds
+        # chevron points away from the closed side
+        point = -sgn if rw['sub'] == 0 else sgn
+        glColor4f(1.0, 0.62, 0.05, 0.85 + 0.15 * night_a)
+        glBegin(GL_TRIANGLES)
+        for k in (-0.55, 0.0, 0.55):
+            tip_x = bx + rx_ * (k + 0.28 * point)
+            tail_x = bx + rx_ * (k - 0.18 * point)
+            glVertex3f(tip_x, by, bz + rz_ * k)
+            glVertex3f(tail_x, by + 0.30, bz + rz_ * k)
+            glVertex3f(tail_x, by - 0.30, bz + rz_ * k)
+        glEnd()
+        glDepthMask(GL_TRUE)
+        glDisable(GL_BLEND)
+
+
+def draw_toll(s_car, P6, concrete_tex, amb_rgb, sun_d):
+    """Free-flow toll gantry: a roof spanning the road on shoulder
+    pillars with a booth island at each side (6.4)."""
+    toll = toll_near(s_car)
+    if toll is None:
+        return
+    d = toll['s'] - s_car
+    if d < -30.0 or d > 700.0:
+        return
+    s = toll['s']
+    x = curve_x(s)
+    y = curve_y(s)
+    z = -d
+    base = _structure_tint(amb_rgb, 0.0)
+    span = ROAD_WIDTH / 2 + 4.0
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, concrete_tex)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glColor3f(*base)
+    glPushMatrix()
+    glTranslatef(x, y, z)
+    glRotatef(_road_yaw_deg(s) - 90.0, 0, 1, 0)
+    _truck_draw_box(-span, span, 4.6, 5.6, -2.4, 2.4)      # roof
+    for px in (-span + 0.6, span - 0.6):
+        _truck_draw_box(px - 0.5, px + 0.5, 0.0, 4.6, -0.5, 0.5)
+    glPopMatrix()
+    glDisable(GL_TEXTURE_2D)
+    _prop_light_begin(amb_rgb, sun_d)
+    for side in (-1, +1):
+        glPushMatrix()
+        glTranslatef(curve_x(s) + side * (ROAD_WIDTH / 2 + 2.2),
+                     curve_y(s), z)
+        glRotatef(_road_yaw_deg(s) - 90.0, 0, 1, 0)
+        glCallList(P6['booth'])
+        glPopMatrix()
+    _prop_light_end()
+
+
+def draw_speed_trap(s_car, emerg_variants, amb_rgb, sun_d):
+    """Parked patrol car on the same-direction shoulder (6.3)."""
+    trap = trap_near(s_car)
+    if trap is None or not emerg_variants:
+        return
+    d = trap['s'] - s_car
+    if d < -25.0 or d > 600.0:
+        return
+    # odd-seeded emergency variants are the police sedan
+    v = emerg_variants[1 % len(emerg_variants)]
+    s = trap['s']
+    _prop_light_begin(amb_rgb, sun_d)
+    glPushMatrix()
+    glTranslatef(curve_x(s) - (ROAD_WIDTH / 2 + 1.7), curve_y(s), -d)
+    glRotatef(_road_yaw_deg(s) + 6.0, 0, 1, 0)
+    glCallList(v['list'])
+    glPopMatrix()
+    _prop_light_end()
+
+
 # ---------------------------------------------------------------------
 # Cinematic post-processing (fixed-function — CPU readback + writeback)
 # ---------------------------------------------------------------------
@@ -10340,6 +10728,9 @@ def _build_arg_parser():
                    help="Pin the wet-road memory 0-1 (for screenshots).")
     p.add_argument("--moon", type=float, default=None,
                    help="Pin the moon phase 0-1 (0=new, 0.5=full).")
+    p.add_argument("--event", choices=("breakdown",), default=None,
+                   help="Force a dynamic incident soon after start "
+                        "(for screenshots/testing).")
     p.add_argument("--storm", type=float, default=None,
                    help="Force storm intensity 0..1. Default: sim-driven.")
     p.add_argument("--s-car", dest="s_car", type=float, default=None,
@@ -10538,6 +10929,10 @@ def main(argv=None):
     phase4_props = build_phase4_props()
     aircraft = None
     aircraft_timer = 45.0
+    # Phase-6 incidents: cone/booth/arrow-board props plus the dynamic
+    # breakdown clock (--event breakdown forces one almost immediately).
+    phase6_props = build_phase6_props()
+    incidents = {'bd_timer': 4.0 if args.event == 'breakdown' else 75.0}
     # Flowers: six colour palettes, each compiled as a crossed-quad
     # billboard display list.
     flower_variants = []
@@ -10965,7 +11360,7 @@ def main(argv=None):
         # constant so rain and wind fade in and out gradually rather
         # than snapping. Levels are ~50% of the previous scale so the
         # weather sits under the music, not on top of it.
-        # Per-kind traffic densities from the SP hourly curves — needed
+        # Per-kind traffic densities from the hourly curves — needed
         # both by the audio block right below and by the traffic
         # update/draw further down the frame.
         traffic_d = traffic_density_at(t_day)
@@ -11086,7 +11481,7 @@ def main(argv=None):
             ENV['wind_speed'] / 14.0 + 0.16 * open_exp_trees
                  + 0.05 * (speed / SPEED),
         )
-        # Seasonal flora (Phase 3.3): São Paulo's winter is the dry
+        # Seasonal flora (Phase 3.3): winter here is the dry
         # season — foliage desaturates toward straw, flowers thin out.
         dry_season = 0.38 * ENV['winter']
         flora_amb = (min(1.0, amb[0] * (1.0 + 0.10 * dry_season)),
@@ -11138,6 +11533,11 @@ def main(argv=None):
         draw_power_lines(s_car, amb)
         draw_billboards_shelters(s_car, phase4_props, amb, night_a,
                                  t_time)
+        # Incidents (6.2-6.4): cone tapers with a blinking arrow board,
+        # free-flow toll gantries, parked speed-trap patrol cars.
+        draw_roadworks(s_car, phase6_props, amb, sun_d, night_a, t_time)
+        draw_toll(s_car, phase6_props, concrete_tex, amb, sun_d)
+        draw_speed_trap(s_car, emerg_variants, amb, sun_d)
         draw_snow_shoulders(snow_ground_tex, s_car, amb)
         draw_lamps(s_car, night_a)
         draw_lamp_moths(s_car, night_a, t_time)
@@ -11157,11 +11557,11 @@ def main(argv=None):
         # the IDM car-following model with MOBIL lane changes, driver
         # personalities, and desired speeds coupled to congestion,
         # rain/frost and dusk (see update_traffic).
-        # Traffic density follows the São Paulo weekday profile — quiet
+        # Traffic density follows the metropolitan weekday profile — quiet
         # between 2-5 AM, morning peak ~08:00-09:00, evening peak
         # ~18:00-19:00. Trucks get a softer modulation since freight
-        # moves more off-peak to avoid the rodízio/congestion windows
-        # (empirical observation from CET-SP cargo studies). The per-kind
+        # moves more off-peak to avoid the plate-rotation/congestion
+        # windows. The per-kind
         # densities themselves are computed earlier in the frame (the
         # audio block needs them too).
         # Drivers slow for active rain AND for a still-wet road (3.2) —
@@ -11170,7 +11570,7 @@ def main(argv=None):
         update_traffic((car_state, truck_state, moto_state, van_state,
                         bus_state, emerg_state), dt, s_car, speed,
                        t_day=t_day, storm_i=driving_wet, frost_i=frost_i,
-                       night_a=night_a)
+                       night_a=night_a, incidents=incidents)
         draw_cars(car_state, car_variants, s_car, amb, sun_d,
                   night_a, flare_tex, density=traffic_d, storm_i=storm_i,
                   t_time=t_time)
