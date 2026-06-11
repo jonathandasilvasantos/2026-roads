@@ -252,7 +252,7 @@ research as the design criterion. Per-cycle snapshots live under
   player's cruise speed — faster drivers spawn behind and overtake,
   slower ones spawn ahead and get reeled in (no more "every car outruns
   the camera" treadmill).
-- **Condition coupling**: desired speed scales with the São Paulo
+- **Condition coupling**: desired speed scales with the metropolitan
   congestion curve and drops in rain (−22%), frost (−32%) and at night
   (−7%); headways stretch +40% on a wet road.
 - **Brake lights**: IDM deceleration past 0.5 m/s² lights and swells the
@@ -269,7 +269,7 @@ research as the design criterion. Per-cycle snapshots live under
   over-indexes at the peaks (motofrete hours).
 - **Delivery vans** (24 variants, white-fleet palette) on a commerce-
   hours density curve (10-16h plateau, near-zero madrugada).
-- **City buses** (12 variants: SPTrans-style white shell + coloured
+- **City buses** (12 variants: transit-style white shell + coloured
   waist stripe, window band, roof AC, lit route board). Buses serve
   hashed bus-stop slots inside city zones: pull to the curb, dwell 5-10s
   with a gentle ~0.9 m/s² approach, then merge back out — followers
@@ -305,8 +305,8 @@ research as the design criterion. Per-cycle snapshots live under
 - **Weather lifecycle machine**: live weather is now a state machine —
   CLEAR → CLOUDING → OVERCAST → RAIN → CLEARING — with humidity carried
   between events (a rain dumps it, clear air recharges it) and the
-  trigger probability peaking on summer afternoons (SP convective
-  pattern). Storms are events you watch build; precipitation only
+  trigger probability peaking on summer afternoons (tropical
+  convective pattern). Storms are events you watch build; precipitation only
   starts once the level passes the rain onset, so the overcast band
   darkens the sky without raining. ~20% of fronts pass dry.
 - **Wet-road memory**: rain soaks the pavement in seconds; drying takes
@@ -392,16 +392,40 @@ research as the design criterion. Per-cycle snapshots live under
   outright. The soundscape is automobile whooshes + nature (birds,
   wind, rain, thunder) + the original engine rumble and ensemble.
 
-### São Paulo traffic model
-- `TRAFFIC_DENSITY_SP` — 24-hour density table [0..1] calibrated from
-  CET-SP bulletins, Metrô 2017 O-D survey, Waze for Cities aggregates.
+### Incidents & emergent events (light branch — plan.txt Phase 6)
+- **Breakdowns**: on a slow clock, a same-direction car or van pulls
+  onto the shoulder, eases fully off the carriageway (it stops
+  counting as a lane occupant only once it's genuinely clear), sits
+  with alternating amber hazard flashers for half a minute or more,
+  then recycles. Passing traffic merges away from it while it still
+  straddles the lane — pure MOBIL. `--event breakdown` forces one.
+- **Roadworks zones** (deterministic hash grid, ~45% of 3.1 km cells):
+  an orange cone taper closes one sub-lane, a blinking-chevron arrow
+  board stands at the entrance, the whole zone crawls at ~55% speed,
+  and lane changes INTO the closure are vetoed. The bottleneck and the
+  upstream brake-light wave emerge from the IDM physics — verified:
+  in-zone average 7.6 m/s vs 13.5 m/s free flow, no overlaps.
+- **Speed traps**: a patrol car parked on the shoulder (the phase-2
+  police sedan, lights off — it's a trap); same-direction drivers lift
+  off ~20% through the radar window and resume after, rippling a
+  brake-light flicker through the flow.
+- **Toll plazas** (rare, flat-rural zones only): a free-flow gantry
+  spanning the road with booth islands on both shoulders; every
+  vehicle funnels to a crawl through the booth line and pulls away
+  after. Emergency code-3 runs are exempt.
+- All incidents are silent, per the serene-mix preference.
+
+### Metropolitan traffic model
+- `TRAFFIC_DENSITY_SP` — 24-hour density table [0..1] calibrated
+  against public big-city traffic bulletins, origin-destination
+  surveys and aggregate flow data.
   Double peak **08-09h (~0.95)** and **18-19h (~1.00)**, noon trough
   ~0.60, madrugada ~0.05-0.10.
 - Each pool vehicle holds a persistent `vis ∈ [0, 1]` threshold;
   `draw_cars` skips when `vis > density` — at 3 AM only a handful of
-  cars render, at 18h every slot fills (Marginais rush-hour density).
-- Trucks use a softer curve `0.3 + 0.7 × density` reflecting CET
-  cargo-flow studies (freight partially off-peak to avoid rodízio).
+  cars render, at 18h every slot fills (rush-hour density).
+- Trucks use a softer curve `0.3 + 0.7 × density` reflecting urban
+  cargo-flow patterns (freight partially off-peak).
 
 ### Engine / stage plumbing
 - Screenshot capture reads `GL_FRONT` after `glFinish()` so the saved
