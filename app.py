@@ -1,3 +1,4 @@
+import argparse
 import math
 import sys
 import numpy as np
@@ -237,7 +238,24 @@ def biome_at(zone_idx, side):
     key_r = (zone_idx * 2654435761 + 9277) & 0xFFFFFFFF
     bl = key_l % BIOME_COUNT
     br = key_r % BIOME_COUNT
+    # Seasonal frost gating, anchored to the ZONE's position on the
+    # distance-based season cycle (never the camera) so a zone's biome
+    # is immutable — no terrain popping as time passes. Frost zones are
+    # rare in summer, common in deep winter; deep winter also upgrades
+    # the occasional plain zone to frost.
+    wint = winter_weight(season_phase_at(zone_idx * ZONE_LEN))
     if bl == BIOME_FROST or br == BIOME_FROST:
+        if ((key_l >> 9) & 0xFF) / 255.0 < (0.06 + 0.94 * wint):
+            return BIOME_FROST
+        # Melted out this season: re-roll each side without frost.
+        if bl == BIOME_FROST:
+            bl = (key_l >> 16) % BIOME_COUNT
+            bl = BIOME_PLAIN if bl == BIOME_FROST else bl
+        if br == BIOME_FROST:
+            br = (key_r >> 16) % BIOME_COUNT
+            br = BIOME_PLAIN if br == BIOME_FROST else br
+    elif (wint > 0.70 and (bl == BIOME_PLAIN or br == BIOME_PLAIN)
+            and ((key_l >> 20) & 0xFF) / 255.0 < (wint - 0.70) * 1.2):
         return BIOME_FROST
     return bl if side < 0 else br
 
@@ -332,11 +350,54 @@ def terrain_heights(s, d, t_time):
 
 # --- Day/Night model ---
 # t_day in [0, 1): 0=midnight, 0.25=sunrise, 0.5=noon, 0.75=sunset
+# --- Shared environment state (Phase 3) ----------------------------------
+# Written once per frame by the main loop (view.py and tests leave the
+# defaults), read by the day/night model, biome zoning, terrain snow and
+# particle systems — so weather, season, moon and wind stay coherent
+# across every subsystem without threading ten extra parameters through
+# long-stable signatures.
+ENV = {
+    'winter': 0.0,        # 0 = midsummer .. 1 = deep winter (SP, southern)
+    'season_off': 0.0,    # CLI season phase offset [0,1)
+    'moon_phase': 0.5,    # 0 = new .. 0.5 = full .. 1 = new again
+    'wind_dir': 0.8,      # radians; world-XZ heading the wind blows toward
+    'wind_speed': 2.5,    # m/s
+    'wetness': 0.0,       # wet-road memory 0..1
+}
+
+# Seasons are anchored to *distance*, not wall-clock: the world ahead was
+# "generated in the season you reach it", so a zone's biome never flips
+# under the camera (no terrain popping) and driving the endless road is
+# also a drive through the year. One full year every YEAR_DIST metres
+# (~14 minutes at cruise speed).
+YEAR_DIST = 24000.0
+MOON_PERIOD_DAYS = 4.0   # moon phase cycle in day-cycles
+
+
+def season_phase_at(s):
+    """0..1 around the year at road position s (0 = midsummer)."""
+    return (s / YEAR_DIST + ENV['season_off']) % 1.0
+
+
+def winter_weight(phase):
+    """0 at midsummer (phase 0), 1 at midwinter (phase 0.5)."""
+    return 0.5 - 0.5 * math.cos(2.0 * math.pi * phase)
+
+
+def moon_fullness():
+    """0 new moon .. 1 full moon, from the shared phase state."""
+    return 0.5 - 0.5 * math.cos(2.0 * math.pi * ENV['moon_phase'])
+
+
 def sun_dir_at(t_day):
     angle = 2 * math.pi * (t_day - 0.25)  # 0 rad at sunrise
-    # Base arc in the X-Y plane; slight tilt on Z so sun traces a real arc
+    # Base arc in the X-Y plane; slight tilt on Z so sun traces a real arc.
+    # Winter (ENV['winter']) flattens and lowers the arc — the sun rises
+    # later, climbs less, and sets earlier, so day length shortens
+    # automatically through the elevation-driven ambient/night factors.
+    w = ENV['winter']
     x = math.cos(angle)
-    y = math.sin(angle)
+    y = math.sin(angle) * (1.0 - 0.18 * w) - 0.22 * w
     z = -0.18 * math.cos(angle)
     v = np.array([x, y, z], dtype=np.float32)
     return v / (np.linalg.norm(v) + 1e-9)
@@ -348,16 +409,30 @@ def _smooth(x):
 
 
 # Keyframes: (t_day, zenith_rgb, horizon_rgb)
+# Cycle 3 calibration notes (2026-04 light branch):
+#   * Noon zenith deepened toward Preetham turbidity=2 mid-sky values
+#     (0.18, 0.40, 0.80) — earlier (0.22, 0.48, 0.85) washed pale after
+#     ACES tone-map toe.
+#   * Noon horizon desaturated to reflect Rayleigh forward-scatter gray-
+#     blue instead of pure pale (0.70, 0.82, 0.93).
+#   * Golden-hour horizons tuned to Planckian 2800-3200 K: dawn
+#     (1.00, 0.62, 0.28), dusk (1.00, 0.52, 0.20) — dusk runs warmer per
+#     Lynch & Livingston 2001 atmospheric optics (longer path length at
+#     setting sun deepens the red end).
+#   * Pre-dawn (0.20) tinted indigo rather than mauve so the sky reads
+#     cold before the warm horizon break at 0.26.
+#   * Deep-night zenith: (0.012, 0.014, 0.045) — true dark with a hint
+#     of cobalt (Hosek-Wilkie twilight tail).
 SKY_KEYS = [
-    (0.00, (0.015, 0.018, 0.055), (0.035, 0.045, 0.10)),
-    (0.20, (0.10, 0.09, 0.22),   (0.50, 0.30, 0.38)),
-    (0.26, (0.32, 0.42, 0.64),   (1.00, 0.64, 0.32)),
-    (0.38, (0.28, 0.52, 0.86),   (0.82, 0.88, 0.96)),
-    (0.50, (0.22, 0.48, 0.85),   (0.78, 0.88, 0.96)),
-    (0.62, (0.28, 0.52, 0.86),   (0.85, 0.84, 0.92)),
-    (0.74, (0.34, 0.30, 0.52),   (1.00, 0.55, 0.24)),
-    (0.80, (0.12, 0.10, 0.22),   (0.40, 0.20, 0.28)),
-    (1.00, (0.015, 0.018, 0.055),(0.035, 0.045, 0.10)),
+    (0.00, (0.012, 0.014, 0.045), (0.030, 0.038, 0.092)),
+    (0.20, (0.08,  0.08,  0.20),  (0.45,  0.28,  0.36)),
+    (0.26, (0.30,  0.40,  0.62),  (1.00,  0.62,  0.28)),
+    (0.38, (0.24,  0.48,  0.84),  (0.78,  0.86,  0.95)),
+    (0.50, (0.18,  0.40,  0.80),  (0.70,  0.82,  0.93)),
+    (0.62, (0.24,  0.48,  0.84),  (0.80,  0.82,  0.90)),
+    (0.74, (0.32,  0.28,  0.50),  (1.00,  0.52,  0.20)),
+    (0.80, (0.10,  0.09,  0.20),  (0.38,  0.19,  0.26)),
+    (1.00, (0.012, 0.014, 0.045), (0.030, 0.038, 0.092)),
 ]
 
 
@@ -425,7 +500,10 @@ def ambient_at(t_day, storm=0.0, flash=0.0):
     """Returns (brightness scalar, RGB tint) affecting terrain/road."""
     el = sun_dir_at(t_day)[1]
     day = _smooth((el + 0.15) / 0.50)
-    bright = 0.22 + 0.78 * day
+    # Night floor scales with the moon: full-moon nights are visibly
+    # brighter than new-moon nights.
+    night_floor = 0.22 * (0.80 + 0.40 * moon_fullness())
+    bright = night_floor + (1.0 - night_floor) * day
     warm = _smooth(1.0 - abs(el) / 0.25) * (1.0 if el > -0.25 else 0.0)
     cold = _smooth((-el - 0.10) / 0.60)
     r = 1.0 + 0.20 * warm - 0.25 * cold
@@ -469,17 +547,73 @@ TRAFFIC_DENSITY_SP = [
 ]
 
 
-def traffic_density_at(t_day):
-    """Continuous 0..1 traffic density for current t_day, following the
-    São Paulo weekday profile. Cosine interpolation between hourly
-    samples so the curve is smooth across the clock."""
+# Delivery vans run on commerce hours, not commuter hours: ramp-up from
+# ~08h, sustained plateau through the 10-16h delivery window (stores
+# open, loading zones legal), tail-off after 18h. Madrugada near zero —
+# São Paulo restricts much night freight anyway.
+VAN_DENSITY_SP = [
+    0.05, 0.03, 0.03, 0.04, 0.08, 0.18,  # 00-05
+    0.35, 0.55, 0.75, 0.90, 1.00, 1.00,  # 06-11
+    0.95, 0.95, 0.95, 0.90, 0.75, 0.55,  # 12-17
+    0.40, 0.28, 0.18, 0.12, 0.08, 0.06,  # 18-23
+]
+
+# SPTrans-style bus service: near-flat headways through the service day
+# (06h-22h), reinforced at both commuter peaks, thin "corujão" (owl
+# network) overnight service rather than zero.
+BUS_DENSITY_SP = [
+    0.15, 0.08, 0.05, 0.08, 0.25, 0.55,  # 00-05
+    0.85, 1.00, 1.00, 0.90, 0.85, 0.85,  # 06-11
+    0.85, 0.85, 0.85, 0.90, 0.95, 1.00,  # 12-17
+    1.00, 0.90, 0.75, 0.55, 0.35, 0.22,  # 18-23
+]
+
+# Street life (pedestrians on city sidewalks): later and flatter than
+# car traffic — lunchtime bump, then the real peak in the early evening
+# (commerce exit + bars + dinner), tapering past midnight.
+PED_DENSITY_SP = [
+    0.10, 0.05, 0.03, 0.02, 0.03, 0.08,  # 00-05
+    0.25, 0.50, 0.65, 0.60, 0.60, 0.75,  # 06-11
+    0.85, 0.80, 0.65, 0.60, 0.70, 0.90,  # 12-17
+    1.00, 1.00, 0.95, 0.80, 0.55, 0.30,  # 18-23
+]
+
+
+def _hourly_curve_at(table, t_day):
+    """Continuous 0..1 sample of a 24-entry hourly table at t_day, with
+    cosine interpolation between hourly samples so the curve is smooth
+    across the clock."""
     t = (t_day % 1.0) * 24.0
     i = int(t) % 24
     j = (i + 1) % 24
     a = t - i
     # Cosine smoothing — softer than linear at the peaks.
     a = 0.5 - 0.5 * math.cos(a * math.pi)
-    return TRAFFIC_DENSITY_SP[i] * (1 - a) + TRAFFIC_DENSITY_SP[j] * a
+    return table[i] * (1 - a) + table[j] * a
+
+
+def traffic_density_at(t_day):
+    """Continuous 0..1 traffic density for current t_day, following the
+    São Paulo weekday profile."""
+    return _hourly_curve_at(TRAFFIC_DENSITY_SP, t_day)
+
+
+def van_density_at(t_day):
+    return _hourly_curve_at(VAN_DENSITY_SP, t_day)
+
+
+def bus_density_at(t_day):
+    return _hourly_curve_at(BUS_DENSITY_SP, t_day)
+
+
+def ped_density_at(t_day):
+    return _hourly_curve_at(PED_DENSITY_SP, t_day)
+
+
+def moto_density_at(t_day):
+    """Motorcycles track car traffic but over-index at the peaks —
+    motofrete and corredor riders thrive exactly when cars crawl."""
+    return min(1.0, traffic_density_at(t_day) * 1.25)
 
 
 def traffic_speed_factor_at(t_day):
@@ -560,6 +694,108 @@ def storm_intensity_at(t_time):
     return x * x * (3.0 - 2.0 * x)
 
 
+# --- Weather lifecycle (Phase 3.1) ----------------------------------------
+# The triple-sine storm_intensity_at above is kept as a legacy forcing
+# reference, but live weather now runs through a Markov-ish state machine:
+# storms are EVENTS with a visible build-up and decay, not a value that
+# drifts. Humidity carries between events (a rain dumps it; clear air
+# slowly recharges it, faster in summer), and the chance of a front
+# forming peaks in the late afternoon (SP convective pattern) and in
+# summer.
+WEATHER_CLEAR = 0
+WEATHER_CLOUDING = 1
+WEATHER_OVERCAST = 2
+WEATHER_RAIN = 3
+WEATHER_CLEARING = 4
+WEATHER_NAMES = ['clear', 'clouding', 'overcast', 'rain', 'clearing']
+
+# Output levels per state. Values below RAIN_ONSET darken the sky
+# without precipitation (see rain_intensity_from); the RAIN state pushes
+# past it up to its rolled peak.
+WEATHER_TARGETS = {
+    WEATHER_CLEAR: 0.0,
+    WEATHER_CLOUDING: 0.28,
+    WEATHER_OVERCAST: 0.38,
+    WEATHER_CLEARING: 0.12,
+}
+RAIN_ONSET = 0.30   # storm level where actual precipitation begins
+
+# CLI pins for --weather: each named state's steady output level.
+WEATHER_PIN = {
+    'clear': 0.0,
+    'clouding': 0.28,
+    'overcast': 0.38,
+    'rain': 0.65,
+    'storm': 0.95,
+}
+
+
+def rain_intensity_from(storm_level):
+    """Precipitation 0..1 from the unified storm level: nothing through
+    the clouding/overcast band, ramping once the cell actually opens."""
+    return max(0.0, (storm_level - RAIN_ONSET) / (1.0 - RAIN_ONSET))
+
+
+class WeatherSystem:
+    def __init__(self, seed=515):
+        self.rng = np.random.default_rng(seed)
+        self.state = WEATHER_CLEAR
+        self.t_left = float(self.rng.uniform(40.0, 160.0))
+        self.humidity = 0.55
+        self.peak = 0.0      # rolled intensity of the current rain event
+        self.level = 0.0     # smoothed output (this is storm_i)
+
+    def update(self, dt, t_day, summer_w=0.5):
+        if self.state in (WEATHER_CLEAR, WEATHER_CLOUDING):
+            self.humidity = min(1.0, self.humidity
+                                + dt * (0.0012 + 0.0018 * summer_w))
+        self.t_left -= dt
+        if self.t_left <= 0.0:
+            self._transition(t_day, summer_w)
+        target = (self.peak if self.state == WEATHER_RAIN
+                  else WEATHER_TARGETS[self.state])
+        # Fronts build a little slower than they clear.
+        tau = 25.0 if self.state in (WEATHER_CLOUDING,
+                                     WEATHER_OVERCAST) else 16.0
+        self.level += (target - self.level) * min(1.0, dt / tau)
+        return self.level
+
+    def _transition(self, t_day, summer_w):
+        rng = self.rng
+        if self.state == WEATHER_CLEAR:
+            # Convective trigger: humidity charges the gun, the
+            # afternoon heating window and summer pull the trigger.
+            hour = (t_day % 1.0) * 24.0
+            conv = math.exp(-((hour - 16.5) ** 2) / (2.0 * 3.5 ** 2))
+            p = (0.18 + 0.50 * self.humidity) \
+                * (0.40 + 0.60 * conv) * (0.55 + 0.75 * summer_w)
+            if rng.random() < p:
+                self.state = WEATHER_CLOUDING
+                self.t_left = float(rng.uniform(35.0, 80.0))
+            else:
+                self.t_left = float(rng.uniform(45.0, 170.0))
+        elif self.state == WEATHER_CLOUDING:
+            self.state = WEATHER_OVERCAST
+            self.t_left = float(rng.uniform(20.0, 55.0))
+        elif self.state == WEATHER_OVERCAST:
+            if rng.random() < 0.80:
+                self.state = WEATHER_RAIN
+                self.peak = min(1.0, (0.45 + 0.55 * self.humidity)
+                                * float(rng.uniform(0.65, 1.10)))
+                self.t_left = float(rng.uniform(45.0, 150.0))
+            else:
+                # Dry front — the deck drifts apart without opening.
+                self.state = WEATHER_CLEARING
+                self.t_left = float(rng.uniform(30.0, 70.0))
+        elif self.state == WEATHER_RAIN:
+            self.humidity = max(0.15, self.humidity - 0.35)
+            self.state = WEATHER_CLEARING
+            self.t_left = float(rng.uniform(30.0, 70.0))
+        else:  # CLEARING
+            self.state = WEATHER_CLEAR
+            self.t_left = float(rng.uniform(60.0, 280.0))
+
+
 def init_rain(seed=91):
     rng = np.random.default_rng(seed)
     pos = np.zeros((RAIN_N, 3), dtype=np.float32)
@@ -567,14 +803,18 @@ def init_rain(seed=91):
     pos[:, 1] = rng.uniform(RAIN_Y_BOTTOM, RAIN_Y_TOP, RAIN_N)
     pos[:, 2] = rng.uniform(-RAIN_BOX_Z, RAIN_BOX_Z * 0.25, RAIN_N)
     vel = np.zeros((RAIN_N, 3), dtype=np.float32)
-    vel[:, 0] = 2.2 + rng.uniform(-0.8, 0.8, RAIN_N)   # wind drift on X
+    # Per-drop X jitter; the shared wind adds on top each update so the
+    # streak slant follows the live wind vector (Phase 3.5).
+    jx = rng.uniform(-0.8, 0.8, RAIN_N).astype(np.float32)
+    vel[:, 0] = jx + 2.2
     vel[:, 1] = rng.uniform(-25.0, -17.0, RAIN_N)       # hard fall
     vel[:, 2] = rng.uniform(-0.6, 0.6, RAIN_N)
-    return pos, vel
+    return pos, vel, jx
 
 
-def update_rain(state, dt):
-    pos, vel = state
+def update_rain(state, dt, wind_x=2.2):
+    pos, vel, jx = state
+    vel[:, 0] = jx + wind_x      # streak tails read the same vector
     pos += vel * dt
     below = pos[:, 1] < RAIN_Y_BOTTOM
     outX = np.abs(pos[:, 0]) > RAIN_BOX_X
@@ -594,7 +834,7 @@ def draw_rain(state, intensity, cam_x, cam_y, cam_z):
     streak matches the motion, length approximates motion blur."""
     if intensity < 0.04:
         return
-    pos, vel = state
+    pos, vel = state[0], state[1]
     # streak ends: tail trails behind the head by streak_dt of motion
     tails = pos - vel * RAIN_STREAK_DT
     lines = np.empty((RAIN_N * 2, 3), dtype=np.float32)
@@ -629,7 +869,7 @@ def draw_rain(state, intensity, cam_x, cam_y, cam_z):
 # per output frame, so playing back faster shifts the rumble higher in
 # pitch, matching the car's wind-rush character when accelerating.
 
-_AUDIO_SAMPLE_RATE = 44100
+_AUDIO_SAMPLE_RATE = 48000
 _AUDIO_BLOCK_SIZE = 1024
 _AUDIO_VOLUME = 0.09              # quiet ambient (user asked "not aloud")
 _AUDIO_BUFFER_SEC = 30.0
@@ -744,7 +984,13 @@ class AmbientAudioMixer:
     parameter changes don't produce clicks. Thunder events are queued in
     a lock-protected list."""
 
-    def __init__(self, brown_duration_s=_AUDIO_BUFFER_SEC):
+    def __init__(self, brown_duration_s=_AUDIO_BUFFER_SEC, devices=None):
+        # devices: list of sounddevice device specs (str name, int index, or
+        # None for the system default). None or [] → single default output.
+        # With multiple entries the first stream owns the state and produces
+        # the audio block; later streams mirror that block so all outputs
+        # carry the exact same correlated bed (no drifting independent noise).
+        self._devices = list(devices) if devices else [None]
         self.brown = generate_brown_noise_buffer(brown_duration_s)
         self.rain = generate_rain_noise_buffer()
         self.wind = generate_wind_noise_buffer()
@@ -773,25 +1019,45 @@ class AmbientAudioMixer:
         self.thunder_events = []
 
         self.stream = None
+        self._streams = []
+        self._mirror_lock = threading.Lock()
+        self._mirror_block = None
 
     def start(self):
-        self.stream = _sd.OutputStream(
-            channels=1,
-            samplerate=_AUDIO_SAMPLE_RATE,
-            blocksize=_AUDIO_BLOCK_SIZE,
-            callback=self._callback,
-            dtype='float32',
-        )
-        self.stream.start()
+        self._streams = []
+        for i, dev in enumerate(self._devices):
+            cb = self._callback if i == 0 else self._mirror_callback
+            kwargs = dict(
+                channels=1,
+                samplerate=_AUDIO_SAMPLE_RATE,
+                blocksize=_AUDIO_BLOCK_SIZE,
+                callback=cb,
+                dtype='float32',
+            )
+            if dev is not None:
+                kwargs["device"] = dev
+            s = _sd.OutputStream(**kwargs)
+            s.start()
+            self._streams.append(s)
+        self.stream = self._streams[0] if self._streams else None
 
     def stop(self):
-        if self.stream is not None:
+        for s in self._streams:
             try:
-                self.stream.stop()
-                self.stream.close()
+                s.stop()
+                s.close()
             except Exception:
                 pass
-            self.stream = None
+        self._streams = []
+        self.stream = None
+
+    def _mirror_callback(self, outdata, frames, time_info, status):
+        with self._mirror_lock:
+            blk = self._mirror_block
+        if blk is None or len(blk) != frames:
+            outdata[:] = 0.0
+        else:
+            outdata[:, 0] = blk
 
     def set_speed(self, speed_factor):
         self.speed_target = float(max(0.2, min(1.8, speed_factor)))
@@ -865,10 +1131,14 @@ class AmbientAudioMixer:
                         still_running.append(ev)
             self.thunder_events = still_running
 
-        outdata[:, 0] = (brown_s * self.brown_vol
-                         + rain_s * self.rain_vol
-                         + wind_s * self.wind_vol
-                         + thunder_s)
+        mixed = (brown_s * self.brown_vol
+                 + rain_s * self.rain_vol
+                 + wind_s * self.wind_vol
+                 + thunder_s)
+        outdata[:, 0] = mixed
+        if len(self._streams) > 1:
+            with self._mirror_lock:
+                self._mirror_block = mixed.copy()
 
 
 # Back-compat alias so older code paths referencing BrownNoisePlayer
@@ -896,6 +1166,28 @@ BrownNoisePlayer = AmbientAudioMixer
 # CoreAudio; the scheduler thread just issues noteon/noteoff events.
 
 SOUNDFONT_PATH = "soundfonts/GeneralUser-GS.sf2"
+
+
+class _FluidMux:
+    """Forward every attribute access to a list of fluidsynth.Synth
+    instances, so one .noteon / .cc / .program_select call drives all of
+    them in lockstep — used when the ensemble is routed to multiple
+    CoreAudio output devices simultaneously."""
+
+    def __init__(self, synths):
+        object.__setattr__(self, "_synths", list(synths))
+
+    def __getattr__(self, name):
+        members = [getattr(s, name) for s in self._synths]
+        if not callable(members[0]):
+            return members[0]
+
+        def fanout(*args, **kwargs):
+            result = None
+            for m in members:
+                result = m(*args, **kwargs)
+            return result
+        return fanout
 
 
 class MinimalEnsemblePlayer:
@@ -964,56 +1256,77 @@ class MinimalEnsemblePlayer:
     STR_BASS_ATTACK = 2.5     # longer, very gentle attack for bass pad
     STR_BASS_RELEASE = 3.0
 
-    def __init__(self, sf2_path=SOUNDFONT_PATH, gain=0.32):
-        self.beat_sec = 60.0 / self.BPM
-        self.fs = _fluidsynth.Synth(samplerate=44100, gain=gain)
+    @staticmethod
+    def _make_synth(gain, device):
+        """Build one fluidsynth Synth bound to the given audio device.
 
-        # Clear device settings that some builds seed with the literal
-        # "default" (a string that isn't a real device on Windows, giving
-        # the 'Device "default" does not exist' error). An empty value
-        # tells the platform driver to use the OS's actual default.
-        for _setting_key in (
-            "audio.dsound.device", "audio.wasapi.device",
-            "audio.waveout.device", "audio.coreaudio.device",
-            "audio.pulseaudio.device", "audio.alsa.device",
-        ):
+        device=None → use the platform default; otherwise on macOS the
+        name is fed into audio.coreaudio.device, and we force the
+        coreaudio driver so the per-device routing actually applies."""
+        fs = _fluidsynth.Synth(samplerate=48000, gain=gain)
+        for k in ("audio.dsound.device", "audio.wasapi.device",
+                  "audio.waveout.device", "audio.coreaudio.device",
+                  "audio.pulseaudio.device", "audio.alsa.device"):
             try:
-                self.fs.setting(_setting_key, "")
+                fs.setting(k, "")
             except Exception:
                 pass
-        # We never read MIDI input (we inject notes via API). Tell
-        # fluidsynth not to try — avoids the "not enough MIDI in devices"
-        # error on systems with no MIDI hardware.
-        for _setting_key in ("midi.autoconnect",):
+        try:
+            fs.setting("midi.autoconnect", 0)
+        except Exception:
+            pass
+
+        if device:
             try:
-                self.fs.setting(_setting_key, 0)
+                fs.setting("audio.coreaudio.device", device)
             except Exception:
                 pass
-
-        # Try platform-appropriate audio drivers in order until one works.
-        _started = False
-        _last_err = None
-        for _drv in _fluidsynth_drivers_for_platform():
             try:
-                self.fs.start(driver=_drv)
-                _started = True
-                break
-            except Exception as _err:
-                _last_err = _err
-                continue
-        if not _started:
-            # Absolute fallback: let fluidsynth pick its compiled default
-            try:
-                self.fs.start()
-            except Exception as _err:
+                fs.start(driver="coreaudio")
+                return fs
+            except Exception as err:
                 raise RuntimeError(
-                    f"fluidsynth could not open any audio driver. "
-                    f"Last error: {_last_err or _err}"
+                    f"fluidsynth could not open coreaudio device {device!r}: {err}"
                 )
 
-        sfid = self.fs.sfload(sf2_path)
-        if sfid == -1:
+        started = False
+        last_err = None
+        for drv in _fluidsynth_drivers_for_platform():
+            try:
+                fs.start(driver=drv)
+                started = True
+                break
+            except Exception as err:
+                last_err = err
+        if not started:
+            try:
+                fs.start()
+            except Exception as err:
+                raise RuntimeError(
+                    f"fluidsynth could not open any audio driver. "
+                    f"Last error: {last_err or err}"
+                )
+        return fs
+
+    def __init__(self, sf2_path=SOUNDFONT_PATH, gain=0.32, devices=None):
+        # devices: list of CoreAudio output device names (or None entries for
+        # the system default). None / [] / [None] → single Synth on default.
+        # With >1 entry we build N Synth instances, each bound to one device,
+        # and mux every method call across them so they stay in lockstep.
+        self.beat_sec = 60.0 / self.BPM
+        device_list = list(devices) if devices else [None]
+        self._synths = [self._make_synth(gain, dev) for dev in device_list]
+        self.fs = (self._synths[0] if len(self._synths) == 1
+                   else _FluidMux(self._synths))
+
+        sfids = [s.sfload(sf2_path) for s in self._synths]
+        if any(sf == -1 for sf in sfids):
             raise RuntimeError(f"failed to load SoundFont at {sf2_path}")
+        if len(set(sfids)) != 1:
+            raise RuntimeError(
+                f"SoundFont id mismatch across synth instances: {sfids}"
+            )
+        sfid = sfids[0]
         # Rhodes on the melody channel, strings on CP + bass
         self.fs.program_select(self.CH_MELODY, sfid, 0, self.PROG_RHODES)
         self.fs.program_select(self.CH_CP, sfid, 0, self.PROG_STRINGS)
@@ -1778,6 +2091,35 @@ def draw_ponds(pond_tex, s_car, storm_i, horizon_rgb, amb_rgb, t_time):
     glDisable(GL_BLEND)
 
 
+def draw_shooting_star(star, cam_x, cam_y, cam_z):
+    """One meteor streak on the dome: an additive line from the head
+    back along the velocity, brightness enveloped over its short life."""
+    a = math.sin(math.pi * min(1.0, star['age'] / star['life']))
+    if a <= 0.01:
+        return
+    px, py, pz = star['p']
+    vx, vy, vz = star['v']
+    glDisable(GL_TEXTURE_2D)
+    glDisable(GL_FOG)
+    glDisable(GL_DEPTH_TEST)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+    glDepthMask(GL_FALSE)
+    glLineWidth(1.8)
+    glBegin(GL_LINES)
+    glColor4f(1.0, 0.98, 0.92, 0.95 * a)
+    glVertex3f(cam_x + px, cam_y + py, cam_z + pz)
+    glColor4f(0.6, 0.7, 1.0, 0.0)
+    glVertex3f(cam_x + px - vx * 0.14,
+               cam_y + py - vy * 0.14,
+               cam_z + pz - vz * 0.14)
+    glEnd()
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_FOG)
+
+
 def generate_bolt(rng, cam_x, cam_y, cam_z):
     """Classic storm bolt via recursive midpoint displacement (Reed &
     Wyvill 1986). Horizontal displacement decays geometrically per
@@ -2400,7 +2742,7 @@ def compute_dome_colors(vfrac, zenith, horizon):
 
 
 def draw_sky(sky_state, cam_x, cam_y, cam_z, t_time, t_day,
-             storm=0.0, flash=0.0):
+             storm=0.0, flash=0.0, cloud_phase=None):
     # sky_state can optionally include a 7th element (overcast_tex) for
     # the dense storm cloud layer. Older callers that pass only 6 still
     # work — we just skip the overcast pass.
@@ -2442,10 +2784,13 @@ def draw_sky(sky_state, cam_x, cam_y, cam_z, t_time, t_day,
         glColor4f(night_a, night_a, night_a, night_a)
         glEnableClientState(GL_TEXTURE_COORD_ARRAY)
         glTexCoordPointer(2, GL_FLOAT, 0, tcs)
-        # slow rotation for celestial drift
+        # slow drift + a gentle rotation about the texture centre so the
+        # field visibly wheels over the course of the night (Phase 3.4)
         glMatrixMode(GL_TEXTURE)
         glLoadIdentity()
-        glTranslatef(t_day * 0.5, 0.0, 0.0)
+        glTranslatef(0.5 + t_day * 0.5, 0.5, 0.0)
+        glRotatef(t_day * 30.0, 0.0, 0.0, 1.0)
+        glTranslatef(-0.5, -0.5, 0.0)
         glMatrixMode(GL_MODELVIEW)
         glDrawElements(GL_TRIANGLES, len(idx), GL_UNSIGNED_INT, idx)
         glMatrixMode(GL_TEXTURE); glLoadIdentity(); glMatrixMode(GL_MODELVIEW)
@@ -2469,7 +2814,12 @@ def draw_sky(sky_state, cam_x, cam_y, cam_z, t_time, t_day,
         glTexCoordPointer(2, GL_FLOAT, 0, tcs)
         glMatrixMode(GL_TEXTURE)
         glLoadIdentity()
-        glTranslatef(t_time * 0.004 * (1.0 + 1.5 * storm), 0.0, 0.0)
+        # cloud_phase is the wind-integrated scroll accumulated by the
+        # main loop (Phase 3.5) — clouds speed up and slow down with the
+        # live wind without jumping. Fallback keeps view.py behaviour.
+        if cloud_phase is None:
+            cloud_phase = t_time * 0.004 * (1.0 + 1.5 * storm)
+        glTranslatef(cloud_phase, 0.0, 0.0)
         glMatrixMode(GL_MODELVIEW)
         glDrawElements(GL_TRIANGLES, len(idx), GL_UNSIGNED_INT, idx)
         glMatrixMode(GL_TEXTURE); glLoadIdentity(); glMatrixMode(GL_MODELVIEW)
@@ -2528,8 +2878,13 @@ def draw_sky(sky_state, cam_x, cam_y, cam_z, t_time, t_day,
 
 # --- Sun / Moon billboards ---
 def draw_celestial(cam_x, cam_y, cam_z, direction, radius,
-                   core_color, glow_color, core_alpha=1.0):
-    """Billboard disc with soft glow, placed on the dome along `direction`."""
+                   core_color, glow_color, core_alpha=1.0,
+                   phase_frac=None):
+    """Billboard disc with soft glow, placed on the dome along `direction`.
+
+    phase_frac (moon only): 0 = new .. 1 = full. Rendered with the
+    classic occluder-disc trick — a dark disc offset across the bright
+    one carves the crescent; at full the occluder slides clear off."""
     if direction[1] < -0.25:
         return  # well below horizon
     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -2583,6 +2938,25 @@ def draw_celestial(cam_x, cam_y, cam_z, direction, radius,
         glColor4f(core_color[0], core_color[1], core_color[2], alt_fade * core_alpha)
         glVertex3f(*p)
     glEnd()
+
+    # Lunar phase occluder: a near-black disc slides across the core.
+    # New moon (0) sits dead-centre and swallows it; full (1) is fully
+    # offset and the disc reads round.
+    if phase_frac is not None and phase_frac < 0.97:
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        ro = r * 1.08
+        off = right * (r * 2.10 * phase_frac)
+        oc = center + off
+        glBegin(GL_TRIANGLE_FAN)
+        glColor4f(0.015, 0.020, 0.045, 0.94 * alt_fade * core_alpha)
+        glVertex3f(*oc)
+        for i in range(33):
+            t = 2 * math.pi * i / 32
+            p = oc + right * (ro * math.cos(t)) + up2 * (ro * math.sin(t))
+            glColor4f(0.015, 0.020, 0.045, 0.94 * alt_fade * core_alpha)
+            glVertex3f(*p)
+        glEnd()
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
 
     glDepthMask(GL_TRUE)
     glDisable(GL_BLEND)
@@ -2667,9 +3041,12 @@ def build_side_arrays(s_arr, s_car, side, t_time, amb_rgb):
     v = np.broadcast_to((s_arr * 0.08)[:, None], (NS, K))
     tcs = np.stack([u, v], axis=-1).reshape(-1, 2).astype(np.float32)
 
-    # Snow overlay alpha: full cover in frost biome, altitude cap on mountains
+    # Snow overlay alpha: full cover in frost biome, altitude cap on
+    # mountains. The snow line rides the season: ~17 m in midsummer
+    # (only the tallest peaks keep caps), down to ~6 m in deep winter.
     frost_cov = np.broadcast_to(weights[:, BIOME_FROST:BIOME_FROST + 1], (NS, K))
-    alt_cap = np.clip((y - 11.0) / 11.0, 0.0, 1.0) ** 1.4 * 0.90
+    snow_line = 17.0 - 11.0 * ENV['winter']
+    alt_cap = np.clip((y - snow_line) / 11.0, 0.0, 1.0) ** 1.4 * 0.90
     snow_a = np.maximum(frost_cov, alt_cap).reshape(-1).astype(np.float32)
 
     snow_rgba = np.zeros((NS * K, 4), dtype=np.float32)
@@ -3530,12 +3907,13 @@ def init_snow(seed=77):
     return pos, vel, seeds
 
 
-def update_snow(state, dt, t_time):
+def update_snow(state, dt, t_time, wind_x=0.0):
     pos, vel, seeds = state
-    # vertical fall + gentle horizontal swirl
+    # vertical fall + gentle horizontal swirl + a fraction of the shared
+    # wind (flakes are light but fall slowly, so they drift visibly)
     swirl_x = 0.55 * np.sin(t_time * 1.25 + seeds)
     swirl_z = 0.45 * np.cos(t_time * 0.85 + seeds * 1.3)
-    pos[:, 0] += (vel[:, 0] + swirl_x) * dt
+    pos[:, 0] += (vel[:, 0] + swirl_x + 0.20 * wind_x) * dt
     pos[:, 1] += vel[:, 1] * dt
     pos[:, 2] += (vel[:, 2] + swirl_z) * dt
 
@@ -3851,7 +4229,8 @@ def build_flower_variant(flower_tex):
     return list_id
 
 
-def draw_flowers(s_car, flower_variants, amb_rgb, t_time, wind_strength):
+def draw_flowers(s_car, flower_variants, amb_rgb, t_time, wind_strength,
+                 bloom=1.0):
     """Instance flowers + clusters along flat-ground biomes. Wind sway
     uses a larger amplitude and higher frequency than trees so flowers
     feel lighter. Distance-culled past ~280 m because they're tiny."""
@@ -3895,8 +4274,10 @@ def draw_flowers(s_car, flower_variants, amb_rgb, t_time, wind_strength):
 
             key = (int(s * 41) * 2654435761
                    + (0 if side < 0 else 3019)) & 0xFFFFFFFF
-            # Density gate — probability of a flower at this slot
-            density = 0.40 * ok
+            # Density gate — probability of a flower at this slot.
+            # `bloom` is the seasonal factor: full carpets in spring/
+            # summer, sparse survivors through the dry winter.
+            density = 0.40 * ok * bloom
             if (key & 0xFF) / 255.0 > density:
                 continue
 
@@ -5319,9 +5700,21 @@ def draw_city(s_car, building_lists, facade_texes, emission_tex,
 # metallic texture (gradient + noise + sparkle pixels) plus Blinn-Phong
 # high-shininess specular for a clearcoat look. Each variant is baked into
 # a single display list at startup; the live scene places a pool of them on
-# two lanes — player's left lane travels same direction as the player
-# (cars drift away), right lane is oncoming (cars close toward the camera).
-CAR_LANE_HALF = 2.5
+# two directions — player's left side travels the same direction as the
+# player, right side is oncoming. Each direction has two sub-lanes
+# (cruising + overtaking) and vehicles follow the IDM car-following model
+# with MOBIL-style lane changes (see update_traffic).
+#
+# Sub-lane offsets in metres from the road centreline. The OUTER
+# sub-lane (shoulder side) is the default cruising lane; the INNER one
+# (centreline side) is for overtaking. Vehicles ease between them over
+# LC_DURATION seconds when the MOBIL check approves a change.
+CAR_LANE_OUTER = 3.70
+CAR_LANE_INNER = 1.55
+LC_DURATION = 2.8        # seconds for a full lane change
+LC_COOLDOWN_MIN = 4.0    # min seconds between lane-change decisions
+LC_COOLDOWN_MAX = 9.0
+LC_B_SAFE = 2.5          # MOBIL safety: max decel imposed on new follower (m/s²)
 # Variant pool: pre-built at startup as individual display lists and
 # then instanced per-frame by the traffic system. 96 vehicles is the
 # sweet spot between "every car feels different" and "startup is
@@ -5331,27 +5724,96 @@ CAR_LANE_HALF = 2.5
 N_CAR_VARIANTS = 96
 N_CARS_PER_LANE = 10  # pool size per lane; density gate below controls
                         # how many actually draw (São Paulo weekday curve).
-# Same-direction (player's left) cars enter from behind the camera, pass
-# through, and recede into the distance. So their spawn range is *behind*
-# s_car, and they're despawned only when they drift off the far horizon.
+# Same-direction (player's left) drivers faster than the player enter
+# from behind the camera, pass through, and recede into the distance.
+# Drivers slower than the player enter far ahead instead, so the player
+# genuinely overtakes part of the flow — no more "every car outruns the
+# camera" treadmill.
 CAR_SPAWN_BEHIND_MIN = 30.0    # metres behind s_car (min)
 CAR_SPAWN_BEHIND_MAX = 260.0   # metres behind s_car (max)
+CAR_SPAWN_SLOW_AHEAD_MIN = 150.0   # slower-than-player same-dir entry range
+CAR_SPAWN_SLOW_AHEAD_MAX = 700.0
 # Oncoming (right lane) cars enter from far ahead and close on the camera,
 # despawning just after they pass.
 CAR_SPAWN_AHEAD_MIN = 120.0
 CAR_SPAWN_AHEAD_MAX = 780.0
 CAR_DESPAWN_BEHIND = 35.0      # oncoming: how far past the camera before respawn
 CAR_DESPAWN_AHEAD = 840.0      # same-dir:  how far ahead before respawn
-CAR_SPEED_ONCOMING_MIN = 20.0
-CAR_SPEED_ONCOMING_MAX = 34.0
-# Same-direction cars must always outrun the camera so they pull ahead
-# and visibly "go further" rather than being overtaken and popping out
-# of the visible window. The speed is clamped to player_speed + this
-# margin every frame inside update_cars, with a floor so stopped players
-# still see traffic move.
-CAR_SPEED_AWAY_OVER_MIN = 4.0
-CAR_SPEED_AWAY_OVER_MAX = 12.0
-CAR_SPEED_AWAY_FLOOR = 22.0
+CAR_DESPAWN_BEHIND_SAMEDIR = 80.0  # same-dir, overtaken: fell this far back
+
+# --- Car-following: IDM (Treiber, Hennecke & Helbing 2000) ---------------
+# Each vehicle accelerates toward a personal desired speed while keeping
+# a speed-dependent safe gap to its leader. Platooning, gap-keeping and
+# stop-and-go waves at rush-hour density all emerge from these few terms.
+IDM_S0 = 2.0             # standstill jam gap (m)
+IDM_DELTA = 4.0          # free-road acceleration exponent
+IDM_MAX_BRAKE = 8.0      # physical braking cap (m/s²) — emergency stop
+BRAKE_LIGHT_DECEL = 0.5  # deceleration (m/s²) at which brake lights light up
+
+# Per-class traffic parameters. v0 ranges are desired free-flow speeds
+# (m/s) rolled per driver at spawn — deliberately straddling the default
+# player cruise speed (28 m/s) so same-direction traffic is a genuine
+# mix of slower and faster vehicles. Trucks are slower, keep longer
+# headways, accelerate lazily, and mostly stay in the outer lane.
+VEH_KINDS = {
+    'car':        {'len': 4.6,
+                   'v0_away': (23.0, 37.0), 'v0_on': (20.0, 34.0),
+                   'p_inner': 0.30, 'T_add': 0.0, 'amax_mul': 1.0,
+                   'eager_mul': 1.0},
+    'truck':      {'len': 7.2,
+                   'v0_away': (19.0, 27.0), 'v0_on': (17.0, 25.0),
+                   'p_inner': 0.08, 'T_add': 0.45, 'amax_mul': 0.6,
+                   'eager_mul': 0.45},
+    # Motorcycles: quick, short headways, eager — and they lane-split
+    # ("corredor") between the two sub-lanes when traffic crawls.
+    'motorcycle': {'len': 2.2,
+                   'v0_away': (26.0, 40.0), 'v0_on': (22.0, 36.0),
+                   'p_inner': 0.45, 'T_add': -0.25, 'amax_mul': 1.6,
+                   'eager_mul': 1.6},
+    # Delivery vans: between car and truck in pace and patience.
+    'van':        {'len': 5.4,
+                   'v0_away': (21.0, 31.0), 'v0_on': (19.0, 29.0),
+                   'p_inner': 0.18, 'T_add': 0.20, 'amax_mul': 0.85,
+                   'eager_mul': 0.8},
+    # City buses: slow, heavy, stay in the outer lane and pull over at
+    # hashed bus-stop slots inside city zones (see update_traffic).
+    'bus':        {'len': 11.5,
+                   'v0_away': (17.0, 23.0), 'v0_on': (16.0, 22.0),
+                   'p_inner': 0.0, 'T_add': 0.60, 'amax_mul': 0.45,
+                   'eager_mul': 0.25},
+    # Emergency (ambulance/police): rare event vehicle — dormant most of
+    # the time, then activates behind the camera, runs fast up the inner
+    # lane with strobes while traffic ahead yields to the outer lane.
+    'emergency':  {'len': 5.6,
+                   'v0_away': (38.0, 46.0), 'v0_on': (34.0, 42.0),
+                   'p_inner': 0.90, 'T_add': -0.40, 'amax_mul': 1.5,
+                   'eager_mul': 2.5},
+}
+
+# Bus stops live on a fixed grid along the road; a slot is only a real
+# stop where the curb side of that direction is in a city zone.
+BUS_STOP_SPACING = 380.0
+BUS_DWELL_MIN = 5.0
+BUS_DWELL_MAX = 10.0
+BUS_CURB_SHIFT = 0.55       # extra outward offset while serving a stop (m)
+
+# Emergency-run cadence: dormant gap between runs (seconds).
+EMERG_GAP_MIN = 90.0
+EMERG_GAP_MAX = 240.0
+EMERG_YIELD_AHEAD = 140.0   # traffic within this range ahead pulls over
+EMERG_PARK_S = 2500.0       # dormant parking offset behind the camera
+
+# Driver personalities, rolled once per spawned vehicle. T is desired
+# time headway (s); a_max comfortable acceleration and b comfortable
+# braking (m/s²); eager scales the lane-change incentive threshold.
+# Roughly: 20% aggressive / 60% normal / 20% calm, each with per-driver
+# jitter applied in _roll_driver so no two drivers are identical.
+DRIVER_PROFILES = [
+    # (weight, v0_mul, T,    a_max, b,    eager)
+    (0.20,    1.12,   1.15,  1.9,   2.7,  1.5),   # aggressive
+    (0.60,    1.00,   1.50,  1.5,   2.2,  1.0),   # normal
+    (0.20,    0.88,   1.95,  1.2,   1.8,  0.6),   # calm
+]
 
 # Automotive paint palette — broad spread mirroring real-world colour
 # popularity (reds / blacks / whites / silvers / greys dominate per
@@ -5537,6 +5999,8 @@ def _generate_car_params(rng):
 
     W_cabin = W * float(rng.uniform(0.82, 0.90))
     color = CAR_PALETTE[int(rng.integers(0, len(CAR_PALETTE)))]
+    # Light per-car grime — most cars are washed; a few are dusty.
+    color = _grime_color(color, float(rng.uniform(0.0, 1.0)), 0.12)
 
     zh = W / 2
     station_defs = [
@@ -6019,82 +6483,611 @@ def build_car_variants(n=N_CAR_VARIANTS):
     return [build_car_variant(5000 + i) for i in range(n)]
 
 
-def _car_speed_for(lane, player_speed, rng):
-    if lane == -1:
-        # Always faster than the camera so the car recedes away.
-        base = max(CAR_SPEED_AWAY_FLOOR, float(player_speed))
-        return base + float(rng.uniform(CAR_SPEED_AWAY_OVER_MIN,
-                                        CAR_SPEED_AWAY_OVER_MAX))
-    return float(rng.uniform(CAR_SPEED_ONCOMING_MIN,
-                             CAR_SPEED_ONCOMING_MAX))
+def _roll_driver(rng, kind):
+    """Roll a persistent driver personality for a freshly spawned vehicle.
+    Weighted pick from DRIVER_PROFILES, then per-driver jitter so even
+    two 'normal' drivers differ. Also rolls the headlight thresholds:
+    hl_thr is the night factor at which this driver switches lights on
+    (so the fleet's lights pop on progressively across dusk, not all at
+    once), hl_storm_thr the storm intensity for daytime lights-on."""
+    k = VEH_KINDS[kind]
+    r = float(rng.random())
+    acc = 0.0
+    chosen = DRIVER_PROFILES[-1]
+    for prof in DRIVER_PROFILES:
+        acc += prof[0]
+        if r <= acc:
+            chosen = prof
+            break
+    _, v0_mul, T, amax, b, eager = chosen
+
+    def jit(x, j):
+        return x * float(rng.uniform(1.0 - j, 1.0 + j))
+
+    return {
+        'v0_mul': jit(v0_mul, 0.05),
+        'T': jit(T, 0.12) + k['T_add'],
+        'amax': jit(amax, 0.12) * k['amax_mul'],
+        'b': jit(b, 0.10),
+        'eager': eager * k['eager_mul'],
+        'hl_thr': float(rng.uniform(0.04, 0.30)),
+        'hl_storm_thr': float(rng.uniform(0.28, 0.48)),
+    }
 
 
-def _car_respawn_s(lane, s_car, rng):
+def _car_respawn_s(lane, s_car, rng, v0=None, player_speed=0.0):
     if lane == -1:
-        # Enter from behind the camera — offset is negative.
-        return s_car - float(rng.uniform(CAR_SPAWN_BEHIND_MIN,
-                                         CAR_SPAWN_BEHIND_MAX))
+        # Same-direction placement depends on relative pace: faster
+        # drivers enter from behind the camera and overtake it; slower
+        # (or near-pace) drivers enter far ahead and get reeled in.
+        if v0 is None or v0 >= float(player_speed) + 2.0:
+            return s_car - float(rng.uniform(CAR_SPAWN_BEHIND_MIN,
+                                             CAR_SPAWN_BEHIND_MAX))
+        return s_car + float(rng.uniform(CAR_SPAWN_SLOW_AHEAD_MIN,
+                                         CAR_SPAWN_SLOW_AHEAD_MAX))
     # Oncoming: far ahead so they have room to close on the camera.
     return s_car + float(rng.uniform(CAR_SPAWN_AHEAD_MIN,
                                      CAR_SPAWN_AHEAD_MAX))
 
 
+def _occupies(c, sub):
+    """True if vehicle c currently occupies sub-lane `sub`. A vehicle
+    mid-change straddles the divider and occupies both sub-lanes, so
+    followers in either lane respect it. A lane-splitting motorcycle
+    rides the divider itself and blocks neither lane; off-split motos
+    get a much narrower straddle window than cars — they are 0.8 m
+    wide, and a near-miss beside them is corredor, not a crash."""
+    if c.get('split'):
+        return False
+    if sub == c.get('sub'):
+        return True     # committed target lane counts from decision time
+    lo, hi = ((0.45, 0.55) if c.get('kind') == 'motorcycle'
+              else (0.18, 0.82))
+    if sub == 1:
+        return c['lf'] > lo
+    return c['lf'] < hi
+
+
+def _spawn_clear_s(lane, sub, s_car, rng, v0, player_speed, others):
+    """Pick a respawn position with a clear gap in the target sub-lane.
+
+    Clearance is closing-speed aware: a fast driver spawning behind a
+    slow leader needs braking distance, not a flat margin — a flat 30 m
+    in front of a 17 m/s car is a guaranteed rear-ending for a 39 m/s
+    spawn. Retries inside the normal entry window first; if the window
+    is crowded, falls back beyond the farthest occupant on the entry
+    side with the same speed-aware margin."""
+    same = [o for o in others if o['lane'] == lane and _occupies(o, sub)
+            and not o.get('parked')]
+    dirn = 1.0 if lane == -1 else -1.0
+    v_new = v0 if v0 is not None else 25.0
+
+    def clear(s):
+        for o in same:
+            rel = (o['s'] - s) * dirn      # >0: o is ahead of the spawn
+            if rel >= 0.0:
+                need = 30.0 + max(0.0, v_new ** 2
+                                  - o['speed'] ** 2) / 10.0
+            else:
+                need = 30.0 + max(0.0, o['speed'] ** 2
+                                  - v_new ** 2) / 10.0
+            if abs(rel) < need:
+                return False
+        return True
+
+    for _ in range(10):
+        s = _car_respawn_s(lane, s_car, rng, v0, player_speed)
+        if clear(s):
+            return s
+    if not same:
+        return _car_respawn_s(lane, s_car, rng, v0, player_speed)
+    # Entry window crowded: walk outward beyond the occupied span on the
+    # entry side, verifying each slot with the same speed-aware
+    # clearance. Candidates outside the legal window are DISCARDED, not
+    # clamped — a clamp stuffs the spawn onto whatever vehicle lingers
+    # at the window edge.
+    if lane == -1 and (v0 is None or v0 >= float(player_speed) + 2.0):
+        # Entry behind the camera: depth is effectively unbounded.
+        lo_s = min(o['s'] for o in same)
+        for d in (40.0, 100.0, 200.0, 400.0):
+            if clear(lo_s - d):
+                return lo_s - d
+        return lo_s - 400.0
+    win_hi = s_car + CAR_DESPAWN_AHEAD - 20.0
+    hi_s = max(o['s'] for o in same)
+    for d in (40.0, 100.0, 200.0):
+        c0 = hi_s + d
+        if c0 <= win_hi and clear(c0):
+            return c0
+    return None     # nowhere safe this frame — caller parks & retries
+
+
+def _respawn_vehicle(c, rng, kind, n_variants, s_car, player_speed,
+                     cond_v, others):
+    """(Re)roll everything that makes a vehicle an individual: variant,
+    driver personality, desired speed, sub-lane, density threshold —
+    then place it at a clear spot for its pace."""
+    k = VEH_KINDS[kind]
+    prof = _roll_driver(rng, kind)
+    v0 = float(rng.uniform(*(k['v0_away'] if c['lane'] == -1
+                             else k['v0_on']))) * prof['v0_mul']
+    sub = 1 if float(rng.random()) < k['p_inner'] else 0
+    c['variant'] = int(rng.integers(0, n_variants))
+    c['kind'] = kind
+    c['len'] = k['len']
+    c['v0'] = v0
+    c['speed'] = v0 * min(1.0, cond_v)
+    c['accel'] = 0.0
+    # Lane-change state: sub is the target sub-lane (0 outer / 1 inner),
+    # lf the continuous fraction eased toward it, off/doff the current
+    # lateral offset (m from centreline) and its rate (m/s).
+    c['sub'] = sub
+    c['lf'] = float(sub)
+    c['off'] = CAR_LANE_OUTER + (CAR_LANE_INNER - CAR_LANE_OUTER) * sub
+    c['doff'] = 0.0
+    c['lc_cool'] = float(rng.uniform(LC_COOLDOWN_MIN, LC_COOLDOWN_MAX))
+    # Personality, flattened onto the vehicle for cheap access.
+    c['T'] = prof['T']
+    c['amax'] = prof['amax']
+    c['bcomf'] = prof['b']
+    c['eager'] = prof['eager']
+    c['hl_thr'] = prof['hl_thr']
+    c['hl_storm_thr'] = prof['hl_storm_thr']
+    # Per-car visibility threshold [0, 1]. The car is rendered only when
+    # the live traffic density > this value, so as density rises (rush
+    # hour) more of the pool turns on.
+    c['vis'] = float(rng.uniform(0.0, 1.0))
+    s_new = _spawn_clear_s(c['lane'], sub, s_car, rng, v0,
+                           player_speed, others)
+    if s_new is None:
+        # No safe slot this frame: hold far off-stage (jittered so
+        # simultaneous parkers don't stack) and flag as parked — the
+        # despawn check re-triggers respawn until a slot opens.
+        c['s'] = s_car - 1200.0 - float(rng.uniform(0.0, 300.0))
+        c['speed'] = 0.0
+        c['parked'] = True
+    else:
+        c['s'] = s_new
+        c['parked'] = False
+    # Kind-specific behaviour state.
+    if kind == 'motorcycle':
+        c['split'] = False
+    elif kind == 'bus':
+        c['bus_stop_s'] = None      # s of the stop being served, if any
+        c['bus_dwell'] = 0.0        # remaining door-open time
+        c['curb'] = 0.0             # eased 0..1 curb pull-over fraction
+    elif kind == 'emergency':
+        # Emergency vehicles are always rendered when active (vis 0) and
+        # start dormant, parked far off-screen until their timer fires.
+        c['vis'] = 0.0
+        if 'em_active' not in c:
+            c['em_active'] = False
+            c['em_timer'] = float(rng.uniform(40.0, 160.0))
+            c['s'] = s_car - EMERG_PARK_S
+            c['speed'] = 0.0
+
+
 def init_cars(seed=303, s_car=0.0, player_speed=0.0,
-              n_variants=N_CAR_VARIANTS, n_per_lane=N_CARS_PER_LANE):
+              n_variants=N_CAR_VARIANTS, n_per_lane=N_CARS_PER_LANE,
+              kind='car', lanes=(-1, +1)):
     rng = np.random.default_rng(seed)
     cars = []
-    for lane in (-1, +1):
+    for lane in lanes:
         for _ in range(n_per_lane):
-            cars.append({
-                'variant': int(rng.integers(0, n_variants)),
-                'lane': lane,
-                's': _car_respawn_s(lane, s_car, rng),
-                'speed': _car_speed_for(lane, player_speed, rng),
-                # Per-car visibility threshold [0, 1]. The car is rendered
-                # only when the live traffic density > this value, so as
-                # density rises (rush hour) more of the pool turns on.
-                # At density 1.0 everything is visible; at density 0.1
-                # only the ~10% with lowest thresholds show.
-                'vis': float(rng.uniform(0.0, 1.0)),
-            })
-    return {'cars': cars, 'rng': rng, 'n_variants': n_variants}
+            c = {'lane': lane}
+            _respawn_vehicle(c, rng, kind, n_variants, s_car,
+                             player_speed, 1.0, cars)
+            cars.append(c)
+    return {'cars': cars, 'rng': rng, 'n_variants': n_variants,
+            'kind': kind}
 
 
-def update_cars(state, dt, s_car, player_speed):
-    rng = state['rng']
-    for c in state['cars']:
-        if c['lane'] == -1:
-            # Clamp same-direction cars to always outrun the camera so
-            # they actually pull ahead and pass it after spawning behind.
-            margin = max(CAR_SPEED_AWAY_OVER_MIN,
-                         c['speed'] - max(CAR_SPEED_AWAY_FLOOR,
-                                          float(player_speed)))
-            margin = min(margin, CAR_SPEED_AWAY_OVER_MAX)
-            c['speed'] = max(CAR_SPEED_AWAY_FLOOR,
-                             float(player_speed)) + margin
-            c['s'] += c['speed'] * dt
-            # Respawn behind the camera once the car has disappeared off
-            # the far horizon ahead. (Never respawn on the "behind" side —
-            # they *live* behind until they pass the camera.)
-            if c['s'] > s_car + CAR_DESPAWN_AHEAD:
-                c['s'] = _car_respawn_s(-1, s_car, rng)
-                c['variant'] = int(rng.integers(0, state['n_variants']))
-                c['speed'] = _car_speed_for(-1, player_speed, rng)
-                c['vis'] = float(rng.uniform(0.0, 1.0))
-        else:
-            # Oncoming: closing on the camera.
-            c['s'] -= c['speed'] * dt
-            if c['s'] < s_car - CAR_DESPAWN_BEHIND:
-                c['s'] = _car_respawn_s(+1, s_car, rng)
-                c['variant'] = int(rng.integers(0, state['n_variants']))
-                c['speed'] = _car_speed_for(+1, player_speed, rng)
-                c['vis'] = float(rng.uniform(0.0, 1.0))
+def _bus_next_stop(c, dirn):
+    """Next bus-stop slot ahead of bus c in its travel direction, or
+    None. Stops sit on a fixed BUS_STOP_SPACING grid along s and only
+    exist where the curb side of this direction is in a city zone."""
+    s = c['s']
+    if dirn > 0:
+        base = math.ceil((s + 15.0) / BUS_STOP_SPACING)
+        cands = [(base + k) * BUS_STOP_SPACING for k in range(3)]
+    else:
+        base = math.floor((s - 15.0) / BUS_STOP_SPACING)
+        cands = [(base - k) * BUS_STOP_SPACING for k in range(3)]
+    for cand in cands:
+        if abs(cand - s) > 700.0:
+            break
+        if city_weight_at(cand, c['lane']) > 0.5:
+            return float(cand)
+    return None
+
+
+def _idm_accel(v, v0, gap, dv, T, amax, b):
+    """Intelligent Driver Model acceleration. gap is the bumper gap to
+    the leader (None on a free road); dv the closing speed v - v_lead."""
+    v0 = max(v0, 0.1)
+    free = 1.0 - (max(v, 0.0) / v0) ** IDM_DELTA
+    if gap is None:
+        a = amax * free
+    else:
+        s_star = IDM_S0 + max(0.0, v * T + v * dv /
+                              (2.0 * math.sqrt(amax * b)))
+        a = amax * (free - (s_star / max(gap, 0.5)) ** 2)
+    return max(-IDM_MAX_BRAKE, min(a, amax))
+
+
+def update_traffic(states, dt, s_car, player_speed,
+                   t_day=0.5, storm_i=0.0, frost_i=0.0, night_a=0.0):
+    """Per-frame traffic physics for all vehicle pools together — cars
+    and trucks share the road, so leader search must span both pools.
+
+    Behaviour stack:
+      * IDM car-following: vehicles accelerate/brake toward a personal
+        desired speed while keeping speed-dependent gaps; platooning and
+        slowdown waves emerge at rush-hour density.
+      * Driver personalities rolled at spawn (aggressive/normal/calm).
+      * Two sub-lanes per direction with MOBIL-style overtaking and
+        keep-right discipline, animated over LC_DURATION seconds.
+      * Desired speed coupled to congestion (São Paulo hourly curve),
+        rain, frost and night; headway opens up on a wet road.
+    """
+    if dt <= 0.0:
+        return
+    rng = states[0]['rng']
+    # Global condition factors: congestion via the SP density curve,
+    # then weather and dusk caution. Applied to every driver's desired
+    # speed so the whole flow slows together at rush hour / in rain.
+    cond_v = (traffic_speed_factor_at(t_day)
+              * (1.0 - 0.22 * storm_i)
+              * (1.0 - 0.32 * frost_i)
+              * (1.0 - 0.07 * night_a))
+    # Wet roads also stretch the desired time headway — drivers keep
+    # visibly larger gaps in rain and frost.
+    T_mult = 1.0 + 0.40 * storm_i + 0.25 * frost_i
+
+    all_veh = [c for st in states for c in st['cars']]
+
+    # --- emergency vehicle lifecycle ---
+    # Dormant units sit parked far off-screen counting down; when the
+    # timer fires they re-roll and launch from behind the camera. Active
+    # units are collected so traffic ahead can yield this same frame.
+    em_actives = []
+    for st in states:
+        if st['kind'] != 'emergency':
+            continue
+        for c in st['cars']:
+            if c.get('em_active'):
+                em_actives.append(c)
+                continue
+            c['em_timer'] -= dt
+            c['s'] = s_car - EMERG_PARK_S
+            c['speed'] = 0.0
+            c['accel'] = 0.0
+            if c['em_timer'] <= 0.0:
+                _respawn_vehicle(c, st['rng'], 'emergency',
+                                 st['n_variants'], s_car, player_speed,
+                                 cond_v,
+                                 [o for o in all_veh if o is not c])
+                c['em_active'] = True
+                # Code-3 runs always take the inner lane — that's the
+                # side everyone else yields away from — and launch from
+                # a speed-aware clear slot behind the camera.
+                c['sub'] = 1
+                c['lf'] = 1.0
+                c['off'] = CAR_LANE_INNER
+                s_new = _spawn_clear_s(-1, 1, s_car, st['rng'],
+                                       c['v0'], player_speed,
+                                       [o for o in all_veh
+                                        if o is not c])
+                if s_new is None:
+                    # No safe launch slot — stand down, retry shortly.
+                    c['em_active'] = False
+                    c['em_timer'] = 10.0
+                    c['s'] = s_car - EMERG_PARK_S
+                else:
+                    c['s'] = s_new
+                    c['speed'] = max(30.0, float(player_speed) + 8.0)
+                    em_actives.append(c)
+
+    for lane in (-1, +1):
+        # Sort by forward progress: ascending s for the same-direction
+        # side, descending s for oncoming — so "ahead" is always a
+        # higher index and a single scan finds leaders/followers.
+        # Dormant emergency units and park-retrying respawners are
+        # off-stage and excluded.
+        group = [c for c in all_veh if c['lane'] == lane
+                 and not c.get('parked')
+                 and (c['kind'] != 'emergency' or c['em_active'])]
+        group.sort(key=(lambda c: c['s']) if lane == -1
+                   else (lambda c: -c['s']))
+
+        def ahead_of(idx, sub):
+            me = group[idx]
+            for j in range(idx + 1, len(group)):
+                o = group[j]
+                if _occupies(o, sub):
+                    return o, abs(o['s'] - me['s']) - 0.5 * (o['len']
+                                                             + me['len'])
+            return None, None
+
+        def behind_of(idx, sub):
+            me = group[idx]
+            for j in range(idx - 1, -1, -1):
+                o = group[j]
+                if _occupies(o, sub):
+                    return o, abs(me['s'] - o['s']) - 0.5 * (o['len']
+                                                             + me['len'])
+            return None, None
+
+        def lane_clear(idx, sub, front=8.0, rear=6.0):
+            """Physical room check for forced merges (yield / bus stop /
+            split exit). Closing-speed aware: merging at 14 m/s in front
+            of a stopped bus needs braking distance, not 8 metres."""
+            me = group[idx]
+            o, g = ahead_of(idx, sub)
+            if o is not None and g is not None:
+                need = front + max(0.0, (me['speed'] ** 2
+                                         - o['speed'] ** 2) / 10.0)
+                if g < need:
+                    return False
+            o, g = behind_of(idx, sub)
+            if o is not None and g is not None:
+                need = rear + max(0.0, (o['speed'] ** 2
+                                        - me['speed'] ** 2) / 10.0)
+                if g < need:
+                    return False
+            return True
+
+        for i, c in enumerate(group):
+            kind = c['kind']
+            v0_eff = c['v0'] * cond_v
+            T_eff = c['T'] * T_mult
+
+            # --- emergency runs hot: sirens clear the congestion ---
+            if kind == 'emergency':
+                v0_eff = max(c['v0'] * cond_v, float(player_speed) + 6.0,
+                             30.0)
+
+            # --- yield to an active emergency vehicle approaching from
+            # behind: pull to the outer lane and ease off the gas ---
+            if em_actives and kind != 'emergency' and lane == -1:
+                for em in em_actives:
+                    rel = c['s'] - em['s']
+                    if -8.0 < rel < EMERG_YIELD_AHEAD:
+                        v0_eff *= 0.75
+                        if c.get('split') and lane_clear(i, 0):
+                            c['split'] = False
+                            c['sub'] = 0
+                        elif (c['sub'] == 1 and abs(c['lf'] - 1.0) < 0.05
+                                and lane_clear(i, 0)):
+                            c['sub'] = 0
+                            c['lc_cool'] = float(
+                                rng.uniform(LC_COOLDOWN_MIN,
+                                            LC_COOLDOWN_MAX))
+                        break
+
+            # --- bus stops: dwell at the curb with the doors open ---
+            if kind == 'bus':
+                if c['bus_dwell'] > 0.0:
+                    c['bus_dwell'] -= dt
+                    c['accel'] = 0.0
+                    c['speed'] = 0.0
+                    c['curb'] = min(1.0, c['curb'] + dt / 1.2)
+                    c['off'] = CAR_LANE_OUTER + BUS_CURB_SHIFT * c['curb']
+                    c['doff'] = 0.0
+                    if c['bus_dwell'] <= 0.0:
+                        c['bus_stop_s'] = None    # served — pull out
+                    continue
+                dirn = 1.0 if lane == -1 else -1.0
+                if c['bus_stop_s'] is None:
+                    c['bus_stop_s'] = _bus_next_stop(c, dirn)
+                if c['bus_stop_s'] is not None:
+                    dist = (c['bus_stop_s'] - c['s']) * dirn
+                    if dist <= 0.0:
+                        c['bus_stop_s'] = None
+                    elif dist < 90.0:
+                        # Serve from the outer lane with a comfortable
+                        # ~1.1 m/s² approach profile to a standstill. A
+                        # bus stuck in the inner lane with no room to
+                        # merge out skips this stop and catches the next.
+                        if c['sub'] != 0 and not lane_clear(i, 0):
+                            c['bus_stop_s'] = None
+                            c['curb'] = max(0.0, c['curb'] - dt / 1.5)
+                        else:
+                            c['sub'] = 0
+                            # ~0.9 m/s² target decel — gentle enough
+                            # that followers track it comfortably.
+                            v0_eff = min(v0_eff,
+                                         math.sqrt(1.8 * max(dist - 1.2,
+                                                             0.0)))
+                            if dist < 40.0:
+                                c['curb'] = min(1.0, c['curb'] + dt / 1.2)
+                            if dist < 2.5 and c['speed'] < 1.2:
+                                c['speed'] = 0.0
+                                c['bus_dwell'] = float(
+                                    rng.uniform(BUS_DWELL_MIN,
+                                                BUS_DWELL_MAX))
+                                continue
+                    else:
+                        c['curb'] = max(0.0, c['curb'] - dt / 1.5)
+                else:
+                    c['curb'] = max(0.0, c['curb'] - dt / 1.5)
+
+            ld, gap = ahead_of(i, c['sub'])
+            dv = c['speed'] - ld['speed'] if ld is not None else 0.0
+            acc = _idm_accel(c['speed'], v0_eff,
+                             gap if ld is not None else None, dv,
+                             T_eff, c['amax'], c['bcomf'])
+            # A mid-change vehicle still physically straddles its old
+            # sub-lane — keep respecting that lane's leader until the
+            # body has fully crossed the divider, or it will roll into
+            # the very vehicle it is pulling out from behind.
+            if not c.get('split') and abs(c['lf'] - c['sub']) > 0.02:
+                old = 1 - c['sub']
+                if _occupies(c, old):
+                    ld_o, gap_o = ahead_of(i, old)
+                    if ld_o is not None:
+                        acc = min(acc, _idm_accel(
+                            c['speed'], v0_eff, gap_o,
+                            c['speed'] - ld_o['speed'],
+                            T_eff, c['amax'], c['bcomf']))
+
+            # --- motorcycle corredor: filter between the sub-lanes when
+            # the flow crawls, drop back into a lane when it frees up ---
+            if kind == 'motorcycle':
+                if not c['split']:
+                    # Corredor only happens in genuinely crawling
+                    # traffic — a slow leader on an open night road is
+                    # an overtake (MOBIL), not a filter.
+                    if (ld is not None and gap is not None and gap < 30.0
+                            and ld['speed'] < 15.0
+                            and ld['speed'] < 0.6 * v0_eff
+                            and c['speed'] < 0.75 * v0_eff):
+                        c['split'] = True
+                        c['lc_cool'] = float(rng.uniform(2.0, 4.0))
+                else:
+                    ld_in, gap_in = ahead_of(i, 1)
+                    ld_out, gap_out = ahead_of(i, 0)
+                    gi = gap_in if gap_in is not None else 1e9
+                    go = gap_out if gap_out is not None else 1e9
+                    if (ld_in is not None and ld_out is not None
+                            and abs(ld_in['s'] - ld_out['s']) < 8.0):
+                        # Side-by-side pair: a wall even for a filtering
+                        # moto — fall in behind the nearer of the two.
+                        ld, gap = ((ld_in, gi) if gi < go
+                                   else (ld_out, go))
+                        acc = _idm_accel(c['speed'], v0_eff, gap,
+                                         c['speed'] - ld['speed'],
+                                         0.5, c['amax'], c['bcomf'])
+                    else:
+                        # Filter forward a notch above the flow speed.
+                        near = [x for x, g in ((ld_in, gi), (ld_out, go))
+                                if x is not None and g < 35.0]
+                        v_cap = (min(x['speed'] for x in near) + 8.0
+                                 if near else v0_eff)
+                        acc = _idm_accel(c['speed'],
+                                         max(min(v0_eff, v_cap), 1.0),
+                                         None, 0.0, T_eff,
+                                         c['amax'], c['bcomf'])
+                    done = ((ld_in is None or gi > 45.0
+                             or ld_in['speed'] > 0.8 * v0_eff)
+                            and (ld_out is None or go > 45.0
+                                 or ld_out['speed'] > 0.8 * v0_eff))
+                    if done and c['lc_cool'] <= 0.0:
+                        # Drop back into whichever lane has room — both
+                        # front AND rear clearance; stay on the divider
+                        # until a slot opens.
+                        prefer = 1 if gi >= go else 0
+                        for cand in (prefer, 1 - prefer):
+                            if lane_clear(i, cand, front=10.0, rear=8.0):
+                                c['split'] = False
+                                c['sub'] = cand
+                                break
+
+            # --- MOBIL-lite lane decisions ---
+            c['lc_cool'] = max(0.0, c['lc_cool'] - dt)
+            mid_change = abs(c['lf'] - c['sub']) > 0.02
+            if (not mid_change and c['lc_cool'] <= 0.0
+                    and not c.get('split')):
+                other = 1 - c['sub']
+                ld2, gap2 = ahead_of(i, other)
+                dv2 = c['speed'] - ld2['speed'] if ld2 is not None else 0.0
+                acc_other = _idm_accel(c['speed'], v0_eff,
+                                       gap2 if ld2 is not None else None,
+                                       dv2, T_eff, c['amax'], c['bcomf'])
+                # Safety: the would-be follower in the target lane must
+                # not be forced to brake harder than LC_B_SAFE.
+                fol, fgap = behind_of(i, other)
+                safe = True
+                if fol is not None:
+                    # IDM alone approves any gap when the cut-in is
+                    # faster than the follower (opening gap), so keep an
+                    # absolute physical floor too — never drop in within
+                    # a few metres of someone's bumper.
+                    facc = _idm_accel(fol['speed'], fol['v0'] * cond_v,
+                                      fgap, fol['speed'] - c['speed'],
+                                      fol['T'] * T_mult, fol['amax'],
+                                      fol['bcomf'])
+                    safe = (facc > -LC_B_SAFE
+                            and (fgap is None or fgap > 4.0))
+                if safe and ld2 is not None and gap2 is not None:
+                    safe = gap2 > 4.0
+                if safe and other == 1:
+                    # Overtake: move inside only when the inner lane is
+                    # clearly better. Eager (aggressive) drivers need
+                    # less advantage; calm drivers and trucks need more.
+                    if acc_other - acc > 0.30 / max(c['eager'], 0.2):
+                        c['sub'] = 1
+                        c['lc_cool'] = float(rng.uniform(LC_COOLDOWN_MIN,
+                                                         LC_COOLDOWN_MAX))
+                elif safe:
+                    # Keep-right discipline: return to the cruising lane
+                    # once it is essentially free (long gap, no cost).
+                    clear = (ld2 is None
+                             or gap2 > c['speed'] * T_eff * 2.2 + 8.0)
+                    if clear and acc_other > acc - 0.10:
+                        c['sub'] = 0
+                        c['lc_cool'] = float(rng.uniform(LC_COOLDOWN_MIN,
+                                                         LC_COOLDOWN_MAX))
+
+            # --- integrate ---
+            c['accel'] = acc
+            c['speed'] = max(0.0, c['speed'] + acc * dt)
+            c['s'] += c['speed'] * dt * (1.0 if lane == -1 else -1.0)
+
+            # Ease the lateral lane-change animation. doff (lateral
+            # rate) feeds the heading tilt in draw_cars so the manoeuvre
+            # reads as steering, not sliding. A splitting motorcycle
+            # targets the lane divider (lf 0.5) instead of a lane centre;
+            # a bus serving a stop adds an extra curbside pull-out.
+            target = 0.5 if c.get('split') else float(c['sub'])
+            if c['lf'] < target:
+                c['lf'] = min(target, c['lf'] + dt / LC_DURATION)
+            elif c['lf'] > target:
+                c['lf'] = max(target, c['lf'] - dt / LC_DURATION)
+            lf = c['lf']
+            sm = lf * lf * (3.0 - 2.0 * lf)
+            off = CAR_LANE_OUTER + (CAR_LANE_INNER - CAR_LANE_OUTER) * sm
+            if kind == 'bus' and c['curb'] > 0.0:
+                off += BUS_CURB_SHIFT * c['curb']
+            c['doff'] = (off - c['off']) / dt
+            c['off'] = off
+
+    # --- despawn / respawn (per pool, so each keeps its own rng) ---
+    for st in states:
+        for c in st['cars']:
+            if st['kind'] == 'emergency':
+                # Active units that cleared the horizon go dormant until
+                # the next run; dormant units never recycle normally.
+                if (c.get('em_active')
+                        and c['s'] > s_car + CAR_DESPAWN_AHEAD):
+                    c['em_active'] = False
+                    c['em_timer'] = float(st['rng'].uniform(
+                        EMERG_GAP_MIN, EMERG_GAP_MAX))
+                    c['s'] = s_car - EMERG_PARK_S
+                    c['speed'] = 0.0
+                    c['accel'] = 0.0
+                continue
+            if c['lane'] == -1:
+                gone = c['s'] > s_car + CAR_DESPAWN_AHEAD
+                # Overtaken vehicles that fell far behind recycle too —
+                # but only if they have no chance of catching back up.
+                if (c['s'] < s_car - CAR_DESPAWN_BEHIND_SAMEDIR
+                        and c['v0'] <= float(player_speed) + 2.0):
+                    gone = True
+            else:
+                gone = c['s'] < s_car - CAR_DESPAWN_BEHIND
+            if gone:
+                _respawn_vehicle(c, st['rng'], st['kind'],
+                                 st['n_variants'], s_car, player_speed,
+                                 cond_v,
+                                 [o for o in all_veh if o is not c])
 
 
 def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
-              night_a, flare_tex, density=1.0):
+              night_a, flare_tex, density=1.0, storm_i=0.0, t_time=0.0):
     if not state['cars']:
         return
+    kind = state.get('kind', 'car')
 
     glEnable(GL_LIGHTING)
     glEnable(GL_LIGHT0)
@@ -6137,18 +7130,42 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
         cy = curve_y(s)
         cz = -(s - s_car)
         lane_sign = c['lane']  # -1 = left of player, +1 = right
-        cx += lane_sign * CAR_LANE_HALF
+        cx += lane_sign * c['off']
+        # Storm-gust lateral buffeting: tall/light vehicles wander a few
+        # centimetres in heavy wind (Phase 3.5). Visual only — the IDM
+        # lane state is untouched.
+        if storm_i > 0.05 and kind in ('truck', 'bus', 'van',
+                                       'motorcycle'):
+            cx += math.sin(t_time * 1.7 + s * 0.13) * 0.07 * storm_i
 
         ds = 0.5
         dxds = (curve_x(s + ds) - curve_x(s - ds)) / (2.0 * ds)
+        # Lane-change lateral velocity tilts the heading slightly so the
+        # manoeuvre reads as steering, not sliding. Same algebra for both
+        # directions: x = curve_x(s) + lane_sign*off, ds/dt = -lane_sign*v
+        # => d(x)/ds = dxds - doff/v.
+        dxds_eff = dxds - c['doff'] / max(c['speed'], 3.0)
         if c['lane'] == -1:
-            yaw_deg = math.degrees(math.atan2(1.0, dxds))
+            yaw_deg = math.degrees(math.atan2(1.0, dxds_eff))
         else:
-            yaw_deg = math.degrees(math.atan2(-1.0, -dxds))
+            yaw_deg = math.degrees(math.atan2(-1.0, -dxds_eff))
 
         glPushMatrix()
         glTranslatef(cx, cy, cz)
         glRotatef(yaw_deg, 0.0, 1.0, 0.0)
+        if kind == 'motorcycle':
+            # Lean into the curve: roll = atan(v²·κ / g), where κ is the
+            # path curvature; positive local-x roll tips toward the
+            # vehicle's right for both directions, so the sign just
+            # flips with the lane. Lane-change lateral rate adds a
+            # touch of countersteer flavour.
+            d2 = (curve_x(s + 2.0) - 2.0 * curve_x(s)
+                  + curve_x(s - 2.0)) / 4.0
+            lean = -c['lane'] * math.degrees(
+                math.atan2(c['speed'] * c['speed'] * d2, 9.81))
+            lean += -c['lane'] * c['doff'] * 2.0
+            lean = max(-30.0, min(30.0, lean))
+            glRotatef(lean, 1.0, 0.0, 0.0)
         glCallList(car_variants[c['variant']]['list'])
         glPopMatrix()
 
@@ -6158,15 +7175,26 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
     glLightModelfv(GL_LIGHT_MODEL_AMBIENT, (0.2, 0.2, 0.2, 1.0))
     glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, GL_FALSE)
 
-    # --- Night headlight / taillight pass ---
+    # --- Headlight / taillight / brake-light pass ---
     # Additive-blended, camera-facing billboards at each light's world
     # position. Drawn per-frame (not baked) so intensity scales with the
-    # current night factor. Headlights read warm-white and only project
+    # current conditions. Headlights read warm-white and only project
     # from the car's front face; taillights read red and only from the
     # rear. We gate per-face by checking whether the car's forward vector
-    # points toward or away from the camera, so recediing cars glow red
+    # points toward or away from the camera, so receding cars glow red
     # and oncoming cars glow yellow — matching real traffic at night.
-    if night_a <= 0.03:
+    # Two per-driver behaviours layer on top:
+    #   * headlight discipline — each driver has a dusk threshold
+    #     (hl_thr) so lights pop on progressively across the fleet, plus
+    #     a storm threshold for lights-on in heavy rain even at noon;
+    #   * brake lights — IDM deceleration lights the rear lens (works in
+    #     daylight too, so a slowing platoon cascades red).
+    braking_any = any(c.get('accel', 0.0) < -BRAKE_LIGHT_DECEL
+                      for c in state['cars'])
+    em_any = (kind == 'emergency'
+              and any(c.get('em_active') for c in state['cars']))
+    if (night_a <= 0.03 and storm_i < 0.20 and not braking_any
+            and not em_any):
         return
     glDisable(GL_LIGHTING)
     glEnable(GL_TEXTURE_2D)
@@ -6182,14 +7210,12 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
     cam_right = (float(mv[0][0]), float(mv[1][0]), float(mv[2][0]))
     cam_up = (float(mv[0][1]), float(mv[1][1]), float(mv[2][1]))
 
-    head_col = (1.0 * night_a, 0.96 * night_a, 0.78 * night_a)
-    # Taillights get +50% additive intensity at night (user request) —
-    # the halo reads much brighter than headlights around the rear lens
-    # without touching the baked daytime emission.
-    tail_boost = 1.5
-    tail_col = (min(1.0, 0.95 * night_a * tail_boost),
-                min(1.0, 0.10 * night_a * tail_boost),
-                min(1.0, 0.08 * night_a * tail_boost))
+    head_base = (1.0, 0.96, 0.78)
+    # Taillights keep a +50% additive boost (user request) — the halo
+    # reads much brighter than headlights around the rear lens without
+    # touching the baked daytime emission.
+    tail_base = (min(1.0, 0.95 * 1.5), min(1.0, 0.10 * 1.5),
+                 min(1.0, 0.08 * 1.5))
     head_size = 0.55
     tail_size = 0.60
 
@@ -6199,10 +7225,24 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
         s = c['s']
         if s < s_car - 15.0 or s > s_car + N_SEG * SEG_LEN:
             continue
+        # Per-driver light state.
+        lights_on = max(0.0, min(1.0, (night_a - c.get('hl_thr', 0.10))
+                                 / 0.06))
+        lights_on = max(lights_on, 0.8 * max(0.0, min(1.0,
+                        (storm_i - c.get('hl_storm_thr', 0.38)) / 0.10)))
+        if kind == 'emergency' and c.get('em_active'):
+            lights_on = 1.0     # code-3 run: lights always on
+        brake_w = max(0.0, min(1.0,
+                      (-c.get('accel', 0.0) - BRAKE_LIGHT_DECEL) / 1.5))
+        head_i = lights_on * (0.40 + 0.60 * night_a)
+        tail_i = max(lights_on * (0.30 + 0.70 * night_a),
+                     brake_w * 0.95)
+        if head_i < 0.02 and tail_i < 0.02:
+            continue
         cx = curve_x(s)
         cy = curve_y(s)
         cz = -(s - s_car)
-        cx += c['lane'] * CAR_LANE_HALF
+        cx += c['lane'] * c['off']
         ds = 0.5
         dxds = (curve_x(s + ds) - curve_x(s - ds)) / (2.0 * ds)
         # Forward direction of the car in world coords.
@@ -6252,33 +7292,66 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
         head_w = max(0.0, min(1.0, (face + 0.05) / 0.15))
         tail_w = max(0.0, min(1.0, (-face + 0.05) / 0.15))
 
-        if head_w > 0.01:
+        if head_w > 0.01 and head_i >= 0.02:
             hx_off = v['head_x']
             hy_off = v['head_y']
             hz_off = v['head_zoff']
+            hw = head_w * head_i
             for lateral in (+1, -1):
                 px = cx + fx * hx_off + rx * hz_off * lateral
                 pz = cz + fz * hx_off + rz * hz_off * lateral
                 py = cy + hy_off
                 emit((px, py, pz),
-                     (head_col[0] * head_w,
-                      head_col[1] * head_w,
-                      head_col[2] * head_w),
+                     (head_base[0] * hw,
+                      head_base[1] * hw,
+                      head_base[2] * hw),
                      head_size)
 
-        if tail_w > 0.01:
+        if tail_w > 0.01 and tail_i >= 0.02:
             tx_off = v['tail_x']
             ty_off = v['tail_y']
             tz_off = v['tail_zoff']
+            tw = tail_w * tail_i
+            # Braking swells the rear lens halo a touch on top of the
+            # brightness jump — reads at a distance even in daylight.
+            tsize = tail_size * (1.0 + 0.35 * brake_w)
             for lateral in (+1, -1):
                 px = cx + fx * tx_off + rx * tz_off * lateral
                 pz = cz + fz * tx_off + rz * tz_off * lateral
                 py = cy + ty_off
                 emit((px, py, pz),
-                     (tail_col[0] * tail_w,
-                      tail_col[1] * tail_w,
-                      tail_col[2] * tail_w),
-                     tail_size)
+                     (min(1.0, tail_base[0] * tw),
+                      min(1.0, tail_base[1] * tw),
+                      min(1.0, tail_base[2] * tw)),
+                     tsize)
+
+        # Bus interior glow: a strip of warm window dots at night — the
+        # depth test culls the far-side row behind the bus body.
+        if kind == 'bus' and night_a > 0.10 and 'win_x0' in v:
+            wi = 0.55 * night_a
+            wx = v['win_x0']
+            while wx <= v['win_x1']:
+                for lateral in (+1, -1):
+                    px = cx + fx * wx + rx * v['win_zoff'] * lateral
+                    pz = cz + fz * wx + rz * v['win_zoff'] * lateral
+                    emit((px, cy + v['win_y'], pz),
+                         (1.0 * wi, 0.85 * wi, 0.58 * wi), 0.26)
+                wx += v['win_step']
+
+        # Emergency strobes: alternating red (left) / blue (right)
+        # lightbar flashes, visible from every angle, day or night.
+        if kind == 'emergency' and c.get('em_active'):
+            ph = math.sin(t_time * 2.0 * math.pi * 3.5)
+            red_i = 1.0 if ph > 0.0 else 0.18
+            blue_i = 1.0 if ph <= 0.0 else 0.18
+            sxo, syo, szo = (v['strobe_x'], v['strobe_y'],
+                             v['strobe_zoff'])
+            for lateral, col in (
+                    (-1, (1.0 * red_i, 0.10 * red_i, 0.08 * red_i)),
+                    (+1, (0.15 * blue_i, 0.25 * blue_i, 1.0 * blue_i))):
+                px = cx + fx * sxo + rx * szo * lateral
+                pz = cz + fz * sxo + rz * szo * lateral
+                emit((px, cy + syo, pz), col, 0.42)
 
     glDepthMask(GL_TRUE)
     glDisable(GL_BLEND)
@@ -6291,13 +7364,14 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
 # bigger, boxier car with an extra cargo section (pickup bed / box / semi
 # fifth-wheel / flatbed deck / dump hopper) and a few extra hardpoints
 # (exhaust stacks, mud flaps, beacon, tow hitch). Traffic logic reuses
-# `_car_respawn_s` and `_car_speed_for` so trucks follow the same flow as
-# cars: left lane spawns behind the camera and overtakes it, right lane
-# spawns far ahead and closes on the camera. Density is ~1/4 of cars.
+# the car pool's spawn/IDM/lane-change machinery (update_traffic) so
+# trucks share the road with cars: slower desired speeds, longer
+# headways, outer-lane preference. Density is ~1/4 of cars.
 N_TRUCK_VARIANTS = 40
 N_TRUCKS_PER_LANE = 4   # modest pool; cargo flow is less peaky and
                           # density gate keeps most hours sparse.
-TRUCK_STYLES = ['pickup', 'box_truck', 'semi', 'flatbed', 'dump']
+TRUCK_STYLES = ['pickup', 'box_truck', 'semi', 'flatbed', 'dump',
+                'tanker']
 
 TRUCK_PALETTE = [
     (0.85, 0.10, 0.10), (0.10, 0.22, 0.70), (0.93, 0.93, 0.95),
@@ -6305,6 +7379,24 @@ TRUCK_PALETTE = [
     (0.20, 0.55, 0.28), (0.92, 0.76, 0.12), (0.32, 0.24, 0.56),
     (0.75, 0.38, 0.08), (0.08, 0.50, 0.55), (0.55, 0.15, 0.08),
 ]
+
+# Shipping-container liveries for loaded semis — the global box fleet
+# is instantly recognisable by these saturated weathered hues.
+CONTAINER_PALETTE = [
+    (0.55, 0.18, 0.10), (0.12, 0.25, 0.50), (0.12, 0.40, 0.22),
+    (0.80, 0.40, 0.08), (0.55, 0.56, 0.58), (0.08, 0.42, 0.45),
+    (0.85, 0.65, 0.10), (0.85, 0.86, 0.88),
+]
+
+
+def _grime_color(color, grime, strength):
+    """Working vehicles are dirty: blend the paint toward a dusty
+    brown-gray by the per-vehicle grime factor."""
+    k = grime * strength
+    dust = (0.30, 0.28, 0.25)
+    return (color[0] * (1 - k) + dust[0] * k,
+            color[1] * (1 - k) + dust[1] * k,
+            color[2] * (1 - k) + dust[2] * k)
 
 
 def _truck_draw_box(x0, x1, y0, y1, z0, z1):
@@ -6381,6 +7473,16 @@ def _generate_truck_params(rng):
         cab_frac = float(rng.uniform(0.30, 0.38))
         dual_rear = True
         beacon = rng.random() < 0.60
+    elif style == 'tanker':
+        L = float(rng.uniform(6.4, 7.8))
+        W = float(rng.uniform(2.05, 2.25))
+        WR = float(rng.uniform(0.50, 0.60))
+        LBH = float(rng.uniform(0.80, 0.95))
+        CH = float(rng.uniform(0.95, 1.15))
+        cab_frac = float(rng.uniform(0.28, 0.36))
+        dual_rear = True
+        stacks = rng.random() < 0.50
+        beacon = rng.random() < 0.30
 
     spoke_count = int(rng.choice([5, 6, 8, 10]))
 
@@ -6408,11 +7510,24 @@ def _generate_truck_params(rng):
         cargo_top_y = body_top_y + float(rng.uniform(0.22, 0.38))
     elif style == 'flatbed':
         cargo_top_y = body_top_y + float(rng.uniform(0.02, 0.08))
+    elif style == 'tanker':
+        cargo_top_y = body_top_y + float(rng.uniform(0.05, 0.12))
     else:  # dump
         cargo_top_y = body_top_y + float(rng.uniform(0.55, 0.85))
 
     W_cabin = W * float(rng.uniform(0.88, 0.96))
     color = TRUCK_PALETTE[int(rng.integers(0, len(TRUCK_PALETTE)))]
+    # Condition variety: trucks earn their dirt. Grime dulls the paint
+    # texture toward a dusty brown-gray, rolled per variant.
+    grime = float(rng.uniform(0.0, 1.0))
+    color = _grime_color(color, grime, 0.35)
+    # Cargo variety: ~60% of semis carry a coloured shipping container;
+    # ~65% of dump trucks run loaded with a dirt mound.
+    container = style == 'semi' and rng.random() < 0.60
+    container_color = CONTAINER_PALETTE[int(rng.integers(
+        0, len(CONTAINER_PALETTE)))]
+    dump_load = style == 'dump' and rng.random() < 0.65
+    tank_chrome = rng.random() < 0.50
 
     zh = W / 2
     hood_mid = (front_x + cab_front_bot) / 2
@@ -6445,7 +7560,7 @@ def _generate_truck_params(rng):
     front_ax = front_x - HL - float(rng.uniform(0.10, 0.25))
     if style == 'semi':
         rear_ax = cab_rear_bot + float(rng.uniform(0.10, 0.35))
-    elif style in ('box_truck', 'dump'):
+    elif style in ('box_truck', 'dump', 'tanker'):
         rear_ax = cargo_rear_x + float(rng.uniform(0.35, 0.70))
     else:
         rear_ax = cargo_rear_x + float(rng.uniform(0.55, 0.95))
@@ -6462,7 +7577,7 @@ def _generate_truck_params(rng):
         wheels.append((rear_ax, WR,  W / 2 - inset - offset))
         wheels.append((rear_ax, WR, -W / 2 + inset))
         wheels.append((rear_ax, WR, -W / 2 + inset + offset))
-        if style in ('semi', 'box_truck', 'dump'):
+        if style in ('semi', 'box_truck', 'dump', 'tanker'):
             rear_ax2 = rear_ax - WR * 2.25
             rear_ax2 = max(rear_x + WR + 0.12, rear_ax2)
             wheels.append((rear_ax2, WR,  W / 2 - inset))
@@ -6491,6 +7606,9 @@ def _generate_truck_params(rng):
         'bed_rails': bed_rails, 'mud_flaps': mud_flaps,
         'trailer_plate': trailer_plate,
         'dump_lift': dump_lift,
+        'grime': grime, 'container': container,
+        'container_color': container_color, 'dump_load': dump_load,
+        'tank_chrome': tank_chrome,
     }
 
 
@@ -6569,6 +7687,28 @@ def _truck_draw_cargo(truck, paint_tex):
             gluDisk(q, 0, tank_r, 16, 1)
             glPopMatrix()
         gluDeleteQuadric(q)
+        # ~60% of semis haul a shipping container on the plate: a
+        # saturated weathered box with darker corrugation ribs.
+        if truck.get('container'):
+            cc = truck['container_color']
+            czw = W * 0.50
+            cy0 = y0 + 0.16
+            cy1 = cy0 + 1.85
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, paint_tex)
+            _car_mat_paint(cc)
+            _truck_draw_box(x0 + 0.05, x1 - 0.05, cy0, cy1, -czw, czw)
+            glDisable(GL_TEXTURE_2D)
+            rib = (cc[0] * 0.62, cc[1] * 0.62, cc[2] * 0.62)
+            _car_mat((rib[0] * 0.5, rib[1] * 0.5, rib[2] * 0.5),
+                     rib, (0.10, 0.10, 0.10), 8.0)
+            n_rib = 6
+            for i in range(n_rib):
+                t = (i + 0.5) / n_rib
+                xs = (x0 + 0.05) + (x1 - x0 - 0.10) * t
+                _truck_draw_box(xs - 0.035, xs + 0.035,
+                                cy0 + 0.06, cy1 - 0.06,
+                                -czw - 0.012, czw + 0.012)
 
     elif style == 'flatbed':
         zw = W * 0.52
@@ -6627,6 +7767,18 @@ def _truck_draw_cargo(truck, paint_tex):
         glVertex3f(x0, floor_y,   -zw)
         glEnd()
         glDisable(GL_TEXTURE_2D)
+        # ~65% of dump trucks run loaded: a dirt mound bulging over the
+        # hopper rim (two stacked earth-tone boxes read as a heap).
+        if truck.get('dump_load'):
+            earth = (0.38, 0.30, 0.21)
+            _car_mat((earth[0] * 0.5, earth[1] * 0.5, earth[2] * 0.5),
+                     earth, (0.05, 0.05, 0.05), 4.0)
+            _truck_draw_box(x0 + 0.18, x1 - 0.18,
+                            yt - 0.10 + lift * 0.5, yt + 0.12 + lift * 0.5,
+                            -zw + 0.12, zw - 0.12)
+            _truck_draw_box(x0 + 0.55, x1 - 0.55,
+                            yt + 0.10 + lift * 0.5, yt + 0.30 + lift * 0.5,
+                            -zw + 0.35, zw - 0.35)
         _car_mat_chrome()
         q = gluNewQuadric()
         glPushMatrix()
@@ -6635,6 +7787,44 @@ def _truck_draw_cargo(truck, paint_tex):
         gluCylinder(q, 0.06, 0.06, 0.45, 12, 1)
         glPopMatrix()
         gluDeleteQuadric(q)
+
+    elif style == 'tanker':
+        # Horizontal tank barrel over the chassis: chrome for fuel
+        # haulers, painted shell for chemical tankers. Top hatches +
+        # rear ladder block sell the silhouette.
+        tank_r = min(W * 0.44, 0.80)
+        tank_len = (x1 - x0) - 0.15
+        cy = y0 + tank_r + 0.06
+        q = gluNewQuadric()
+        gluQuadricNormals(q, GLU_SMOOTH)
+        if truck.get('tank_chrome'):
+            _car_mat_chrome()
+        else:
+            shell = (0.88, 0.88, 0.90)
+            _car_mat((shell[0] * 0.5, shell[1] * 0.5, shell[2] * 0.5),
+                     shell, (0.8, 0.8, 0.8), 70.0)
+        glPushMatrix()
+        glTranslatef(x0 + 0.08, cy, 0.0)
+        glRotatef(90.0, 0.0, 1.0, 0.0)
+        gluCylinder(q, tank_r, tank_r, tank_len, 22, 1)
+        glRotatef(180.0, 0.0, 1.0, 0.0)
+        gluDisk(q, 0, tank_r, 20, 1)
+        glRotatef(180.0, 0.0, 1.0, 0.0)
+        glTranslatef(0.0, 0.0, tank_len)
+        gluDisk(q, 0, tank_r, 20, 1)
+        glPopMatrix()
+        gluDeleteQuadric(q)
+        _car_mat_dark()
+        for frac in (0.30, 0.60):
+            hx = x0 + 0.08 + tank_len * frac
+            _truck_draw_box(hx - 0.10, hx + 0.10,
+                            cy + tank_r - 0.02, cy + tank_r + 0.10,
+                            -0.10, 0.10)
+        # Rear ladder + chassis rail.
+        _truck_draw_box(x0 + 0.02, x0 + 0.10, y0 + 0.05,
+                        cy + tank_r * 0.7, -0.18, 0.18)
+        _truck_draw_box(x0, x1, y0 - 0.02, y0 + 0.06,
+                        -W * 0.30, W * 0.30)
 
 
 def _truck_draw_details(truck):
@@ -6866,25 +8056,1081 @@ def build_truck_variants(n=N_TRUCK_VARIANTS):
 def init_trucks(seed=707, s_car=0.0, player_speed=0.0):
     return init_cars(seed=seed, s_car=s_car, player_speed=player_speed,
                      n_variants=N_TRUCK_VARIANTS,
-                     n_per_lane=N_TRUCKS_PER_LANE)
+                     n_per_lane=N_TRUCKS_PER_LANE,
+                     kind='truck')
 
 
 def draw_trucks(state, truck_variants, s_car, amb_rgb, sun_dir,
-                night_a, flare_tex, density=1.0):
+                night_a, flare_tex, density=1.0, storm_i=0.0,
+                t_time=0.0):
     # draw_cars is vehicle-agnostic: it just iterates state['cars'] and
     # calls `variants[c['variant']]['list']`. We pass the truck state and
-    # truck variant pool and reuse it verbatim — including the night
-    # headlight/taillight billboard pass.
+    # truck variant pool and reuse it verbatim — including the
+    # headlight/taillight/brake-light billboard pass.
     draw_cars(state, truck_variants, s_car, amb_rgb, sun_dir,
-              night_a, flare_tex, density=density)
+              night_a, flare_tex, density=density, storm_i=storm_i,
+              t_time=t_time)
+
+
+# --- Procedural motorcycles / vans / buses / emergency vehicles ---------
+# Phase-2 road-user diversity. All four reuse the car module's materials,
+# paint texture, wheel quadrics and the box helper, and return variant
+# dicts shaped exactly like cars/trucks ('list', 'L', 'W', head_*/tail_*
+# light hardpoints) so draw_cars and the traffic system treat every kind
+# uniformly. Kind-specific extras (bus window strip, emergency strobe
+# bar) ride along in the same dict.
+N_MOTO_VARIANTS = 24
+N_MOTOS_PER_LANE = 3
+N_VAN_VARIANTS = 24
+N_VANS_PER_LANE = 2
+N_BUS_VARIANTS = 12
+N_BUSES_PER_LANE = 1
+N_EMERG_VARIANTS = 6
+
+# Rider gear tones — leathers and jackets read dark on the road.
+RIDER_PALETTE = [
+    (0.10, 0.10, 0.12), (0.16, 0.16, 0.18), (0.22, 0.08, 0.08),
+    (0.08, 0.12, 0.22), (0.30, 0.28, 0.26), (0.12, 0.18, 0.12),
+]
+
+# SPTrans-style bus liveries: white shell + a coloured waist stripe
+# (the system colour-codes regions: red downtown, dark blue south, ...).
+BUS_STRIPE_PALETTE = [
+    (0.78, 0.10, 0.10), (0.10, 0.18, 0.55), (0.10, 0.45, 0.20),
+    (0.85, 0.45, 0.08), (0.20, 0.55, 0.75), (0.55, 0.20, 0.55),
+    (0.85, 0.70, 0.10), (0.35, 0.35, 0.38),
+]
+
+# Delivery vans: mostly white fleets with a couple of brand colours.
+VAN_PALETTE = [
+    (0.92, 0.92, 0.94), (0.92, 0.92, 0.94), (0.92, 0.92, 0.94),
+    (0.85, 0.65, 0.10), (0.55, 0.12, 0.10), (0.15, 0.30, 0.55),
+    (0.25, 0.25, 0.28), (0.75, 0.40, 0.10),
+]
+
+
+def build_motorcycle_variant(seed):
+    rng = np.random.default_rng(seed)
+    color = CAR_PALETTE[int(rng.integers(0, len(CAR_PALETTE)))]
+    rider = RIDER_PALETTE[int(rng.integers(0, len(RIDER_PALETTE)))]
+    L = float(rng.uniform(2.05, 2.35))
+    W = 0.80
+    wheel_r = float(rng.uniform(0.30, 0.34))
+    half = L / 2
+    paint_tex = make_car_paint_texture(color, rng)
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    # Wheels: single-track, centred on z=0.
+    _car_draw_wheel(-half + wheel_r, wheel_r, 0.0, wheel_r, +1, 5)
+    _car_draw_wheel(half - wheel_r, wheel_r, 0.0, wheel_r, +1, 5)
+    # Engine block + lower frame.
+    _car_mat_dark()
+    _truck_draw_box(-0.30, 0.32, wheel_r * 0.8, wheel_r * 1.9,
+                    -0.15, 0.15)
+    # Tank + tail in the paint colour.
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, paint_tex)
+    _car_mat_paint(color)
+    _truck_draw_box(0.02, 0.46, 0.55, 0.80, -0.14, 0.14)   # tank
+    _truck_draw_box(-0.50, 0.02, 0.55, 0.70, -0.12, 0.12)  # tail
+    glDisable(GL_TEXTURE_2D)
+    # Seat pad.
+    _car_mat_dark()
+    _truck_draw_box(-0.38, 0.02, 0.70, 0.76, -0.11, 0.11)
+    # Front fork (raked) + handlebar.
+    _car_mat_chrome()
+    glPushMatrix()
+    glTranslatef(half - wheel_r, wheel_r, 0.0)
+    glRotatef(-24.0, 0.0, 0.0, 1.0)
+    _truck_draw_box(-0.03, 0.03, 0.0, 0.80, -0.05, 0.05)
+    glPopMatrix()
+    _truck_draw_box(half - wheel_r - 0.40, half - wheel_r - 0.32,
+                    0.96, 1.01, -0.30, 0.30)
+    # Rider: leaning torso + legs + helmet.
+    _car_mat((rider[0] * 0.5, rider[1] * 0.5, rider[2] * 0.5),
+             rider, (0.2, 0.2, 0.22), 14.0)
+    glPushMatrix()
+    glTranslatef(-0.10, 0.74, 0.0)
+    glRotatef(-16.0, 0.0, 0.0, 1.0)
+    _truck_draw_box(-0.13, 0.15, 0.0, 0.54, -0.16, 0.16)   # torso
+    glPopMatrix()
+    for zs in (-0.13, 0.13):                                # legs
+        _truck_draw_box(-0.16, 0.00, 0.42, 0.76, zs - 0.05, zs + 0.05)
+    helmet = (color[0] * 0.7 + 0.15, color[1] * 0.7 + 0.15,
+              color[2] * 0.7 + 0.15)
+    _car_mat((helmet[0] * 0.5, helmet[1] * 0.5, helmet[2] * 0.5),
+             helmet, (0.9, 0.9, 0.9), 90.0)
+    q = gluNewQuadric()
+    glPushMatrix()
+    glTranslatef(0.06, 1.34, 0.0)
+    gluSphere(q, 0.155, 12, 10)
+    glPopMatrix()
+    gluDeleteQuadric(q)
+    glEndList()
+    return {
+        'list': list_id, 'paint_tex': paint_tex, 'L': L, 'W': W,
+        # Single centred head/tail lamp: zoff 0 collapses the two
+        # billboard emits of the light pass onto one bright point.
+        'head_x': half - 0.06, 'tail_x': -half + 0.06,
+        'head_y': 0.86, 'tail_y': 0.72,
+        'head_zoff': 0.0, 'tail_zoff': 0.0,
+    }
+
+
+def build_van_variant(seed):
+    rng = np.random.default_rng(seed)
+    color = VAN_PALETTE[int(rng.integers(0, len(VAN_PALETTE)))]
+    L = float(rng.uniform(5.2, 5.7))
+    W = float(rng.uniform(1.95, 2.10))
+    H = float(rng.uniform(2.25, 2.50))
+    half = L / 2
+    zw = W / 2
+    paint_tex = make_car_paint_texture(color, rng)
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, paint_tex)
+    _car_mat_paint(color)
+    # Lower body full length, tall cargo box behind the cab.
+    _truck_draw_box(-half, half, 0.38, 1.05, -zw, zw)
+    _truck_draw_box(-half, half - 1.40, 1.05, H, -zw, zw)
+    # Cab roof, slightly narrower.
+    _truck_draw_box(half - 1.45, half - 0.25, 1.05, 1.80,
+                    -zw + 0.06, zw - 0.06)
+    glDisable(GL_TEXTURE_2D)
+    # Windshield + door glass band.
+    _car_mat_glass()
+    _truck_draw_box(half - 0.40, half - 0.12, 1.15, 1.72,
+                    -zw + 0.10, zw - 0.10)
+    _truck_draw_box(half - 1.42, half - 0.45, 1.18, 1.66,
+                    -zw - 0.012, zw + 0.012)
+    # Rear door seam.
+    _car_mat_dark()
+    _truck_draw_box(-half - 0.012, -half + 0.012, 0.55, H - 0.15,
+                    -zw + 0.15, zw - 0.15)
+    # Bumpers.
+    _truck_draw_box(half - 0.06, half + 0.05, 0.32, 0.52, -zw, zw)
+    _truck_draw_box(-half - 0.05, -half + 0.06, 0.32, 0.52, -zw, zw)
+    wheel_r = 0.36
+    for wx in (half - 1.05, -half + 1.15):
+        for side in (+1, -1):
+            _car_draw_wheel(wx, wheel_r, side * (zw - 0.16), wheel_r,
+                            side, 6)
+    glEndList()
+    return {
+        'list': list_id, 'paint_tex': paint_tex, 'L': L, 'W': W,
+        'head_x': half - 0.04, 'tail_x': -half + 0.04,
+        'head_y': 0.78, 'tail_y': 0.95,
+        'head_zoff': W * 0.34, 'tail_zoff': W * 0.36,
+    }
+
+
+def build_bus_variant(seed):
+    rng = np.random.default_rng(seed)
+    stripe = BUS_STRIPE_PALETTE[int(rng.integers(0,
+                                                 len(BUS_STRIPE_PALETTE)))]
+    shell = (0.90, 0.90, 0.92)
+    L = float(rng.uniform(10.6, 12.4))
+    W = 2.50
+    H = float(rng.uniform(2.95, 3.15))
+    half = L / 2
+    zw = W / 2
+    paint_tex = make_car_paint_texture(shell, rng)
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, paint_tex)
+    _car_mat_paint(shell)
+    _truck_draw_box(-half, half, 0.42, H, -zw, zw)          # shell
+    glDisable(GL_TEXTURE_2D)
+    # Dark skirt under the floor line.
+    _car_mat_dark()
+    _truck_draw_box(-half + 0.35, half - 0.35, 0.18, 0.44,
+                    -zw + 0.05, zw - 0.05)
+    # Livery waist stripe (slightly proud so it survives z-fighting).
+    _car_mat_paint(stripe)
+    _truck_draw_box(-half - 0.01, half + 0.01, 0.95, 1.35,
+                    -zw - 0.012, zw + 0.012)
+    # Continuous side window band + windshield.
+    _car_mat_glass()
+    _truck_draw_box(-half + 0.55, half - 0.95, H - 1.20, H - 0.30,
+                    -zw - 0.02, zw + 0.02)
+    _truck_draw_box(half - 0.10, half + 0.02, 0.95, H - 0.35,
+                    -zw + 0.15, zw - 0.15)
+    # Door inset (single side; reads from the curb side often enough).
+    _car_mat_dark()
+    _truck_draw_box(half - 2.30, half - 1.45, 0.22, H - 1.05,
+                    zw - 0.01, zw + 0.018)
+    # Roof AC hump.
+    _car_mat((0.30, 0.30, 0.32), (0.62, 0.62, 0.65),
+             (0.3, 0.3, 0.3), 18.0)
+    _truck_draw_box(-half + 2.0, half - 3.0, H, H + 0.22,
+                    -zw + 0.45, zw - 0.45)
+    # Route board: warm lit box above the windshield (mild emission so
+    # it reads day and night, like real LED destination signs).
+    _car_mat_emit((0.55, 0.45, 0.22))
+    _truck_draw_box(half - 0.08, half + 0.015, H - 0.32, H - 0.10,
+                    -zw + 0.55, zw - 0.55)
+    _car_mat_clear()
+    wheel_r = 0.48
+    axles = [half - 1.65, -half + 1.95]
+    if L > 11.6:
+        axles.append(-half + 3.10)      # tandem rear on the long units
+    for wx in axles:
+        for side in (+1, -1):
+            _car_draw_wheel(wx, wheel_r, side * (zw - 0.24), wheel_r,
+                            side, 7)
+    glEndList()
+    return {
+        'list': list_id, 'paint_tex': paint_tex, 'L': L, 'W': W,
+        'head_x': half - 0.05, 'tail_x': -half + 0.05,
+        'head_y': 0.80, 'tail_y': 1.10,
+        'head_zoff': W * 0.32, 'tail_zoff': W * 0.36,
+        # Night window-strip glow, emitted by the light pass.
+        'win_x0': -half + 0.8, 'win_x1': half - 1.2,
+        'win_y': H - 0.75, 'win_step': 1.15, 'win_zoff': zw + 0.04,
+    }
+
+
+def build_emergency_variant(seed):
+    rng = np.random.default_rng(seed)
+    is_ambulance = (seed % 2) == 0
+    list_id = glGenLists(1)
+    if is_ambulance:
+        body = (0.93, 0.93, 0.95)
+        L, W, H = 5.6, 2.10, 2.45
+        half, zw = L / 2, W / 2
+        paint_tex = make_car_paint_texture(body, rng)
+        glNewList(list_id, GL_COMPILE)
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, paint_tex)
+        _car_mat_paint(body)
+        _truck_draw_box(-half, half, 0.40, 1.05, -zw, zw)
+        _truck_draw_box(-half, half - 1.55, 1.05, H, -zw, zw)   # module
+        _truck_draw_box(half - 1.60, half - 0.30, 1.05, 1.80,
+                        -zw + 0.06, zw - 0.06)                  # cab
+        glDisable(GL_TEXTURE_2D)
+        # Red rescue stripe around the module.
+        _car_mat_paint((0.80, 0.08, 0.08))
+        _truck_draw_box(-half - 0.01, half - 1.50, 1.30, 1.62,
+                        -zw - 0.012, zw + 0.012)
+        _car_mat_glass()
+        _truck_draw_box(half - 0.42, half - 0.12, 1.15, 1.72,
+                        -zw + 0.10, zw - 0.10)
+        strobe_x = half - 0.95
+        strobe_y = 1.92
+    else:
+        body = (0.16, 0.18, 0.26)       # PM dark navy
+        L, W, H = 4.9, 1.85, 1.46
+        half, zw = L / 2, W / 2
+        paint_tex = make_car_paint_texture(body, rng)
+        glNewList(list_id, GL_COMPILE)
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, paint_tex)
+        _car_mat_paint(body)
+        _truck_draw_box(-half, half, 0.38, 0.95, -zw, zw)       # body
+        _truck_draw_box(-half + 0.85, half - 1.30, 0.95, H,
+                        -zw + 0.10, zw - 0.10)                  # cabin
+        glDisable(GL_TEXTURE_2D)
+        # White door band (POLÍCIA livery block).
+        _car_mat_paint((0.90, 0.90, 0.92))
+        _truck_draw_box(-0.85, 0.85, 0.50, 0.88, -zw - 0.012,
+                        zw + 0.012)
+        _car_mat_glass()
+        _truck_draw_box(-half + 0.95, half - 1.40, 0.98, H - 0.06,
+                        -zw + 0.06, zw - 0.06)
+        strobe_x = 0.10
+        strobe_y = H + 0.10
+    # Roof lightbar: red + blue lens blocks with a faint built-in glow
+    # (the live strobing happens in the light pass billboards).
+    _car_mat_emit((0.45, 0.06, 0.06))
+    _truck_draw_box(strobe_x - 0.30, strobe_x + 0.30, strobe_y - 0.07,
+                    strobe_y + 0.05, -0.42, -0.06)
+    _car_mat_emit((0.06, 0.08, 0.45))
+    _truck_draw_box(strobe_x - 0.30, strobe_x + 0.30, strobe_y - 0.07,
+                    strobe_y + 0.05, 0.06, 0.42)
+    _car_mat_clear()
+    wheel_r = 0.34 if not is_ambulance else 0.38
+    for wx in (half - 1.00, -half + 1.05):
+        for side in (+1, -1):
+            _car_draw_wheel(wx, wheel_r, side * (zw - 0.14), wheel_r,
+                            side, 6)
+    glEndList()
+    return {
+        'list': list_id, 'paint_tex': paint_tex, 'L': L, 'W': W,
+        'head_x': half - 0.04, 'tail_x': -half + 0.04,
+        'head_y': 0.70, 'tail_y': 0.80,
+        'head_zoff': W * 0.34, 'tail_zoff': W * 0.36,
+        'strobe_x': strobe_x, 'strobe_y': strobe_y + 0.05,
+        'strobe_zoff': 0.26,
+    }
+
+
+def build_motorcycle_variants(n=N_MOTO_VARIANTS):
+    return [build_motorcycle_variant(9000 + i) for i in range(n)]
+
+
+def build_van_variants(n=N_VAN_VARIANTS):
+    return [build_van_variant(9500 + i) for i in range(n)]
+
+
+def build_bus_variants(n=N_BUS_VARIANTS):
+    return [build_bus_variant(9700 + i) for i in range(n)]
+
+
+def build_emergency_variants(n=N_EMERG_VARIANTS):
+    return [build_emergency_variant(9900 + i) for i in range(n)]
+
+
+def init_motos(seed=909, s_car=0.0, player_speed=0.0):
+    return init_cars(seed=seed, s_car=s_car, player_speed=player_speed,
+                     n_variants=N_MOTO_VARIANTS,
+                     n_per_lane=N_MOTOS_PER_LANE, kind='motorcycle')
+
+
+def init_vans(seed=911, s_car=0.0, player_speed=0.0):
+    return init_cars(seed=seed, s_car=s_car, player_speed=player_speed,
+                     n_variants=N_VAN_VARIANTS,
+                     n_per_lane=N_VANS_PER_LANE, kind='van')
+
+
+def init_buses(seed=913, s_car=0.0, player_speed=0.0):
+    return init_cars(seed=seed, s_car=s_car, player_speed=player_speed,
+                     n_variants=N_BUS_VARIANTS,
+                     n_per_lane=N_BUSES_PER_LANE, kind='bus')
+
+
+def init_emergency(seed=917, s_car=0.0, player_speed=0.0):
+    # A single same-direction unit — emergencies are events, not flow.
+    return init_cars(seed=seed, s_car=s_car, player_speed=player_speed,
+                     n_variants=N_EMERG_VARIANTS, n_per_lane=1,
+                     kind='emergency', lanes=(-1,))
+
+
+# --- Pedestrians (city sidewalks) ----------------------------------------
+# Billboard people on hashed sidewalk slots inside city zones, following
+# the street-life hourly curve (PED_DENSITY_SP — evening-shifted vs car
+# traffic). When a storm is on, the whole crowd switches to the umbrella
+# texture set. Same crossed-quad + alpha-test technique as the flowers,
+# so they bake into display lists and instance for free.
+N_PED_VARIANTS = 10
+PED_SPACING = 6.0
+PED_MAX_DIST = 260.0
+
+PED_SKIN_TONES = [
+    (0.87, 0.68, 0.53), (0.72, 0.52, 0.38), (0.52, 0.36, 0.26),
+    (0.40, 0.28, 0.20), (0.93, 0.76, 0.62),
+]
+PED_SHIRTS = [
+    (0.85, 0.20, 0.18), (0.20, 0.35, 0.70), (0.92, 0.90, 0.86),
+    (0.15, 0.15, 0.18), (0.90, 0.75, 0.15), (0.25, 0.55, 0.30),
+    (0.75, 0.40, 0.60), (0.50, 0.70, 0.85), (0.95, 0.55, 0.15),
+    (0.45, 0.30, 0.55),
+]
+PED_PANTS = [
+    (0.18, 0.24, 0.38), (0.12, 0.12, 0.14), (0.35, 0.30, 0.26),
+    (0.55, 0.55, 0.58), (0.25, 0.30, 0.25),
+]
+PED_HAIR = [
+    (0.08, 0.06, 0.05), (0.20, 0.12, 0.06), (0.40, 0.30, 0.15),
+    (0.55, 0.55, 0.55), (0.10, 0.10, 0.12),
+]
+UMBRELLA_COLORS = [
+    (0.85, 0.12, 0.12), (0.12, 0.20, 0.60), (0.10, 0.10, 0.12),
+    (0.90, 0.80, 0.20), (0.20, 0.55, 0.35), (0.80, 0.40, 0.65),
+]
+
+
+def make_pedestrian_texture(seed, umbrella=False, w=64, h=128):
+    """Blocky person silhouette, feet at row 0 (v=0 maps to quad
+    bottom). Crude pixel-art at 64x128 reads perfectly at sidewalk
+    distance and mip-blurs gracefully."""
+    rng = np.random.default_rng(seed)
+    img = np.zeros((h, w, 4), dtype=np.uint8)
+
+    def put(r0, r1, c0, c1, col):
+        img[max(0, r0):min(h, r1), max(0, c0):min(w, c1), :3] = \
+            [int(c * 255) for c in col]
+        img[max(0, r0):min(h, r1), max(0, c0):min(w, c1), 3] = 255
+
+    skin = PED_SKIN_TONES[int(rng.integers(0, len(PED_SKIN_TONES)))]
+    shirt = PED_SHIRTS[int(rng.integers(0, len(PED_SHIRTS)))]
+    pants = PED_PANTS[int(rng.integers(0, len(PED_PANTS)))]
+    hair = PED_HAIR[int(rng.integers(0, len(PED_HAIR)))]
+    cx = w // 2
+    # shoes / legs
+    put(0, 6, cx - 9, cx - 2, (0.08, 0.07, 0.06))
+    put(0, 6, cx + 2, cx + 9, (0.08, 0.07, 0.06))
+    put(6, 54, cx - 9, cx - 2, pants)
+    put(6, 54, cx + 2, cx + 9, pants)
+    # torso + arms
+    put(54, 92, cx - 13, cx + 13, shirt)
+    sleeve_skin = rng.random() < 0.5     # t-shirt vs long sleeves
+    arm_col = skin if sleeve_skin else shirt
+    put(54, 86, cx - 19, cx - 13, arm_col)
+    put(54, 86, cx + 13, cx + 19, arm_col)
+    put(48, 58, cx - 19, cx - 13, skin)  # hands
+    put(48, 58, cx + 13, cx + 19, skin)
+    # head + hair
+    yy, xx = np.mgrid[0:h, 0:w]
+    head = ((xx - cx) ** 2 / 81.0 + (yy - 105) ** 2 / 121.0) <= 1.0
+    img[head, :3] = [int(c * 255) for c in skin]
+    img[head, 3] = 255
+    hair_m = head & (yy > 105 + int(rng.integers(0, 5)))
+    img[hair_m, :3] = [int(c * 255) for c in hair]
+    if umbrella:
+        ucol = UMBRELLA_COLORS[int(rng.integers(0, len(UMBRELLA_COLORS)))]
+        # pole from hand up
+        put(56, 122, cx + 14, cx + 17, (0.25, 0.25, 0.27))
+        # canopy: clipped dome over the head
+        dome = (((xx - (cx + 4)) ** 2 / 676.0
+                 + (yy - 112) ** 2 / 196.0) <= 1.0) & (yy >= 112)
+        img[dome, :3] = [int(c * 255) for c in ucol]
+        img[dome, 3] = 255
+    return img
+
+
+def _build_billboard_list(tex, aspect=0.5, alpha_cut=0.45):
+    """Crossed-quad billboard display list, unit height (0..1 in Y),
+    aspect = width/height. Same recipe as build_flower_variant."""
+    list_id = glGenLists(1)
+    glNewList(list_id, GL_COMPILE)
+    glBindTexture(GL_TEXTURE_2D, tex)
+    glEnable(GL_ALPHA_TEST)
+    glAlphaFunc(GL_GREATER, alpha_cut)
+    hw = aspect / 2.0
+    for rot in (0.0, 90.0):
+        glPushMatrix()
+        glRotatef(rot, 0.0, 1.0, 0.0)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0.0, 0.0); glVertex3f(-hw, 0.0, 0.0)
+        glTexCoord2f(1.0, 0.0); glVertex3f(hw, 0.0, 0.0)
+        glTexCoord2f(1.0, 1.0); glVertex3f(hw, 1.0, 0.0)
+        glTexCoord2f(0.0, 1.0); glVertex3f(-hw, 1.0, 0.0)
+        glEnd()
+        glPopMatrix()
+    glDisable(GL_ALPHA_TEST)
+    glEndList()
+    return list_id
+
+
+def build_pedestrian_variants(n=N_PED_VARIANTS):
+    ped, umb = [], []
+    for i in range(n):
+        tex = upload_texture(make_pedestrian_texture(4200 + i, False),
+                             internal=GL_RGBA, src=GL_RGBA)
+        ped.append(_build_billboard_list(tex))
+        tex_u = upload_texture(make_pedestrian_texture(4200 + i, True),
+                               internal=GL_RGBA, src=GL_RGBA)
+        umb.append(_build_billboard_list(tex_u))
+    return ped, umb
+
+
+def draw_pedestrians(s_car, ped_lists, umb_lists, amb_rgb, night_a,
+                     storm_i, t_day, t_time):
+    density = ped_density_at(t_day)
+    if density < 0.02:
+        return
+    lists = umb_lists if storm_i > 0.30 else ped_lists
+    nvar = len(lists)
+    s_start = math.floor(s_car / PED_SPACING) * PED_SPACING
+    n_steps = int(PED_MAX_DIST / PED_SPACING) + 1
+
+    glEnable(GL_TEXTURE_2D)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    # Ambient tint with a small night lift — city sidewalks catch shop
+    # and lamp light, so people never go fully black.
+    glColor3f(min(1.0, amb_rgb[0] + 0.12 * night_a),
+              min(1.0, amb_rgb[1] + 0.11 * night_a),
+              min(1.0, amb_rgb[2] + 0.09 * night_a))
+
+    for i in range(n_steps):
+        s = s_start + i * PED_SPACING
+        if s < s_car + 2.0:
+            continue
+        for side in (-1, +1):
+            w_city = city_weight_at(s, side)
+            if w_city < 0.55:
+                continue
+            key = (int(s * 17) * 2654435761
+                   + (0 if side < 0 else 5417)) & 0xFFFFFFFF
+            if (key & 0xFF) / 255.0 > density * 0.55 * float(w_city):
+                continue
+            group_n = 1
+            if ((key >> 24) & 0x07) == 0:       # occasional pair/trio
+                group_n = 2 + ((key >> 27) & 0x01)
+            d_base = ROAD_WIDTH / 2 + 1.0 + ((key >> 8) & 0xFF) / 255.0 * 2.2
+            for k in range(group_n):
+                kk = (key * 0x9E3779B1 + k * 0x85EBCA77) & 0xFFFFFFFF
+                jx = ((kk & 0xFF) / 255.0 - 0.5) * 1.6 if group_n > 1 else 0.0
+                jd = (((kk >> 8) & 0xFF) / 255.0 - 0.5) * 1.0 if group_n > 1 else 0.0
+                variant = ((kk >> 16) & 0xFF) % nvar
+                scale = 1.55 + ((kk >> 12) & 0x0F) / 15.0 * 0.30
+                yaw = ((kk >> 4) & 0xFF) / 255.0 * 360.0
+                phase = ((kk >> 20) & 0x3FF) * 0.006
+                tx = curve_x(s) + side * (d_base + jd)
+                ty = curve_y(s) - 0.20      # city pavement datum
+                tz = -(s - s_car) + jx
+                glPushMatrix()
+                glTranslatef(tx, ty, tz)
+                glRotatef(yaw, 0.0, 1.0, 0.0)
+                # idle sway — alive, not walking-in-place
+                glRotatef(1.8 * math.sin(t_time * 1.1 + phase),
+                          0.0, 0.0, 1.0)
+                glScalef(scale, scale, scale)
+                glCallList(lists[variant])
+                glPopMatrix()
+    glDisable(GL_TEXTURE_2D)
+
+
+# --- Wildlife: birds, crepuscular mammals, lamp moths --------------------
+N_BIRD_FLOCKS = 3
+N_ANIMAL_VARIANTS = 6
+ANIMAL_SPACING = 90.0
+ANIMAL_MAX_DIST = 320.0
+
+
+def make_deer_texture(seed, w=128, h=96):
+    """Side-on deer silhouette (feet at row 0)."""
+    rng = np.random.default_rng(seed)
+    img = np.zeros((h, w, 4), dtype=np.uint8)
+    body = (float(rng.uniform(0.42, 0.52)),
+            float(rng.uniform(0.28, 0.36)), 0.20)
+
+    def put(r0, r1, c0, c1, col):
+        img[max(0, r0):min(h, r1), max(0, c0):min(w, c1), :3] = \
+            [int(c * 255) for c in col]
+        img[max(0, r0):min(h, r1), max(0, c0):min(w, c1), 3] = 255
+
+    yy, xx = np.mgrid[0:h, 0:w]
+    trunk = (((xx - 58) ** 2 / 1225.0 + (yy - 48) ** 2 / 289.0) <= 1.0)
+    img[trunk, :3] = [int(c * 255) for c in body]
+    img[trunk, 3] = 255
+    # legs
+    for cx0 in (32, 44, 72, 84):
+        put(0, 38, cx0, cx0 + 5, (body[0] * 0.8, body[1] * 0.8,
+                                  body[2] * 0.8))
+    # neck + head
+    put(52, 78, 88, 100, body)
+    head = (((xx - 102) ** 2 / 100.0 + (yy - 76) ** 2 / 64.0) <= 1.0)
+    img[head, :3] = [int(c * 255) for c in body]
+    img[head, 3] = 255
+    # antlers
+    put(84, 95, 100, 103, (0.55, 0.48, 0.35))
+    put(88, 95, 96, 99, (0.55, 0.48, 0.35))
+    put(88, 95, 104, 107, (0.55, 0.48, 0.35))
+    # tail
+    put(50, 60, 22, 28, (0.85, 0.82, 0.75))
+    return img
+
+
+def make_capybara_texture(seed, w=128, h=96):
+    """Side-on capybara: one big rounded agouti block. Feet at row 0."""
+    rng = np.random.default_rng(seed)
+    img = np.zeros((h, w, 4), dtype=np.uint8)
+    fur = (float(rng.uniform(0.45, 0.55)),
+           float(rng.uniform(0.33, 0.40)),
+           float(rng.uniform(0.20, 0.26)))
+    yy, xx = np.mgrid[0:h, 0:w]
+    body = (((xx - 58) ** 2 / 1764.0 + (yy - 46) ** 2 / 625.0) <= 1.0)
+    img[body, :3] = [int(c * 255) for c in fur]
+    img[body, 3] = 255
+    head = (((xx - 102) ** 2 / 196.0 + (yy - 42) ** 2 / 256.0) <= 1.0)
+    img[head, :3] = [int(c * 255) for c in fur]
+    img[head, 3] = 255
+    # boxy snout — the capybara profile-maker
+    img[30:48, 112:124, :3] = [int(c * 255) for c in fur]
+    img[30:48, 112:124, 3] = 255
+    for cx0 in (34, 50, 74, 88):
+        img[6:28, cx0:cx0 + 6, :3] = [int(c * 0.8 * 255) for c in fur]
+        img[6:28, cx0:cx0 + 6, 3] = 255
+    img[56:62, 100:106, :3] = [int(c * 0.7 * 255) for c in fur]  # ear
+    img[56:62, 100:106, 3] = 255
+    return img
+
+
+def build_animal_variants(n=N_ANIMAL_VARIANTS):
+    """Half deer, half capybara. Returns list of (list_id, kind,
+    height_m) tuples."""
+    out = []
+    for i in range(n):
+        if i % 2 == 0:
+            tex = upload_texture(make_deer_texture(5600 + i),
+                                 internal=GL_RGBA, src=GL_RGBA)
+            out.append((_build_billboard_list(tex, aspect=128.0 / 96.0),
+                        'deer', 1.35))
+        else:
+            tex = upload_texture(make_capybara_texture(5600 + i),
+                                 internal=GL_RGBA, src=GL_RGBA)
+            out.append((_build_billboard_list(tex, aspect=128.0 / 96.0),
+                        'capybara', 0.60))
+    return out
+
+
+def crepuscular_at(t_day):
+    """1.0 at the heart of dawn/dusk activity windows, 0 otherwise."""
+    def win(center, width):
+        d = abs(((t_day - center + 0.5) % 1.0) - 0.5)
+        return max(0.0, 1.0 - d / width)
+    return max(win(0.26, 0.055), win(0.74, 0.055))
+
+
+def draw_animals(s_car, animal_variants, amb_rgb, t_day, t_time):
+    crep = crepuscular_at(t_day)
+    if crep < 0.05:
+        return
+    s_start = math.floor(s_car / ANIMAL_SPACING) * ANIMAL_SPACING
+    n_steps = int(ANIMAL_MAX_DIST / ANIMAL_SPACING) + 1
+    glEnable(GL_TEXTURE_2D)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glColor3f(amb_rgb[0] * 0.95, amb_rgb[1] * 0.95, amb_rgb[2] * 0.95)
+    for i in range(n_steps):
+        s = s_start + i * ANIMAL_SPACING
+        if s < s_car + 12.0:
+            continue
+        for side in (-1, +1):
+            w_b = biome_weights_vec(np.array([s], dtype=np.float32),
+                                    side)[0]
+            w_forest = float(w_b[BIOME_FOREST])
+            w_river = float(w_b[BIOME_RIVER])
+            if w_forest + w_river < 0.55:
+                continue
+            key = (int(s * 7) * 2654435761
+                   + (0 if side < 0 else 7919)) & 0xFFFFFFFF
+            if (key & 0xFF) / 255.0 > 0.35 * crep:
+                continue
+            # deer at the forest edge, capybara near the water
+            want = 'deer' if w_forest >= w_river else 'capybara'
+            cands = [v for v in animal_variants if v[1] == want]
+            if not cands:
+                continue
+            list_id, _, height = cands[((key >> 16) & 0xFF) % len(cands)]
+            d = 12.0 + ((key >> 8) & 0xFF) / 255.0 * 18.0
+            yaw = ((key >> 4) & 0xFF) / 255.0 * 360.0
+            tx = curve_x(s) + side * (ROAD_WIDTH / 2 + d)
+            # Anchor to the blended terrain height — a capybara at the
+            # river stands at water level (wading), a deer on the
+            # forest floor, never floating at road datum.
+            hs = terrain_heights(float(s), float(d), t_time)
+            ty = curve_y(s) + sum(float(w_b[j]) * float(hs[j])
+                                  for j in range(BIOME_COUNT))
+            tz = -(s - s_car)
+            glPushMatrix()
+            glTranslatef(tx, ty, tz)
+            glRotatef(yaw, 0.0, 1.0, 0.0)
+            # slow grazing dip
+            glRotatef(2.5 * math.sin(t_time * 0.4 + (key & 0x3F)),
+                      0.0, 0.0, 1.0)
+            glScalef(height, height, height)
+            glCallList(list_id)
+            glPopMatrix()
+    glDisable(GL_TEXTURE_2D)
+
+
+def init_birds(seed=4747, s_car=0.0):
+    rng = np.random.default_rng(seed)
+    flocks = []
+    for _ in range(N_BIRD_FLOCKS):
+        flocks.append({
+            's': s_car + float(rng.uniform(120.0, 450.0)),
+            'side': -1 if rng.random() < 0.5 else +1,
+            'alt': float(rng.uniform(9.0, 18.0)),
+            'lat': float(rng.uniform(6.0, 38.0)),
+            'n': int(rng.integers(5, 10)),
+            'drift': float(rng.uniform(2.0, 5.0)),
+            'burst': 0.0,
+        })
+    return {'flocks': flocks, 'rng': rng}
+
+
+def birds_startle(state):
+    """Lightning! Every flock takes off hard for a few seconds."""
+    for f in state['flocks']:
+        f['burst'] = 1.0
+
+
+def update_birds(state, dt, s_car):
+    rng = state['rng']
+    for f in state['flocks']:
+        f['s'] += (f['drift'] + 14.0 * f['burst']) * dt
+        f['burst'] = max(0.0, f['burst'] - dt / 4.0)
+        if f['s'] < s_car - 40.0 or f['s'] > s_car + 700.0:
+            # respawn ahead over an open biome (plain/forest/river)
+            for _ in range(4):
+                cand = s_car + float(rng.uniform(150.0, 450.0))
+                side = -1 if rng.random() < 0.5 else +1
+                w_b = biome_weights_vec(
+                    np.array([cand], dtype=np.float32), side)[0]
+                if (w_b[BIOME_PLAIN] + w_b[BIOME_FOREST]
+                        + w_b[BIOME_RIVER]) > 0.5:
+                    break
+            f['s'] = cand
+            f['side'] = side
+            f['alt'] = float(rng.uniform(9.0, 18.0))
+            f['lat'] = float(rng.uniform(6.0, 38.0))
+            f['n'] = int(rng.integers(5, 10))
+            f['drift'] = float(rng.uniform(2.0, 5.0))
+
+
+def draw_birds(state, s_car, amb_rgb, night_a, t_time):
+    if night_a > 0.55:
+        return      # roosting
+    glDisable(GL_TEXTURE_2D)
+    glLineWidth(1.5)
+    col = (amb_rgb[0] * 0.18, amb_rgb[1] * 0.18, amb_rgb[2] * 0.20)
+    glColor3f(*col)
+    glBegin(GL_LINES)
+    for f in state['flocks']:
+        ds = f['s'] - s_car
+        if ds < 5.0 or ds > 600.0:
+            continue
+        bx = curve_x(f['s']) + f['side'] * f['lat']
+        by = curve_y(f['s']) + f['alt'] + 7.0 * f['burst']
+        bz = -ds
+        for k in range(f['n']):
+            px = bx + math.sin(t_time * 0.30 + k * 1.7) * 6.0
+            py = by + math.sin(t_time * 0.70 + k * 2.3) * 1.5
+            pz = bz + math.cos(t_time * 0.25 + k * 1.1) * 6.0
+            # two wing strokes; flap rate jumps during a startle burst
+            flap = math.sin(t_time * (8.0 + 6.0 * f['burst']) + k * 2.9)
+            span = 0.55
+            wy = flap * 0.35
+            glVertex3f(px - span, py + wy, pz)
+            glVertex3f(px, py, pz)
+            glVertex3f(px, py, pz)
+            glVertex3f(px + span, py + wy, pz)
+    glEnd()
+
+
+def draw_lamp_moths(s_car, night_a, t_time):
+    """Insect motes circling the street-lamp heads at night."""
+    if night_a < 0.30:
+        return
+    s_start = math.ceil(s_car / LAMP_SPACING) * LAMP_SPACING
+    glDisable(GL_TEXTURE_2D)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+    glDepthMask(GL_FALSE)
+    glPointSize(2.0)
+    glBegin(GL_POINTS)
+    for i in range(int(130.0 / LAMP_SPACING)):
+        s = s_start + i * LAMP_SPACING
+        d = s - s_car
+        if d < 4.0:
+            continue
+        if not is_plain_either_side(s):
+            continue
+        fade = max(0.0, 1.0 - d / 130.0) * night_a
+        x = curve_x(s)
+        y = curve_y(s)
+        z = -d
+        for side in (-1, 1):
+            px = x + side * (ROAD_WIDTH / 2 + 0.6) - side * 1.0
+            py = y + 3.15
+            for k in range(5):
+                r = 0.18 + 0.06 * ((k * 37 + int(s)) % 5)
+                ang = t_time * (1.5 + 0.45 * k) + k * 2.1 + s * 0.13
+                glColor4f(1.0, 0.93, 0.65, 0.55 * fade)
+                glVertex3f(px + math.cos(ang) * r,
+                           py + math.sin(ang * 1.7) * r * 0.6,
+                           z + math.sin(ang) * r)
+    glEnd()
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+
+
+# ---------------------------------------------------------------------
+# Cinematic post-processing (fixed-function — CPU readback + writeback)
+# ---------------------------------------------------------------------
+#
+# We keep the pipeline fixed-function by doing the final grade on the CPU
+# every frame: glReadPixels -> numpy vector ops -> glDrawPixels. The cost
+# is one RGB uint8 transfer each direction (~6 MB at 1280x720, ~1.5 MB
+# at the headless 800x450 screenshot default) + vectorised numpy math.
+# That's acceptable for the baseline-and-iterate workflow on this branch
+# (the "light" branch is an iterative cinematic calibration pass).
+#
+# Stack (applied in linear-ish sRGB, top-down):
+#   1. Exposure scale                  (Hable 2010 / Reinhard 2002)
+#   2. ACES fitted tone map            (Narkowicz 2015)
+#   3. ASC CDL lift/gamma/gain         (ASC 2008)
+#   4. Teal-orange split-tone          (cinematic colour science)
+#   5. Filmic S-curve contrast         (Pixar-style log response)
+#   6. Subtle vignette                 (cinema lens falloff)
+#   7. Final clamp
+#
+# All coefficients are bundled in CINEMATIC_CFG so iteration cycles show
+# up as coefficient diffs, not code rewrites. Numbers are sourced in the
+# constants' docstring below.
+
+CINEMATIC_CFG = {
+    # 1. Exposure — cycle 2: kept neutral (1.00). Cycle 1 at 1.08 over-
+    # exposed already-bright noon frames after ACES toe compression.
+    "exposure": 1.00,
+    # 2. ACES Narkowicz 2015 coefficients (published verbatim).
+    "aces_a": 2.51, "aces_b": 0.03, "aces_c": 2.43,
+    "aces_d": 0.59, "aces_e": 0.14,
+    # 3. ASC CDL — cycle 2: push a touch of warmth into midtones via
+    # gain.R > gain.B, and lift blues slightly in the shadows so blacks
+    # read as "cool cinema black" rather than crushed.
+    "lift":  ( 0.00,  0.000, +0.008),
+    "gamma": ( 0.98,  1.00,   1.02),
+    "gain":  ( 1.05,  1.02,   0.98),
+    # 4. Teal-orange split. Cycle 1 used (0.86, 1.02, 1.08) for shadows
+    # but the elevated G channel read as mint/green on grass. Cycle 2
+    # shifts the shadow tint toward true teal-blue (less G, more B) and
+    # reduces overall strength from 0.35 -> 0.18 so the grade reads as
+    # a push, not a wash. Highlights kept warm (amber) but less amber so
+    # the sunrise sky doesn't collapse into neutral.
+    "split_shadow_rgb":    (0.94, 0.99, 1.10),
+    "split_highlight_rgb": (1.06, 1.01, 0.94),
+    "split_strength":      0.18,
+    # 5. Contrast — cycle 1 at 0.55 crushed midtones and flattened the
+    # dawn warm gradient. 0.30 gives a visible S without losing
+    # colour volume in the sky.
+    "contrast_k": 0.30,
+    # 6. Vignette — subtle; just enough to pull eye to centre without
+    # darkening the corners into a fake oval.
+    "vignette_strength": 0.22,
+    "vignette_inner":    0.55,
+    "vignette_outer":    1.15,
+    # 7. Saturation — pushed to 1.14 (was 1.08) to restore colour volume
+    # lost to the ACES tone-map toe on cycle 1, without overdriving the
+    # already-neon grass biomes.
+    "saturation": 1.14,
+}
+
+
+def _cinematic_post_process(W, H, cfg=CINEMATIC_CFG):
+    """Read the back buffer, apply the cinematic grade, and write it
+    back. Call right before pygame.display.flip()."""
+    # Read. BGRA would be faster on some drivers, but RGB/ubyte is the
+    # conservative fixed-function choice.
+    raw = glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE)
+    img = np.frombuffer(raw, dtype=np.uint8).reshape(H, W, 3).astype(np.float32) / 255.0
+
+    # 1. Exposure
+    x = img * cfg["exposure"]
+
+    # 2. ACES fitted (Narkowicz 2015). Applied per channel in linear-ish
+    # space. This squashes highlights and gives the image filmic roll-off.
+    a = cfg["aces_a"]; b = cfg["aces_b"]; c = cfg["aces_c"]
+    d = cfg["aces_d"]; e = cfg["aces_e"]
+    x = np.clip((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0)
+
+    # 3. ASC CDL — per-channel lift/gamma/gain.
+    lift = np.asarray(cfg["lift"], dtype=np.float32)
+    gain = np.asarray(cfg["gain"], dtype=np.float32)
+    gm = np.asarray(cfg["gamma"], dtype=np.float32)
+    # Remap: (x - lift)/(gain - lift) -> pow(1/gamma). Avoid div by zero.
+    denom = np.maximum(gain - lift, 1e-4)
+    x = np.clip((x - lift) / denom, 0.0, 1.0)
+    x = np.power(x, 1.0 / np.maximum(gm, 1e-3))
+
+    # 4. Teal-orange split. Rec. 709 luma drives the blend.
+    luma = x[..., 0] * 0.2126 + x[..., 1] * 0.7152 + x[..., 2] * 0.0722
+    # Smoothstep 0.20 -> 0.80 keeps the effect off the extreme shadow and
+    # the extreme highlight so pure blacks stay neutral.
+    w_hi = np.clip((luma - 0.20) / 0.60, 0.0, 1.0)
+    w_hi = w_hi * w_hi * (3.0 - 2.0 * w_hi)
+    w_lo = 1.0 - w_hi
+    sh = np.asarray(cfg["split_shadow_rgb"], dtype=np.float32)
+    hl = np.asarray(cfg["split_highlight_rgb"], dtype=np.float32)
+    tint = sh[None, None, :] * w_lo[..., None] + hl[None, None, :] * w_hi[..., None]
+    s_str = cfg["split_strength"]
+    x = x * (1.0 - s_str) + x * tint * s_str
+
+    # 5. Filmic S-curve (contrast). Symmetric cubic around midgray; the
+    # published "Pixar log response" uses ~1.2 slope at 0.5, realized as
+    # 0.5 + s*(x-0.5) - k*(x-0.5)^3 with k tuned by eye.
+    k = cfg["contrast_k"]
+    d05 = x - 0.5
+    x = np.clip(0.5 + d05 * (1.0 + 0.2 * (1.0 - 4.0 * d05 * d05)) - k * (d05 ** 3), 0.0, 1.0)
+
+    # 6. Saturation boost. Luma-preserving: out = gray + s*(rgb - gray).
+    sat = cfg["saturation"]
+    if abs(sat - 1.0) > 1e-3:
+        gray = (x[..., 0] * 0.2126 + x[..., 1] * 0.7152 + x[..., 2] * 0.0722)[..., None]
+        x = np.clip(gray + (x - gray) * sat, 0.0, 1.0)
+
+    # 7. Vignette. Precompute a cached radial mask on first call.
+    vkey = (W, H, cfg["vignette_strength"], cfg["vignette_inner"], cfg["vignette_outer"])
+    cache = _cinematic_post_process.__dict__.setdefault("_vcache", {})
+    mask = cache.get(vkey)
+    if mask is None:
+        yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+        cx_ = (W - 1) * 0.5
+        cy_ = (H - 1) * 0.5
+        # Normalise so r=1 at half-diagonal.
+        rn = np.sqrt((xx - cx_) ** 2 + (yy - cy_) ** 2) / math.sqrt(cx_ ** 2 + cy_ ** 2)
+        inn = cfg["vignette_inner"]; out_ = cfg["vignette_outer"]
+        t = np.clip((rn - inn) / max(1e-4, out_ - inn), 0.0, 1.0)
+        t = t * t * (3.0 - 2.0 * t)
+        mask = (1.0 - cfg["vignette_strength"] * t).astype(np.float32)
+        # Cap cache size so long interactive sessions don't leak.
+        if len(cache) > 4:
+            cache.clear()
+        cache[vkey] = mask
+    x = x * mask[..., None]
+
+    # Final 8-bit encode and write back.
+    out = (np.clip(x, 0.0, 1.0) * 255.0).astype(np.uint8)
+    # glDrawPixels writes at the current raster pos. Reset projection to
+    # identity pixel space so (0,0) is bottom-left and pixels land 1:1.
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glOrtho(0, W, 0, H, -1, 1)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+    glDisable(GL_DEPTH_TEST)
+    glDisable(GL_BLEND)
+    glDisable(GL_FOG)
+    glDisable(GL_TEXTURE_2D)
+    glDisable(GL_LIGHTING)
+    glRasterPos2i(0, 0)
+    glDrawPixels(W, H, GL_RGB, GL_UNSIGNED_BYTE, out.tobytes())
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_FOG)
+
+
+def _save_screenshot(path, W, H):
+    """Save the current front buffer as a PNG. Reads GL_FRONT so the saved
+    frame matches what the user just saw — the classic GL_BACK readback
+    captures one frame behind."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    glFinish()
+    glReadBuffer(GL_FRONT)
+    buf = glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE)
+    glReadBuffer(GL_BACK)
+    img = np.frombuffer(buf, dtype=np.uint8).reshape(H, W, 3)
+    img = np.flipud(img)
+    surface = pygame.image.fromstring(img.tobytes(), (W, H), "RGB")
+    pygame.image.save(surface, path)
+    print(f"saved: {path}", file=sys.stderr)
+
+
+def _build_arg_parser():
+    p = argparse.ArgumentParser(
+        description="Roads driving simulation. Without arguments, runs the "
+                    "full interactive demo. Arguments enable headless "
+                    "capture for the cinematic calibration iteration loop.",
+    )
+    p.add_argument("--headless", action="store_true",
+                   help="Run without audio, in a small window, for fixed "
+                        "frames, then exit. Used for screenshot iteration.")
+    p.add_argument("--width", type=int, default=1280)
+    p.add_argument("--height", type=int, default=720)
+    p.add_argument("--time", type=float, default=None,
+                   metavar="HOURS",
+                   help="Force time of day in hours 0..24. 6=dawn, 12=noon, "
+                        "18=dusk, 22=night. Default: lets the sim drift.")
+    p.add_argument("--season", type=str, default=None,
+                   help="Season phase: 'summer'/'autumn'/'winter'/'spring' "
+                        "or a numeric phase offset 0-1 around the year. "
+                        "Seasons otherwise advance with distance driven.")
+    p.add_argument("--weather", choices=tuple(WEATHER_PIN.keys()),
+                   default=None,
+                   help="Pin the weather lifecycle to a named state "
+                        "(clear/clouding/overcast/rain/storm).")
+    p.add_argument("--wetness", type=float, default=None,
+                   help="Pin the wet-road memory 0-1 (for screenshots).")
+    p.add_argument("--moon", type=float, default=None,
+                   help="Pin the moon phase 0-1 (0=new, 0.5=full).")
+    p.add_argument("--storm", type=float, default=None,
+                   help="Force storm intensity 0..1. Default: sim-driven.")
+    p.add_argument("--s-car", dest="s_car", type=float, default=None,
+                   help="Starting distance along the road (m). Picks the "
+                        "biome under the camera (try 0, 400, 900, 1400...).")
+    p.add_argument("--screenshot", type=str, default=None,
+                   help="PNG output path. Captured after --warmup-frames.")
+    p.add_argument("--warmup-frames", type=int, default=4,
+                   help="Frames to render before screenshotting (gives smoothed "
+                        "states a chance to settle).")
+    p.add_argument("--exit-after-shot", action="store_true",
+                   help="Close the window immediately after the screenshot "
+                        "is saved. Implicit when --headless is set.")
+    p.add_argument("--no-cinematic", action="store_true",
+                   help="Skip the final cinematic grade pass. Use to capture "
+                        "a pre-grade baseline reference frame.")
+    p.add_argument("--audio-output", choices=("default", "blackhole", "both"),
+                   default="default",
+                   help="Where ambient + ensemble audio is routed. "
+                        "'default' = system default output; 'blackhole' = "
+                        "BlackHole 2ch only (silent on speakers); 'both' = "
+                        "fan out to BOTH the system default AND BlackHole 2ch.")
+    p.add_argument("--hidden", action="store_true",
+                   help="Create the SDL window with the HIDDEN flag and place "
+                        "it off-screen. Use with --stream-pipe to render for "
+                        "broadcast without occupying the user's desktop.")
+    p.add_argument("--stream-pipe", action="store_true",
+                   help="Stream raw RGB24 frames of the rendered framebuffer "
+                        "to stdout, one frame per pygame.display.flip(). "
+                        "Use with a downstream encoder (ffmpeg -f rawvideo). "
+                        "Auto-implies continuous render (no warmup-exit).")
+    return p
+
+
+_BLACKHOLE_NAME = "BlackHole 2ch"
+
+
+def _resolve_audio_devices(mode):
+    """Map --audio-output mode to (sounddevice_specs, fluidsynth_devices).
+
+    sounddevice accepts None for the default (and a string name otherwise);
+    fluidsynth's audio.coreaudio.device takes the device name (None = default).
+    """
+    if mode == "default":
+        return [None], [None]
+    if mode == "blackhole":
+        return [_BLACKHOLE_NAME], [_BLACKHOLE_NAME]
+    if mode == "both":
+        return [None, _BLACKHOLE_NAME], [None, _BLACKHOLE_NAME]
+    return [None], [None]
 
 
 # --- Main ---
-def main():
+def main(argv=None):
+    args = _build_arg_parser().parse_args(argv)
+
+    # Stream-pipe mode: stdout is reserved for raw RGB24 frame bytes, so
+    # any incidental text print() must be diverted to stderr or the
+    # downstream encoder will see corrupted pixels.
+    _stream_fd = None
+    if args.stream_pipe:
+        import io
+        _stream_fd = os.fdopen(os.dup(1), "wb", buffering=0)
+        sys.stdout = sys.stderr
+
+    if args.hidden:
+        # Belt and suspenders: HIDDEN flag + off-screen position. macOS may
+        # throttle truly hidden GL contexts; an off-screen window keeps the
+        # compositor convinced it should keep drawing.
+        os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "9999,9999")
+
     pygame.init()
-    info = pygame.display.Info()
-    W, H = info.current_w, info.current_h
-    pygame.display.set_mode((W, H), DOUBLEBUF | OPENGL | FULLSCREEN)
+    if args.headless:
+        W, H = args.width, args.height
+        # Hidden window on macOS still needs SDL_VIDEODRIVER set upstream
+        # (the README-documented dummy driver). Use a small windowed mode
+        # so pygame creates a real GL context regardless.
+        os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+        pygame.display.set_mode((W, H), DOUBLEBUF | OPENGL)
+    elif args.stream_pipe:
+        W, H = args.width, args.height
+        flags = DOUBLEBUF | OPENGL
+        if args.hidden and hasattr(pygame, "HIDDEN"):
+            flags |= pygame.HIDDEN
+        pygame.display.set_mode((W, H), flags)
+    else:
+        info = pygame.display.Info()
+        W, H = info.current_w, info.current_h
+        pygame.display.set_mode((W, H), DOUBLEBUF | OPENGL | FULLSCREEN)
     pygame.display.set_caption("Roads")
     pygame.mouse.set_visible(False)
 
@@ -6972,6 +9218,23 @@ def main():
     # oncoming.
     truck_variants = build_truck_variants()
     truck_state = init_trucks(player_speed=SPEED)
+    # Phase-2 road users: motorcycles (corredor lane-splitting), delivery
+    # vans (commerce-hours density), city buses (curbside stops in city
+    # zones) and a rare emergency unit (strobes + traffic yielding).
+    moto_variants = build_motorcycle_variants()
+    moto_state = init_motos(player_speed=SPEED)
+    van_variants = build_van_variants()
+    van_state = init_vans(player_speed=SPEED)
+    bus_variants = build_bus_variants()
+    bus_state = init_buses(player_speed=SPEED)
+    emerg_variants = build_emergency_variants()
+    emerg_state = init_emergency(player_speed=SPEED)
+    # Phase-2 life beyond the roadway: sidewalk pedestrians (umbrellas
+    # up in storms), crepuscular wildlife at forest/river edges, bird
+    # flocks that scatter on lightning, moths around the lamps.
+    ped_lists, ped_umb_lists = build_pedestrian_variants()
+    animal_variants = build_animal_variants()
+    bird_state = init_birds()
     # Flowers: six colour palettes, each compiled as a crossed-quad
     # billboard display list.
     flower_variants = []
@@ -6995,10 +9258,11 @@ def main():
     # Ambient audio mixer: brown-noise engine rumble + rain + wind +
     # thunder one-shots. Disabled silently if the platform doesn't have a
     # usable audio output (e.g. headless runs).
+    sd_devs, fs_devs = _resolve_audio_devices(args.audio_output)
     audio_player = None
-    if _AUDIO_AVAILABLE:
+    if _AUDIO_AVAILABLE and not args.headless:
         try:
-            audio_player = AmbientAudioMixer()
+            audio_player = AmbientAudioMixer(devices=sd_devs)
             audio_player.start()
         except Exception as exc:
             _print_help_banner(
@@ -7019,9 +9283,9 @@ def main():
     # fluidsynth (system library) + pyfluidsynth + the CC0 SoundFont.
     # Skipped gracefully with a friendly message if any part is missing.
     piano_player = None
-    if _FLUIDSYNTH_AVAILABLE and os.path.exists(SOUNDFONT_PATH):
+    if _FLUIDSYNTH_AVAILABLE and os.path.exists(SOUNDFONT_PATH) and not args.headless:
         try:
-            piano_player = MinimalEnsemblePlayer()
+            piano_player = MinimalEnsemblePlayer(devices=fs_devs)
             piano_player.start()
         except Exception as exc:
             _print_help_banner(
@@ -7062,21 +9326,45 @@ def main():
     active_ca_charge = None
     ca_charge_frames_left = 0
     ca_time_to_strike = 5.0
-    # Seed the EMA with the starting storm value so we don't ramp in from 0
-    storm_smoothed = storm_intensity_at(0.0)
+    # Live weather: the Phase-3 lifecycle machine (CLEAR → CLOUDING →
+    # OVERCAST → RAIN → CLEARING) replaces the raw triple-sine EMA.
+    weather = WeatherSystem()
+    wetness = 0.0          # wet-road memory (Phase 3.2)
+    thunder_queue = []     # [delay_remaining, volume] — speed-of-sound
+    shooting_star = None
+    shoot_timer = 8.0
+    cloud_phase = 0.0      # wind-integrated cloud scroll
+    wind_dir = ENV['wind_dir']
+    # CLI season: named or numeric phase offset around the year.
+    if args.season is not None:
+        named = {'summer': 0.0, 'autumn': 0.25, 'winter': 0.5,
+                 'spring': 0.75}
+        try:
+            ENV['season_off'] = named.get(args.season.lower(),
+                                          None)
+            if ENV['season_off'] is None:
+                ENV['season_off'] = float(args.season) % 1.0
+        except ValueError:
+            ENV['season_off'] = 0.0
     sv, stc, sfr, sidx = build_sky_dome()
     sky_state = (sv, stc, sfr, sidx, cloud_tex, stars_tex, overcast_tex)
 
     clock = pygame.time.Clock()
-    s_car = 0.0
+    s_car = float(args.s_car) if args.s_car is not None else 0.0
     t_time = 0.0
     # start near dawn so first sight is pretty
-    t_day = 0.18
+    t_day = (args.time / 24.0) % 1.0 if args.time is not None else 0.18
     speed = SPEED
     camera_yaw = 0.0    # degrees; + rotates view right, - rotates left
     manual_strike_queued = False
     manual_ca_queued = False
     running = True
+    # Headless bookkeeping for the screenshot-and-iterate loop.
+    _frame_no = 0
+    _shot_taken = False
+    _headless_time_override = args.time is not None
+    _headless_storm_override = args.storm is not None
+    _apply_cinematic = not args.no_cinematic
     while running:
         dt = clock.tick(60) / 1000.0
         for e in pygame.event.get():
@@ -7117,6 +9405,15 @@ def main():
         s_car += speed * dt
         t_time += dt
         t_day = (t_day + dt / DAY_PERIOD) % 1.0
+        # Headless overrides: pin time-of-day and freeze s_car so the
+        # --time / --s-car CLI flags deterministically select a scene
+        # state. The loop still ticks a few frames so EMAs settle, but
+        # these two drivers are held constant.
+        if args.headless:
+            if _headless_time_override:
+                t_day = (args.time / 24.0) % 1.0
+            if args.s_car is not None:
+                s_car = float(args.s_car)
 
         # Audio mix: brown noise speed tracks camera speed; rain and wind
         # volumes track the weather/biome state. Set once per frame —
@@ -7124,14 +9421,47 @@ def main():
         if audio_player is not None:
             audio_player.set_speed(0.25 + (speed / SPEED) * 0.75)
 
-        # weather tick: storm intensity and lightning lifecycle.
-        # EMA on the raw storm signal so intensity climbs and falls over
-        # ~30 seconds rather than whatever the sine product happens to do —
-        # looks like weather building gradually, not flicking on and off.
-        storm_raw = storm_intensity_at(t_time)
-        storm_tau = 60.0   # weather blends over ~1 min
-        storm_smoothed += (storm_raw - storm_smoothed) * min(1.0, dt / storm_tau)
-        storm_i = storm_smoothed
+        # weather tick (Phase 3): season + moon + lifecycle machine.
+        # Season is anchored to distance (the zone you reach was rolled
+        # in the season you reach it), so the camera's winter weight
+        # drives the sun arc, snow line and flora without terrain pops.
+        # Moon phase cycles every MOON_PERIOD_DAYS day-cycles and
+        # lifts/dims the ambient night floor.
+        ENV['winter'] = winter_weight(season_phase_at(s_car))
+        ENV['moon_phase'] = (t_time / (DAY_PERIOD
+                                       * MOON_PERIOD_DAYS)) % 1.0
+        if args.moon is not None:
+            ENV['moon_phase'] = float(args.moon) % 1.0
+        summer_w = 1.0 - ENV['winter']
+        # Live weather is the lifecycle machine: CLEAR → CLOUDING →
+        # OVERCAST → RAIN → CLEARING, humidity carried between events,
+        # convective likelihood peaking on summer afternoons. The
+        # machine's own EMA replaces the old raw-sine smoothing.
+        storm_i = weather.update(dt, t_day, summer_w)
+        if _headless_storm_override:
+            storm_i = float(args.storm)
+            weather.level = storm_i
+        elif args.weather is not None:
+            storm_i = WEATHER_PIN[args.weather]
+            weather.level = storm_i
+
+        # Unified wind (Phase 3.5): heading wanders slowly; speed =
+        # calm base + triple-LFO gusting + storm forcing. The cloud
+        # scroll integrates the live speed so clouds accelerate with
+        # the front instead of jumping.
+        wind_dir += (0.06 * math.sin(t_time * 0.013)
+                     + 0.04 * math.sin(t_time * 0.041 + 1.7)) * dt
+        gust = ((0.55 + 0.45 * math.sin(t_time * 2 * math.pi / 5.3))
+                * (0.55 + 0.45 * math.sin(t_time * 2 * math.pi / 7.8
+                                          + 2.1))
+                * (0.55 + 0.45 * math.sin(t_time * 2 * math.pi / 3.1
+                                          + 4.0)))
+        wind_speed = 1.6 + 2.6 * gust + 7.0 * storm_i
+        ENV['wind_dir'] = wind_dir
+        ENV['wind_speed'] = wind_speed
+        wind_x = math.cos(wind_dir) * wind_speed
+        cloud_phase += dt * 0.004 * (0.4 + wind_speed / 5.0)
+
         if active_bolt is not None:
             bolt_age += dt
             if bolt_age > BOLT_LIFE:
@@ -7154,18 +9484,51 @@ def main():
         sun_d = sun_dir_at(t_day)
         moon_d = -sun_d  # opposite
 
+        # --- Wet-road memory (Phase 3.2) ---
+        # Rain soaks the pavement within seconds; drying takes 2-4
+        # simulated hours (10-22 s wall-clock), faster under the midday
+        # sun. Puddles, road specular and traffic caution all read this
+        # instead of the instantaneous storm value, so the road stays
+        # wet — and traffic stays careful — after the sun comes out.
+        frost_i = frost_intensity_at(s_car)
+        rain_i = rain_intensity_from(storm_i) * (1.0 - frost_i)
+        if args.wetness is not None:
+            wetness = float(args.wetness)
+        elif rain_i > 0.04:
+            wetness = min(1.0, wetness + rain_i * dt / 6.0)
+        else:
+            day_w = _smooth((float(sun_d[1]) + 0.15) / 0.50)
+            wetness = max(0.0, wetness - dt / (22.0 - 12.0 * day_w))
+        ENV['wetness'] = wetness
+
+        # Camera-local biome weights (used by fog, wind exposure, audio).
+        wL_c = biome_weights_vec(
+            np.array([s_car], dtype=np.float32), -1)[0]
+        wR_c = biome_weights_vec(
+            np.array([s_car], dtype=np.float32), +1)[0]
+        open_exp_trees = 0.5 * (
+            wL_c[BIOME_PLAIN] + wL_c[BIOME_MOUNTAIN] + wL_c[BIOME_FROST]
+            + wR_c[BIOME_PLAIN] + wR_c[BIOME_MOUNTAIN] + wR_c[BIOME_FROST]
+        )
+
         # fog fades into the horizon color of the moment
         fog_c = (horizon[0] * bright * 0.9 + 0.05,
                  horizon[1] * bright * 0.9 + 0.05,
                  horizon[2] * bright * 0.9 + 0.05, 1.0)
         glFogfv(GL_FOG_COLOR, fog_c)
-        # Gradually thicken fog up to +10% when the camera is in frost biome.
-        # frost_intensity_at returns the smoothstep-blended biome weight so
-        # density eases in/out at zone transitions rather than snapping.
-        frost_i = frost_intensity_at(s_car)
-        # Frost biome and heavy storm both reduce visibility: shrink the
-        # fog-end distance so the linear fog ramp terminates sooner.
-        vis_end = 920.0 / (1.0 + 0.10 * frost_i + 0.30 * storm_i)
+        # Radiation fog at dawn (Phase 3.1): clear nights over open or
+        # wet ground leave a fog bank through sunrise that burns off by
+        # mid-morning — strongest over river/plain zones.
+        dawn_w = max(0.0, 1.0 - abs(t_day - 0.265) / 0.05)
+        low_ground = 0.5 * float(
+            wL_c[BIOME_PLAIN] + wL_c[BIOME_RIVER]
+            + wR_c[BIOME_PLAIN] + wR_c[BIOME_RIVER])
+        dawn_fog = dawn_w * low_ground * (1.0 - storm_i)
+        # Frost biome, heavy storm and dawn fog all reduce visibility:
+        # shrink the fog-end distance so the linear ramp ends sooner.
+        vis_end = 920.0 / (1.0 + 0.10 * frost_i + 0.30 * storm_i
+                           + 1.5 * dawn_fog)
+        glFogf(GL_FOG_START, 180.0 * (1.0 - 0.65 * dawn_fog))
         glFogf(GL_FOG_END, vis_end)
         glClearColor(horizon[0], horizon[1], horizon[2], 1.0)
 
@@ -7220,10 +9583,26 @@ def main():
             else:
                 time_to_strike = 1.0
 
-        if triggered_bolt and audio_player is not None:
-            thunder_vol = 0.40 + max(storm_i, 0.5) * 0.40 \
-                          + float(bolt_rng.uniform(-0.05, 0.15))
-            audio_player.trigger_thunder(volume=thunder_vol)
+        if triggered_bolt:
+            # Lightning startles every bird flock into a burst climb.
+            birds_startle(bird_state)
+            # Distance-correct thunder (Phase 3.4): the flash is
+            # instant, the clap crosses the gap at ~343 m/s — nearby
+            # strikes crack at once, far ones rumble in seconds later
+            # (and a touch quieter).
+            ground = active_bolt[0][-1]
+            d_bolt = math.hypot(float(ground[0]) - cx,
+                                float(ground[2]) - cz)
+            vol = (0.40 + max(storm_i, 0.5) * 0.40
+                   + float(bolt_rng.uniform(-0.05, 0.15)))
+            vol *= max(0.45, 1.0 - d_bolt / 700.0)
+            thunder_queue.append([d_bolt / 343.0, vol])
+        for _ev in thunder_queue:
+            _ev[0] -= dt
+        while thunder_queue and thunder_queue[0][0] <= 0.0:
+            _ev = thunder_queue.pop(0)
+            if audio_player is not None:
+                audio_player.trigger_thunder(volume=_ev[1])
 
         # CA electric charge — *separate* flash, 1-4 frames of full
         # brightness. Fires independently on rare dice rolls during
@@ -7267,59 +9646,88 @@ def main():
         # than snapping. Levels are ~50% of the previous scale so the
         # weather sits under the music, not on top of it.
         if audio_player is not None:
-            rain_vol = storm_i * (1.0 - frost_i) * 0.17
-            wL_now = biome_weights_vec(
-                np.array([s_car], dtype=np.float32), -1)[0]
-            wR_now = biome_weights_vec(
-                np.array([s_car], dtype=np.float32), +1)[0]
-            open_exp = 0.5 * (
-                wL_now[BIOME_PLAIN] + wL_now[BIOME_MOUNTAIN] + wL_now[BIOME_FROST]
-                + wR_now[BIOME_PLAIN] + wR_now[BIOME_MOUNTAIN] + wR_now[BIOME_FROST]
-            )
+            # Rain hiss tracks actual precipitation (not the overcast
+            # build-up); the wind layer tracks the unified wind speed.
+            rain_vol = rain_i * 0.17
             speed_ratio = speed / SPEED
-            wind_vol = (0.015
+            wind_vol = (0.012
                         + speed_ratio * 0.025
-                        + open_exp * 0.040
-                        + storm_i * 0.035)
+                        + float(open_exp_trees) * 0.035
+                        + ENV['wind_speed'] * 0.0042)
             audio_player.set_volumes(rain=rain_vol, wind=wind_vol)
 
-        draw_sky(sky_state, cx, cy, cz, t_time, t_day, storm_i, flash)
+        draw_sky(sky_state, cx, cy, cz, t_time, t_day, storm_i, flash,
+                 cloud_phase=cloud_phase)
 
         # sun + moon sit on top of the sky pass but behind terrain
         sc = sun_color(t_day)
         draw_celestial(cx, cy, cz, sun_d, radius=14.0,
                        core_color=sc,
                        glow_color=(sc[0], sc[1] * 0.8, sc[2] * 0.6))
-        # moon — slightly smaller, cool silver. Fades out when sun is up.
-        moon_alpha = _smooth((0.3 - bright) / 0.3)
+        # moon — slightly smaller, cool silver. Fades out when sun is
+        # up; waxes and wanes over the MOON_PERIOD_DAYS cycle, with the
+        # glow following the lit fraction (Phase 3.4).
+        moon_full = moon_fullness()
+        moon_alpha = _smooth((0.3 - bright) / 0.3) \
+            * (0.35 + 0.65 * moon_full)
         if moon_alpha > 0.02 and moon_d[1] > -0.25:
             draw_celestial(cx, cy, cz, moon_d, radius=9.0,
                            core_color=(0.92, 0.94, 1.0),
                            glow_color=(0.55, 0.65, 0.85),
-                           core_alpha=moon_alpha)
+                           core_alpha=moon_alpha,
+                           phase_frac=moon_full)
+
+        # Shooting stars (Phase 3.4): rare meteor streaks, clear nights
+        # only — a quiet reward for night drives between storms.
+        if shooting_star is None:
+            shoot_timer -= dt
+            if shoot_timer <= 0.0:
+                shoot_timer = float(bolt_rng.uniform(5.0, 16.0))
+                if (night_a > 0.6 and storm_i < 0.10
+                        and bolt_rng.random() < 0.5):
+                    az = float(bolt_rng.uniform(0.0, 2.0 * math.pi))
+                    alt = float(bolt_rng.uniform(0.35, 0.75))
+                    R = SKY_DOME_R * 0.85
+                    vaz = az + (math.pi / 2 if bolt_rng.random() < 0.5
+                                else -math.pi / 2)
+                    shooting_star = {
+                        'p': [math.cos(az) * math.cos(alt) * R,
+                              math.sin(alt) * R,
+                              math.sin(az) * math.cos(alt) * R],
+                        'v': [math.cos(vaz) * R * 0.55, -R * 0.18,
+                              math.sin(vaz) * R * 0.55],
+                        'age': 0.0,
+                        'life': float(bolt_rng.uniform(0.5, 0.9)),
+                    }
+        else:
+            shooting_star['age'] += dt
+            shooting_star['p'][0] += shooting_star['v'][0] * dt
+            shooting_star['p'][1] += shooting_star['v'][1] * dt
+            shooting_star['p'][2] += shooting_star['v'][2] * dt
+            if shooting_star['age'] >= shooting_star['life']:
+                shooting_star = None
+        if shooting_star is not None:
+            draw_shooting_star(shooting_star, cx, cy, cz)
 
         draw_terrain(terrain_tex, snow_ground_tex, s_car, t_time, amb)
         draw_city(s_car, building_lists, facade_texes, emission_tex,
                   amb, night_a, t_time,
                   storm_i=storm_i, frost_i=frost_i,
                   snow_tex=snow_ground_tex)
-        # Wind strength drives tree sway. Built from the same ingredients as
-        # wind audio: storm intensity dominates, open biomes add exposure,
-        # camera speed a touch. Clamped so peak sway stays around 3-4°.
-        wL_c = biome_weights_vec(
-            np.array([s_car], dtype=np.float32), -1)[0]
-        wR_c = biome_weights_vec(
-            np.array([s_car], dtype=np.float32), +1)[0]
-        open_exp_trees = 0.5 * (
-            wL_c[BIOME_PLAIN] + wL_c[BIOME_MOUNTAIN] + wL_c[BIOME_FROST]
-            + wR_c[BIOME_PLAIN] + wR_c[BIOME_MOUNTAIN] + wR_c[BIOME_FROST]
-        )
+        # Tree/flower sway now reads the unified wind (Phase 3.5): the
+        # same vector that slants the rain and pushes the clouds.
         wind_strength = min(
-            0.8,
-            0.10 + 0.30 * storm_i + 0.18 * open_exp_trees
+            0.85,
+            ENV['wind_speed'] / 14.0 + 0.16 * open_exp_trees
                  + 0.05 * (speed / SPEED),
         )
-        draw_forest(s_car, tree_lists, frost_tree_lists, amb,
+        # Seasonal flora (Phase 3.3): São Paulo's winter is the dry
+        # season — foliage desaturates toward straw, flowers thin out.
+        dry_season = 0.38 * ENV['winter']
+        flora_amb = (min(1.0, amb[0] * (1.0 + 0.10 * dry_season)),
+                     amb[1] * (1.0 - 0.10 * dry_season),
+                     amb[2] * (1.0 - 0.30 * dry_season))
+        draw_forest(s_car, tree_lists, frost_tree_lists, flora_amb,
                     t_time, wind_strength)
         # Rural houses: farther than trees, closer than city skyscrapers.
         # Snow accumulates on roofs during frost biome, melts off when
@@ -7327,26 +9735,42 @@ def main():
         draw_houses(s_car, house_variants, snow_ground_tex, amb, night_a)
         # Flowers along the shoulders — same wind as the trees so the
         # whole landscape pulses together when a gust rolls through.
-        draw_flowers(s_car, flower_variants, amb, t_time, wind_strength)
-        # Road pavement with subtle wet darkening during rain, then the
-        # snow overlay pass that fades in/out with frost biome transitions.
-        draw_road(road_tex, s_car, amb, storm_i, horizon_rgb=horizon)
+        draw_flowers(s_car, flower_variants, flora_amb, t_time,
+                     wind_strength,
+                     bloom=0.35 + 0.65 * (1.0 - ENV['winter']))
+        # Road pavement wet-darkens from the wetness MEMORY (not the
+        # instantaneous storm), then the snow overlay pass fades in/out
+        # with frost biome transitions.
+        draw_road(road_tex, s_car, amb, wetness, horizon_rgb=horizon)
         draw_road_snow_overlay(snow_ground_tex, s_car, amb)
         # Ponds draw *after* the road so any puddle sits on top of the
-        # pavement (including its imperfections and snow overlay). This
-        # is the reason cracks / dirt never show through a puddle — the
-        # puddle's alpha composite is the last paint.
-        draw_ponds(pond_tex, s_car, storm_i, horizon, amb, t_time)
+        # pavement (including its imperfections and snow overlay).
+        # Driven by wetness, so puddles linger and shrink as the road
+        # dries instead of vanishing with the last raindrop.
+        draw_ponds(pond_tex, s_car, wetness, horizon, amb, t_time)
         # Bridges + tunnels: placed where biomes dictate (river / mountain)
         # so they never collide with trees, buildings, or other structures.
-        # Concrete tint reacts to storm (wet darkening) and frost (snow cap).
-        draw_civil_structures(s_car, concrete_tex, amb, storm_i, frost_i)
+        # Concrete tint wet-darkens off the same wetness memory.
+        draw_civil_structures(s_car, concrete_tex, amb, wetness, frost_i)
         draw_snow_shoulders(snow_ground_tex, s_car, amb)
         draw_lamps(s_car, night_a)
+        draw_lamp_moths(s_car, night_a, t_time)
+        # Street life: pedestrians on city sidewalks (umbrellas in the
+        # rain), deer/capybara silhouettes at dawn and dusk, bird flocks
+        # over the open biomes.
+        draw_pedestrians(s_car, ped_lists, ped_umb_lists, amb, night_a,
+                         storm_i, t_day, t_time)
+        draw_animals(s_car, animal_variants, amb, t_day, t_time)
+        update_birds(bird_state, dt, s_car)
+        draw_birds(bird_state, s_car, amb, night_a, t_time)
 
-        # Procedural traffic. Two lanes: player's left lane travels the
-        # same direction as the player (cars recede), right lane is
-        # oncoming (cars close toward the camera).
+        # Procedural traffic. Player's left side travels the same
+        # direction as the player (a mix of slower vehicles the player
+        # reels in and faster ones that overtake), right side is
+        # oncoming. Each direction has two sub-lanes; vehicles follow
+        # the IDM car-following model with MOBIL lane changes, driver
+        # personalities, and desired speeds coupled to congestion,
+        # rain/frost and dusk (see update_traffic).
         # Traffic density follows the São Paulo weekday profile — quiet
         # between 2-5 AM, morning peak ~08:00-09:00, evening peak
         # ~18:00-19:00. Trucks get a softer modulation since freight
@@ -7354,25 +9778,48 @@ def main():
         # (empirical observation from CET-SP cargo studies).
         traffic_d = traffic_density_at(t_day)
         truck_d = 0.3 + 0.7 * traffic_d   # less peaky than cars
-        update_cars(car_state, dt, s_car, speed)
+        moto_d = moto_density_at(t_day)
+        van_d = van_density_at(t_day)
+        bus_d = bus_density_at(t_day)
+        # Drivers slow for active rain AND for a still-wet road (3.2) —
+        # the flow stays cautious after the cell has passed.
+        driving_wet = max(rain_i, 0.80 * wetness)
+        update_traffic((car_state, truck_state, moto_state, van_state,
+                        bus_state, emerg_state), dt, s_car, speed,
+                       t_day=t_day, storm_i=driving_wet, frost_i=frost_i,
+                       night_a=night_a)
         draw_cars(car_state, car_variants, s_car, amb, sun_d,
-                  night_a, flare_tex, density=traffic_d)
-        update_cars(truck_state, dt, s_car, speed)
+                  night_a, flare_tex, density=traffic_d, storm_i=storm_i,
+                  t_time=t_time)
         draw_trucks(truck_state, truck_variants, s_car, amb, sun_d,
-                    night_a, flare_tex, density=truck_d)
+                    night_a, flare_tex, density=truck_d, storm_i=storm_i,
+                    t_time=t_time)
+        draw_cars(moto_state, moto_variants, s_car, amb, sun_d,
+                  night_a, flare_tex, density=moto_d, storm_i=storm_i,
+                  t_time=t_time)
+        draw_cars(van_state, van_variants, s_car, amb, sun_d,
+                  night_a, flare_tex, density=van_d, storm_i=storm_i,
+                  t_time=t_time)
+        draw_cars(bus_state, bus_variants, s_car, amb, sun_d,
+                  night_a, flare_tex, density=bus_d, storm_i=storm_i,
+                  t_time=t_time)
+        draw_cars(emerg_state, emerg_variants, s_car, amb, sun_d,
+                  night_a, flare_tex, density=1.0, storm_i=storm_i,
+                  t_time=t_time)
 
         # snowfall: per-side gating. Flakes only fall where that side of
         # the road is in a frost biome; if left is frost and right isn't,
         # snow falls only to the left.
         wL_frost = frost_weight_at(s_car, -1)
         wR_frost = frost_weight_at(s_car, +1)
-        update_snow(snow_state, dt, t_time)
+        update_snow(snow_state, dt, t_time, wind_x=wind_x)
         draw_snow(snow_state, snowflake_tex, wL_frost, wR_frost, cx, cy, cz)
 
-        # rain: storm active AND not in a frost biome (otherwise it's snow
-        # falling from the sibling snow system — don't draw both at once).
-        update_rain(rain_state, dt)
-        rain_i = storm_i * (1.0 - frost_i)
+        # rain: precipitation only once the cell has actually opened
+        # (rain_i, computed from the lifecycle level) AND not in a frost
+        # biome (otherwise it's snow from the sibling system). Streak
+        # slant follows the unified wind.
+        update_rain(rain_state, dt, wind_x=wind_x)
         draw_rain(rain_state, rain_i, cx, cy, cz)
 
         # Volumetric dust motes — rare, gated so they only appear in
@@ -7412,14 +9859,43 @@ def main():
         draw_lens_flare(flare_tex, sun_d, cx, cy, cz, lx, ly, lz,
                         W, H, flare_smoothed)
 
-        # Lens weather drops: spawn + advance + draw, gated by rain/snow
-        # intensity so they only appear in their respective weather.
-        rain_lens_i = storm_i * (1.0 - frost_i)
+        # Lens weather drops: spawn + advance + draw, gated by actual
+        # precipitation (not the overcast build-up) and snow.
+        rain_lens_i = rain_i
         snow_lens_i = frost_i
         lens_overlay.update(dt, rain_lens_i, snow_lens_i, W, H)
         lens_overlay.draw(lens_drop_tex, lens_flake_tex, W, H)
 
+        # Final pass: cinematic grade (ACES + CDL + teal-orange + vignette).
+        # Runs last so everything — sky, terrain, city, rain streaks, lens
+        # flare, lens overlay — receives the same film look.
+        if _apply_cinematic:
+            _cinematic_post_process(W, H)
+
         pygame.display.flip()
+        _frame_no += 1
+
+        # Stream-pipe: read the just-flipped front buffer and emit one
+        # raw RGB24 frame to stdout. OpenGL's origin is bottom-left so the
+        # downstream encoder must apply -vf vflip (cheaper than flipping
+        # an HD frame in Python every tick).
+        if _stream_fd is not None:
+            buf = glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE)
+            try:
+                _stream_fd.write(buf)
+            except BrokenPipeError:
+                running = False
+
+        # Headless: after warmup frames elapse, capture a screenshot and
+        # end the loop. Saving reads the FRONT buffer post-flip so the
+        # captured image is exactly what we just displayed (same trick as
+        # view.py — prevents the 1-frame-behind aliasing on double buffers).
+        if (args.screenshot and not _shot_taken
+                and _frame_no > args.warmup_frames):
+            _save_screenshot(args.screenshot, W, H)
+            _shot_taken = True
+            if args.headless or args.exit_after_shot:
+                running = False
 
     if piano_player is not None:
         piano_player.stop()

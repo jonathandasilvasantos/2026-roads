@@ -9,3 +9,4 @@ __pycache__/
 .vscode/
 soundfonts/*.sf2
 soundfonts/*.7z
+plan.txt
