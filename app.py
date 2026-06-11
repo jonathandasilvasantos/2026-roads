@@ -1045,19 +1045,156 @@ def generate_thunder_clip(duration_s=3.8,
     return np.tanh(rumble * 0.9).astype(np.float32)
 
 
+# --- Phase 5: traffic & environment sound synthesis -----------------------
+# All clips are mono float32 at the mixer sample rate, normalised and
+# soft-limited like the thunder clip. Stereo placement happens at
+# trigger time (constant-power pan in the mixer), not in the clips.
+
+def _shaped_noise(n, sample_rate, cutoff, power=1.2, seed=0):
+    """FFT-shaped noise bed: white → low-passed with an exponential
+    roll-off above `cutoff` Hz (same recipe as the thunder rumble)."""
+    rng = np.random.default_rng(seed)
+    re = rng.standard_normal(n // 2 + 1).astype(np.float32)
+    im = rng.standard_normal(n // 2 + 1).astype(np.float32)
+    spectrum = (re + 1j * im).astype(np.complex64)
+    freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
+    scale = np.zeros_like(freqs, dtype=np.float32)
+    scale[1:] = np.exp(-(freqs[1:] / cutoff) ** power)
+    out = np.fft.irfft(spectrum * scale.astype(np.complex64), n)
+    out = out.astype(np.float32)
+    return out / (np.max(np.abs(out)) + 1e-9)
+
+
+def generate_passby_clip(kind='car', seed=0,
+                         sample_rate=_AUDIO_SAMPLE_RATE):
+    """One vehicle passing the camera: an asymmetric noise swell with
+    the Doppler drop baked in (every pass-by follows the same profile,
+    so the bright→dark spectral glide and the pitch ramp on the tonal
+    component are pre-rendered). Class sets length and timbre:
+    trucks and buses roar softly, cars whoosh. (Motorcycles are
+    deliberately SILENT — the buzz annoyed the user.)"""
+    dur = {'car': 1.5, 'van': 1.7, 'truck': 2.3, 'bus': 2.4,
+           'emergency': 1.5}.get(kind, 1.5)
+    n = int(dur * sample_rate)
+    t = np.arange(n, dtype=np.float32) / sample_rate
+    tc = dur * 0.45                      # moment of closest approach
+    # Spectral Doppler: crossfade a bright bed into a dark one through
+    # the pass (approaching tyres/intake read bright, receding exhaust
+    # reads dark).
+    bright = _shaped_noise(n, sample_rate, 2600.0, seed=seed * 7 + 1)
+    dark = _shaped_noise(n, sample_rate, 620.0, seed=seed * 7 + 2)
+    xfade = 1.0 / (1.0 + np.exp((t - tc) * 7.0))
+    body = bright * xfade + dark * (1.0 - xfade)
+    # Asymmetric swell: builds slower than it fades.
+    sig_in, sig_out = dur * 0.26, dur * 0.36
+    env = np.where(t < tc,
+                   np.exp(-((t - tc) / sig_in) ** 2),
+                   np.exp(-((t - tc) / sig_out) ** 2)).astype(np.float32)
+    out = body * env
+    # Tonal component with the pitch ramp (engine note drops ~18%
+    # through the pass).
+    rng = np.random.default_rng(seed)
+    if kind in ('truck', 'bus'):
+        f0 = float(rng.uniform(58.0, 78.0))
+        f = f0 * (1.09 - 0.18 / (1.0 + np.exp(-(t - tc) * 7.0)))
+        ph = np.cumsum(f) / sample_rate
+        rumble = (np.sin(2 * np.pi * ph)
+                  + 0.45 * np.sin(4 * np.pi * ph)).astype(np.float32)
+        out = out * 0.70 + rumble * env * 0.40
+    out /= (np.max(np.abs(out)) + 1e-9)
+    return np.tanh(out * 0.9).astype(np.float32)
+
+
+def generate_birdsong_loop(seed=61, sample_rate=_AUDIO_SAMPLE_RATE):
+    """~22 s of sparse dawn chorus: short downward FM chirps in two
+    'species' registers over near-silence."""
+    dur = 22.0
+    n = int(dur * sample_rate)
+    out = np.zeros(n, dtype=np.float32)
+    rng = np.random.default_rng(seed)
+    for _ in range(30):
+        c_dur = float(rng.uniform(0.05, 0.18))
+        cn = int(c_dur * sample_rate)
+        start = int(rng.uniform(0.0, dur - 0.3) * sample_rate)
+        ct = np.arange(cn, dtype=np.float32) / sample_rate
+        f0 = float(rng.choice([2400.0, 3600.0])) \
+            * float(rng.uniform(0.9, 1.25))
+        sweep = f0 * (1.0 - 0.25 * ct / c_dur)
+        ph = np.cumsum(sweep) / sample_rate
+        env = np.sin(np.pi * ct / c_dur) ** 2
+        out[start:start + cn] += (np.sin(2 * np.pi * ph)
+                                  * env * 0.8).astype(np.float32)
+    return np.tanh(out).astype(np.float32)
+
+
+PASSBY_CLASS_GAIN = {'car': 1.0, 'van': 1.05, 'truck': 1.5,
+                     'bus': 1.45, 'emergency': 1.1}
+
+# Mechanical/artificial sounds (the pass-by whooshes) sit at 4% of
+# their natural level — the agreeable layer (birdsong, wind, rain)
+# keeps full volume, per user preference: the world should murmur.
+# (Started at 0.20; user asked for 5x quieter on top of that. Horns,
+# sirens, engine brakes, the cricket chorus, the city hum and the
+# motorcycle buzz were then removed outright as annoying — keep the
+# soundscape to automobile pass-bys + nature.)
+ARTIFICIAL_SOUND_GAIN = 0.04
+
+
+def update_traffic_audio(mixer, pools, densities, dt, s_car,
+                         player_speed, wetness, passby_clips, rng):
+    """Per-frame traffic soundscape: a pass-by whoosh when a rendered
+    vehicle crosses the camera plane — volume by closing speed (louder
+    on a wet road), stereo pan by which side it's on. Motorcycles are
+    intentionally silent; horns / sirens / engine brakes were removed
+    per user preference."""
+    for st, dens in zip(pools, densities):
+        kind = st['kind']
+        if kind == 'motorcycle':
+            continue
+        for c in st['cars']:
+            rel = c['s'] - s_car
+            prev = c.get('_rel_prev')
+            c['_rel_prev'] = rel
+            if prev is None or c.get('parked'):
+                continue
+            if kind == 'emergency' and not c.get('em_active'):
+                continue
+            if c.get('vis', 0.0) > dens:
+                continue
+            # crossed the camera plane this frame?
+            if (prev > 0.0) == (rel > 0.0) or abs(prev) > 60.0:
+                continue
+            if c['lane'] == +1:
+                closing = c['speed'] + player_speed
+            else:
+                closing = abs(c['speed'] - player_speed)
+            if closing < 3.0:
+                continue
+            vol = min(0.50, (0.08 + closing / 110.0)
+                      * PASSBY_CLASS_GAIN.get(kind, 1.0))
+            vol *= (1.0 + 0.7 * wetness)      # wet tyres sizzle louder
+            vol = min(0.6, vol) * ARTIFICIAL_SOUND_GAIN
+            bank = passby_clips.get(kind, passby_clips['car'])
+            mixer.trigger_clip(bank[int(rng.integers(0, len(bank)))],
+                               volume=vol,
+                               pan=0.55 * c['lane'])
+
+
 class AmbientAudioMixer:
-    """Single sounddevice output stream mixing four layers:
+    """Single STEREO sounddevice output stream mixing:
 
         * brown-noise engine rumble at variable playback speed
-        * rain hiss (looped), volume tracks storm × (1 - frost)
-        * wind gusts (looped), volume tracks camera speed + open-terrain
-          exposure + storm
-        * thunder one-shots, triggered by lightning strikes
+        * rain hiss (looped), volume tracks actual precipitation
+        * wind gusts (looped), volume tracks the unified wind
+        * registered ambience loops (dawn birdsong; the generic
+          mechanism also supports varispeed), crossfaded by biome
+        * panned one-shot events (thunder, vehicle pass-bys) with
+          constant-power stereo placement
 
-    All target volumes and the brown-noise speed are set from the main
-    thread (atomic float writes) and low-passed inside the callback so
-    parameter changes don't produce clicks. Thunder events are queued in
-    a lock-protected list."""
+    All target volumes/speeds are set from the main thread (atomic
+    float writes) and low-passed inside the callback so parameter
+    changes don't produce clicks. Events are queued in a
+    lock-protected list with a concurrency cap."""
 
     def __init__(self, brown_duration_s=_AUDIO_BUFFER_SEC, devices=None):
         # devices: list of sounddevice device specs (str name, int index, or
@@ -1089,9 +1226,16 @@ class AmbientAudioMixer:
         self.rain_phase = 0
         self.wind_phase = 0
 
-        # thunder events: each entry = [clip_sample_index, volume]
-        self.thunder_lock = threading.Lock()
-        self.thunder_events = []
+        # One-shot events (thunder, vehicle pass-bys): each entry =
+        # [clip_array, sample_index, gain_left, gain_right].
+        # Constant-power stereo pan happens at trigger time (Phase 5).
+        self.event_lock = threading.Lock()
+        self.events = []
+
+        # Extra ambience loop layers (currently dawn birdsong):
+        # name -> {'buf', 'phase', 'vol', 'target', 'speed', 'speed_t',
+        # 'varispeed'}.
+        self.loops = {}
 
         self.stream = None
         self._streams = []
@@ -1103,7 +1247,7 @@ class AmbientAudioMixer:
         for i, dev in enumerate(self._devices):
             cb = self._callback if i == 0 else self._mirror_callback
             kwargs = dict(
-                channels=1,
+                channels=2,
                 samplerate=_AUDIO_SAMPLE_RATE,
                 blocksize=_AUDIO_BLOCK_SIZE,
                 callback=cb,
@@ -1132,7 +1276,7 @@ class AmbientAudioMixer:
         if blk is None or len(blk) != frames:
             outdata[:] = 0.0
         else:
-            outdata[:, 0] = blk
+            outdata[:] = blk
 
     def set_speed(self, speed_factor):
         self.speed_target = float(max(0.2, min(1.8, speed_factor)))
@@ -1145,12 +1289,40 @@ class AmbientAudioMixer:
         if brown is not None:
             self.brown_vol_target = float(max(0.0, min(0.30, brown)))
 
+    def trigger_clip(self, clip, volume=0.4, pan=0.0):
+        """Queue a one-shot at a stereo position. pan ∈ [-1, +1]
+        (left..right), constant-power law. Concurrency-capped so event
+        bursts can't snowball the mix."""
+        pan = max(-1.0, min(1.0, float(pan)))
+        gl = float(volume) * math.sqrt(0.5 * (1.0 - pan))
+        gr = float(volume) * math.sqrt(0.5 * (1.0 + pan))
+        with self.event_lock:
+            if len(self.events) < 10:
+                self.events.append([clip, 0, gl, gr])
+
     def trigger_thunder(self, volume=0.55):
-        with self.thunder_lock:
-            # cap at 3 concurrent thunder events so repeated lightning
-            # doesn't snowball volume
-            if len(self.thunder_events) < 3:
-                self.thunder_events.append([0, float(volume)])
+        # cap thunder lower than the generic event cap so repeated
+        # lightning doesn't dominate (same behaviour as before)
+        with self.event_lock:
+            n_thunder = sum(1 for ev in self.events
+                            if ev[0] is self.thunder)
+        if n_thunder < 3:
+            self.trigger_clip(self.thunder, volume=volume, pan=0.0)
+
+    def add_loop(self, name, buf, varispeed=False):
+        """Register an extra ambience loop layer (volume starts at 0)."""
+        self.loops[name] = {
+            'buf': buf, 'phase': 0.0, 'vol': 0.0, 'target': 0.0,
+            'speed': 1.0, 'speed_t': 1.0, 'varispeed': bool(varispeed),
+        }
+
+    def set_loop(self, name, volume, speed=None):
+        lp = self.loops.get(name)
+        if lp is None:
+            return
+        lp['target'] = float(max(0.0, min(0.45, volume)))
+        if speed is not None:
+            lp['speed_t'] = float(max(0.5, min(1.6, speed)))
 
     @staticmethod
     def _read_loop(buf, phase, frames):
@@ -1191,29 +1363,55 @@ class AmbientAudioMixer:
         wind_s = self._read_loop(self.wind, self.wind_phase, frames)
         self.wind_phase = (self.wind_phase + frames) % len(self.wind)
 
-        thunder_s = np.zeros(frames, dtype=np.float32)
-        with self.thunder_lock:
+        # Centre bed: noise layers + extra ambience loops.
+        bed = (brown_s * self.brown_vol
+               + rain_s * self.rain_vol
+               + wind_s * self.wind_vol)
+        for lp in self.loops.values():
+            lp['vol'] += (lp['target'] - lp['vol']) * a_slow
+            if lp['vol'] < 1e-4 and lp['target'] < 1e-4:
+                continue
+            buf = lp['buf']
+            ln = len(buf)
+            if lp['varispeed']:
+                lp['speed'] += (lp['speed_t'] - lp['speed']) * a_fast
+                sp2 = lp['speed']
+                idxs2 = (lp['phase']
+                         + np.arange(frames, dtype=np.float64) * sp2) % ln
+                j0 = idxs2.astype(np.int64)
+                j1 = (j0 + 1) % ln
+                fr2 = (idxs2 - j0).astype(np.float32)
+                seg = buf[j0] * (1.0 - fr2) + buf[j1] * fr2
+                lp['phase'] = float((lp['phase'] + frames * sp2) % ln)
+            else:
+                ph = int(lp['phase'])
+                seg = self._read_loop(buf, ph, frames)
+                lp['phase'] = float((ph + frames) % ln)
+            bed = bed + seg * lp['vol']
+
+        # Panned one-shots (thunder, vehicle pass-bys).
+        ev_l = np.zeros(frames, dtype=np.float32)
+        ev_r = np.zeros(frames, dtype=np.float32)
+        with self.event_lock:
             still_running = []
-            for ev in self.thunder_events:
-                start_idx, vol = ev
-                clip_len = len(self.thunder)
+            for ev in self.events:
+                clip, start_idx, gl, gr = ev
+                clip_len = len(clip)
                 if start_idx < clip_len:
                     end_idx = min(start_idx + frames, clip_len)
-                    chunk = self.thunder[start_idx:end_idx]
-                    thunder_s[:len(chunk)] += chunk * vol
-                    ev[0] = start_idx + frames
-                    if ev[0] < clip_len:
+                    chunk = clip[start_idx:end_idx]
+                    ev_l[:len(chunk)] += chunk * gl
+                    ev_r[:len(chunk)] += chunk * gr
+                    ev[1] = start_idx + frames
+                    if ev[1] < clip_len:
                         still_running.append(ev)
-            self.thunder_events = still_running
+            self.events = still_running
 
-        mixed = (brown_s * self.brown_vol
-                 + rain_s * self.rain_vol
-                 + wind_s * self.wind_vol
-                 + thunder_s)
-        outdata[:, 0] = mixed
+        outdata[:, 0] = bed + ev_l
+        outdata[:, 1] = bed + ev_r
         if len(self._streams) > 1:
             with self._mirror_lock:
-                self._mirror_block = mixed.copy()
+                self._mirror_block = outdata.copy()
 
 
 # Back-compat alias so older code paths referencing BrownNoisePlayer
@@ -10368,6 +10566,10 @@ def main(argv=None):
     if _AUDIO_AVAILABLE and not args.headless:
         try:
             audio_player = AmbientAudioMixer(devices=sd_devs)
+            # Phase-5 ambience: dawn birdsong, crossfaded by the live
+            # forest/plain weight. (Siren, cricket chorus and city hum
+            # were removed at user request — nature sounds only.)
+            audio_player.add_loop('birds', generate_birdsong_loop())
             audio_player.start()
         except Exception as exc:
             _print_help_banner(
@@ -10383,6 +10585,17 @@ def main(argv=None):
                 ],
             )
             audio_player = None
+
+    # Phase-5 one-shot clip banks (only worth synthesising when the
+    # mixer is live): pass-by whooshes per vehicle class (motorcycles
+    # excluded — silent by user preference) plus the audio event RNG.
+    passby_clips = audio_rng = None
+    if audio_player is not None:
+        passby_clips = {k: [generate_passby_clip(k, seed=s0)
+                            for s0 in range(3)]
+                        for k in ('car', 'van', 'truck', 'bus',
+                                  'emergency')}
+        audio_rng = np.random.default_rng(8181)
 
     # Procedural minimalist ensemble over the ambient bed. Needs
     # fluidsynth (system library) + pyfluidsynth + the CC0 SoundFont.
@@ -10752,16 +10965,49 @@ def main(argv=None):
         # constant so rain and wind fade in and out gradually rather
         # than snapping. Levels are ~50% of the previous scale so the
         # weather sits under the music, not on top of it.
+        # Per-kind traffic densities from the SP hourly curves — needed
+        # both by the audio block right below and by the traffic
+        # update/draw further down the frame.
+        traffic_d = traffic_density_at(t_day)
+        truck_d = 0.3 + 0.7 * traffic_d   # less peaky than cars
+        moto_d = moto_density_at(t_day)
+        van_d = van_density_at(t_day)
+        bus_d = bus_density_at(t_day)
+
         if audio_player is not None:
             # Rain hiss tracks actual precipitation (not the overcast
-            # build-up); the wind layer tracks the unified wind speed.
+            # build-up); the wind layer tracks the unified wind speed,
+            # amplified to a whistle through mountain zones (5.3).
             rain_vol = rain_i * 0.17
             speed_ratio = speed / SPEED
+            mtn_w = 0.5 * float(wL_c[BIOME_MOUNTAIN]
+                                + wR_c[BIOME_MOUNTAIN])
             wind_vol = (0.012
                         + speed_ratio * 0.025
                         + float(open_exp_trees) * 0.035
-                        + ENV['wind_speed'] * 0.0042)
+                        + ENV['wind_speed'] * 0.0042) \
+                * (1.0 + 0.9 * mtn_w)
             audio_player.set_volumes(rain=rain_vol, wind=wind_vol)
+
+            # Traffic soundscape (5.1): automobile pass-bys only.
+            update_traffic_audio(
+                audio_player,
+                (car_state, truck_state, moto_state, van_state,
+                 bus_state, emerg_state),
+                (traffic_d, truck_d, moto_d, van_d, bus_d, 1.0),
+                dt, s_car, speed, wetness, passby_clips, audio_rng)
+
+            # Biome ambience (5.3): dawn birdsong over forest/plain.
+            hour_now = (t_day % 1.0) * 24.0
+            song_w = max(0.0, 1.0 - abs(hour_now - 8.0) / 4.5)
+            birds_w = (0.5 * float(wL_c[BIOME_FOREST]
+                                   + wR_c[BIOME_FOREST])
+                       + 0.25 * float(wL_c[BIOME_PLAIN]
+                                      + wR_c[BIOME_PLAIN]))
+            audio_player.set_loop(
+                'birds',
+                0.085 * birds_w * song_w * (1.0 - storm_i)
+                * (1.0 - night_a))
 
         draw_sky(sky_state, cx, cy, cz, t_time, t_day, storm_i, flash,
                  cloud_phase=cloud_phase)
@@ -10915,12 +11161,9 @@ def main(argv=None):
         # between 2-5 AM, morning peak ~08:00-09:00, evening peak
         # ~18:00-19:00. Trucks get a softer modulation since freight
         # moves more off-peak to avoid the rodízio/congestion windows
-        # (empirical observation from CET-SP cargo studies).
-        traffic_d = traffic_density_at(t_day)
-        truck_d = 0.3 + 0.7 * traffic_d   # less peaky than cars
-        moto_d = moto_density_at(t_day)
-        van_d = van_density_at(t_day)
-        bus_d = bus_density_at(t_day)
+        # (empirical observation from CET-SP cargo studies). The per-kind
+        # densities themselves are computed earlier in the frame (the
+        # audio block needs them too).
         # Drivers slow for active rain AND for a still-wet road (3.2) —
         # the flow stays cautious after the cell has passed.
         driving_wet = max(rain_i, 0.80 * wetness)

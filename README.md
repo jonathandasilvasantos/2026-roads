@@ -371,6 +371,27 @@ research as the design criterion. Per-cycle snapshots live under
 - Perf: zone-biome rolls are now memoised (`_BIOME_CACHE`) — the
   terrain/flora/scenery stack issues >1M biome lookups per frame.
 
+### Traffic audio & event soundscape (light branch — plan.txt Phase 5)
+- **Stereo mixer upgrade**: the ambient mixer now outputs two channels
+  with constant-power panned one-shots and registrable ambience loops
+  (with a varispeed mechanism; thunder rides the same event path as
+  before).
+- **Vehicle pass-bys**: every rendered automobile that crosses the
+  camera plane fires a class-specific whoosh — Doppler baked into the
+  clip (bright→dark spectral glide + ~18% pitch drop on the tonal
+  layer), trucks/buses with a soft sub-harmonic rumble. Volume scales
+  with true closing speed, pans to the vehicle's side, and sizzles
+  ~70% louder on a wet road (the phase-3 wetness memory).
+- **Biome ambience**: dawn birdsong over forest/plain zones, silent in
+  storms, crossfaded by the live biome weights at the camera; the wind
+  layer amplifies into a whistle through mountain zones.
+- **Deliberately serene mix** (user preference): mechanical sounds sit
+  at 4% of natural level (`ARTIFICIAL_SOUND_GAIN`), and the noisier
+  phase-5 prototypes — horns, sirens, engine brakes, the cricket/frog
+  night chorus, the city hum and the motorcycle buzz — were removed
+  outright. The soundscape is automobile whooshes + nature (birds,
+  wind, rain, thunder) + the original engine rumble and ensemble.
+
 ### São Paulo traffic model
 - `TRAFFIC_DENSITY_SP` — 24-hour density table [0..1] calibrated from
   CET-SP bulletins, Metrô 2017 O-D survey, Waze for Cities aggregates.
