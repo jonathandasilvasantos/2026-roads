@@ -443,6 +443,34 @@ research as the design criterion. Per-cycle snapshots live under
   says a design-speed vehicle would leave the road; skid-mark decals
   drift toward the outside through the hardest apexes.
 
+### Tunnels (light branch — plan v2 phase 2)
+- **Placement that earns itself**: one candidate per ~2.6 km hash
+  cell, and the cell is *scanned* for a genuine mountain run (high
+  mountain weight across the whole 150-290 m span) — tunnels only
+  exist where the terrain justifies boring through. Deterministic,
+  cached, ~1 per 15-20 km.
+- **Structure**: half-cylinder bore shell with per-vertex sodium light
+  pooling baked into a world-space VBO (drawn behind one
+  camera-relative translate, like the far-forest chunks), portal arch
+  faces, and an exterior rock ridge that carries the mountain over the
+  road. Ceiling lamps every 12 m with feathered warm pools on the
+  pavement; a daylight glow disc marks the exit portal from inside.
+- **Exposure feel**: ambient blends to a dim sodium-warm interior over
+  15 m portal skirts — at night the bore is BRIGHTER than outside, the
+  classic reversal. Fog shortens to enclosed-air range; sky, sun, moon,
+  shooting stars and aircraft are culled when fully inside.
+- **Weather shielding**: rain, snow, lens drops and the wetness GAIN
+  gate off through the portals (wet pavement near the mouths persists
+  via the phase-3 wetness memory and dries on its own clock).
+- **Behaviour**: every vehicle forces its headlights on inside; lane
+  changes are vetoed in the bore (drivers hold their lane); signs,
+  chevrons, km markers, guardrails, trees, turbines and incident zones
+  (roadworks/tolls/traps) are all suppressed inside via one shared
+  `in_tunnel(s)` predicate.
+- **Audio**: the outside world (birds/wind/rain) ducks to ~20% through
+  the portals and the car's own rumble lifts a touch — no new
+  mechanical sounds, per the serene-mix preference.
+
 ### Metropolitan traffic model
 - `TRAFFIC_DENSITY_SP` — 24-hour density table [0..1] calibrated
   against public big-city traffic bulletins, origin-destination

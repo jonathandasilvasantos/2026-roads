@@ -4600,6 +4600,8 @@ def _tree_slot(slot, side, nvar):
     frw = float(w[BIOME_FROST])
     rec = None
     tree_density = fw + frw
+    if in_tunnel(s):
+        tree_density = 0.0      # nothing grows in the bore
     if tree_density >= 0.28:
         key = (int(s * 97) * 2654435761
                + (0 if side < 0 else 7919)
@@ -6841,6 +6843,9 @@ def roadworks_near(s):
             + 800.0 + ((key >> 8) & 0xFF) / 255.0 \
             * (ROADWORKS_SPACING - 1600.0)
         if abs(s - (s0 + ROADWORKS_LEN * 0.5)) < 600.0 + ROADWORKS_LEN:
+            # never set up roadworks inside a tunnel bore
+            if in_tunnel(s0) or in_tunnel(s0 + ROADWORKS_LEN):
+                continue
             return {
                 's0': s0, 's1': s0 + ROADWORKS_LEN,
                 'lane': -1 if ((key >> 16) & 1) else +1,
@@ -6862,7 +6867,7 @@ def toll_near(s):
         w = biome_weights_vec(np.array([ts], dtype=np.float32), -1)[0]
         flat = float(w[BIOME_PLAIN] + w[BIOME_FARM] + w[BIOME_CERRADO]
                      + w[BIOME_HILL] + w[BIOME_FOREST])
-        if flat < 0.7:
+        if flat < 0.7 or in_tunnel(ts):
             continue
         if abs(s - ts) < 700.0:
             return {'s': ts}
@@ -6879,9 +6884,90 @@ def trap_near(s):
             continue
         ts = k * TRAP_SPACING + 600.0 + ((key >> 8) & 0xFF) / 255.0 \
             * (TRAP_SPACING - 1200.0)
-        if abs(s - ts) < 450.0:
+        if abs(s - ts) < 450.0 and not in_tunnel(ts):
             return {'s': ts}
     return None
+
+
+# --- Tunnels (plan v2, phase 2) -------------------------------------------
+# Mountain zones finally bore THROUGH the rock. One candidate per hash
+# cell; the cell is scanned for a genuine mountain run (high mountain
+# weight on at least one side across the whole span) and the bore is
+# placed on it — so tunnels only exist where the terrain justifies
+# them. Deterministic and cached, like every other world query.
+TUNNEL_SPACING = 2600.0
+TUNNEL_MIN_LEN = 150.0
+TUNNEL_MAX_LEN = 290.0
+TUNNEL_R = 6.8              # bore arch radius (road is 10 m wide)
+TUNNEL_SKIRT = 15.0         # ambient/effects transition at the portals
+TUNNEL_LAMP_STEP = 12.0
+_TUNNEL_CACHE = {}
+
+
+def _mountain_run_w(s):
+    wl = biome_weights_vec(np.array([s], dtype=np.float32), -1)[0]
+    wr = biome_weights_vec(np.array([s], dtype=np.float32), +1)[0]
+    return max(float(wl[BIOME_MOUNTAIN]), float(wr[BIOME_MOUNTAIN]))
+
+
+def _tunnel_for_cell(k):
+    if k in _TUNNEL_CACHE:
+        return _TUNNEL_CACHE[k]
+    t = None
+    key = _zone_hash(k, 8101)
+    if (key & 0xFF) / 255.0 <= 0.55:
+        base = k * TUNNEL_SPACING
+        # scan the cell for the first solid mountain stretch
+        step = 40.0
+        run_start = None
+        sv = base + 400.0
+        while sv < base + TUNNEL_SPACING - 400.0:
+            if _mountain_run_w(sv) >= 0.55:
+                if run_start is None:
+                    run_start = sv
+                if sv - run_start >= TUNNEL_MIN_LEN:
+                    # extend to the end of the run (capped)
+                    end = sv
+                    while (end - run_start < TUNNEL_MAX_LEN
+                           and end < base + TUNNEL_SPACING - 400.0
+                           and _mountain_run_w(end + step) >= 0.55):
+                        end += step
+                    t = {'s0': run_start, 's1': end}
+                    break
+            else:
+                run_start = None
+            sv += step
+    _TUNNEL_CACHE[k] = t
+    return t
+
+
+def tunnel_near(s):
+    """The tunnel whose bore or influence could touch s, or None."""
+    for k in {int((s - 900.0) // TUNNEL_SPACING),
+              int((s + 900.0) // TUNNEL_SPACING)}:
+        t = _tunnel_for_cell(k)
+        if t is not None and t['s0'] - 900.0 < s < t['s1'] + 900.0:
+            return t
+    return None
+
+
+def in_tunnel(s):
+    """True strictly inside a bore (gates spawns/furniture/effects)."""
+    t = tunnel_near(s)
+    return t is not None and t['s0'] <= s <= t['s1']
+
+
+def tunnel_depth_at(s):
+    """0 outside .. 1 fully inside, ramping over TUNNEL_SKIRT at the
+    portals — drives the ambient/fog/audio transitions."""
+    t = tunnel_near(s)
+    if t is None:
+        return 0.0
+    if s < t['s0'] - TUNNEL_SKIRT or s > t['s1'] + TUNNEL_SKIRT:
+        return 0.0
+    d_in = min(s - (t['s0'] - TUNNEL_SKIRT),
+               (t['s1'] + TUNNEL_SKIRT) - s)
+    return max(0.0, min(1.0, d_in / (2.0 * TUNNEL_SKIRT)))
 
 # Driver personalities, rolled once per spawned vehicle. T is desired
 # time headway (s); a_max comfortable acceleration and b comfortable
@@ -8187,10 +8273,13 @@ def update_traffic(states, dt, s_car, player_speed,
                                 break
 
             # --- MOBIL-lite lane decisions ---
+            # (no lane changes inside a tunnel bore — walls are close
+            # and real drivers hold their lane through)
             c['lc_cool'] = max(0.0, c['lc_cool'] - dt)
             mid_change = abs(c['lf'] - c['sub']) > 0.02
             if (not mid_change and c['lc_cool'] <= 0.0
-                    and not c.get('split')):
+                    and not c.get('split')
+                    and not in_tunnel(c['s'])):
                 other = 1 - c['sub']
                 ld2, gap2 = ahead_of(i, other)
                 dv2 = c['speed'] - ld2['speed'] if ld2 is not None else 0.0
@@ -8427,8 +8516,9 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
     em_any = (kind == 'emergency'
               and any(c.get('em_active') for c in state['cars']))
     bd_any = any(c.get('bd_phase') for c in state['cars'])
+    tun_any = tunnel_near(s_car) is not None
     if (night_a <= 0.03 and storm_i < 0.20 and not braking_any
-            and not em_any and not bd_any):
+            and not em_any and not bd_any and not tun_any):
         return
     glDisable(GL_LIGHTING)
     glEnable(GL_TEXTURE_2D)
@@ -8466,6 +8556,8 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
                         (storm_i - c.get('hl_storm_thr', 0.38)) / 0.10)))
         if kind == 'emergency' and c.get('em_active'):
             lights_on = 1.0     # code-3 run: lights always on
+        if in_tunnel(s):
+            lights_on = 1.0     # everyone lights up inside a bore
         brake_w = max(0.0, min(1.0,
                       (-c.get('accel', 0.0) - BRAKE_LIGHT_DECEL) / 1.5))
         head_i = lights_on * (0.40 + 0.60 * night_a)
@@ -10491,6 +10583,12 @@ def draw_guardrails(s_car, amb_rgb):
     wR = biome_weights_vec(s_arr, +1)
     curv = np.array([road_curv(float(sv)) for sv in s_arr],
                     dtype=np.float32)
+    # no guardrails inside a bore — the tunnel walls do that job
+    tun = tunnel_near(s_car)
+    tun_mask = np.ones(NS, dtype=np.float32)
+    if tun is not None:
+        inside = (s_arr >= tun['s0'] - 4.0) & (s_arr <= tun['s1'] + 4.0)
+        tun_mask[inside] = 0.0
     glDisable(GL_TEXTURE_2D)
     rail = (min(1.0, amb_rgb[0] * 0.80), min(1.0, amb_rgb[1] * 0.82),
             min(1.0, amb_rgb[2] * 0.86))
@@ -10501,7 +10599,7 @@ def draw_guardrails(s_car, amb_rgb):
             np.where(curv * side < 0.0, np.abs(curv), 0.0)
             * V_DESIGN * V_DESIGN / 2.2 - 0.55, 0.0, 1.0)
         drop = np.maximum(w[:, BIOME_MOUNTAIN] + w[:, BIOME_RIVER],
-                          corner_need)
+                          corner_need) * tun_mask
 
         def emit(i, alpha, side=side):
             s = float(s_arr[i])
@@ -10553,6 +10651,8 @@ def draw_road_signs(s_car, P, amb_rgb, night_a):
     for i in range(8):
         s = s0 + i * 50.0
         d = s - s_car
+        if in_tunnel(s):
+            continue
         panel = None
         # Curve warning: sharp bend 70-150 m past the sign, calm here.
         k_ahead = max(_curvature_at(s + 80.0), _curvature_at(s + 120.0))
@@ -10589,7 +10689,7 @@ def draw_road_signs(s_car, P, amb_rgb, night_a):
     for i in range(11):
         s = s0c + i * 40.0
         kap_s = road_curv(s)
-        if abs(kap_s) < 0.0045:
+        if abs(kap_s) < 0.0045 or in_tunnel(s):
             continue
         side_out = -1 if kap_s > 0.0 else +1
         x_off = side_out * (ROAD_WIDTH / 2 + 1.1)
@@ -10609,7 +10709,7 @@ def draw_road_signs(s_car, P, amb_rgb, night_a):
         glPopMatrix()
     # km markers every 500 m.
     s_km = math.ceil(s_car / 500.0) * 500.0
-    if s_km - s_car < 400.0:
+    if s_km - s_car < 400.0 and not in_tunnel(s_km):
         x = curve_x(s_km) + (ROAD_WIDTH / 2 + 1.0)
         glPushMatrix()
         glTranslatef(x, road_y_at(s_km, ROAD_WIDTH / 2 + 1.0),
@@ -10857,7 +10957,7 @@ def draw_biome_scenery(s_car, P, amb_rgb, sun_d, night_a, t_time,
                     glCallList(P['tank'])
                     glPopMatrix()
         elif (float(w[BIOME_HILL] + w[BIOME_MOUNTAIN]) > 0.6
-                and r0 < 0.030):
+                and r0 < 0.030 and not in_tunnel(s)):
             # wind turbine on the ridge
             d_off = 52.0 + ((key >> 8) & 0xFF) / 255.0 * 22.0
             glPushMatrix()
@@ -11159,6 +11259,193 @@ def draw_speed_trap(s_car, emerg_variants, amb_rgb, sun_d):
     glCallList(v['list'])
     glPopMatrix()
     _prop_light_end()
+
+
+# --- Tunnel rendering (plan v2 phase 2) ------------------------------------
+# Static geometry (bore shell, portal arches, exterior ridge) bakes
+# into world-space VBOs per tunnel — drawn behind one camera-relative
+# translate, like the far-forest chunks. The bore carries per-vertex
+# colour for the sodium-lamp light pooling (interior lighting is
+# independent of the sky); the exterior ridge modulates with daylight.
+_TUNNEL_VBOS = {}
+
+
+def _tunnel_arch_pts(s, frac_up):
+    """Arch ring point at parametric height frac_up∈[0,1] (0=right
+    ground, 0.5=crown, 1=left ground)."""
+    th = math.pi * frac_up
+    return (curve_x(s) + TUNNEL_R * math.cos(th),
+            curve_y(s) + TUNNEL_R * math.sin(th))
+
+
+def _build_tunnel_vbos(t):
+    key = t['s0']
+    hit = _TUNNEL_VBOS.get(key)
+    if hit is not None:
+        return hit
+    s0, s1 = t['s0'], t['s1']
+    seg = 6.0
+    n_ring = 11
+    bore = []       # x,y,z,u,v,r,g,b
+    shell = []      # x,y,z,u,v
+    svals = list(np.arange(s0, s1 + 0.001, seg))
+    if svals[-1] < s1:
+        svals.append(s1)
+
+    def lampg(sv):
+        # brightness pulse: 1.0 under each ceiling lamp, dim between
+        ph = ((sv - s0 - TUNNEL_LAMP_STEP * 0.5)
+              % TUNNEL_LAMP_STEP) / TUNNEL_LAMP_STEP
+        return 0.5 + 0.5 * math.cos(2.0 * math.pi * (ph - 0.5))
+
+    for i in range(len(svals) - 1):
+        sa, sb = svals[i], svals[i + 1]
+        ga, gb_ = lampg(sa), lampg(sb)
+        for j in range(n_ring - 1):
+            fa, fb = j / (n_ring - 1.0), (j + 1) / (n_ring - 1.0)
+            quad = []
+            for (sv, g, fr) in ((sa, ga, fa), (sa, ga, fb),
+                                (sb, gb_, fb), (sb, gb_, fa)):
+                x, y = _tunnel_arch_pts(sv, fr)
+                ceil_w = 0.55 + 0.45 * math.sin(math.pi * fr)
+                br = (0.16 + 0.40 * g) * ceil_w
+                quad.append((x, y, -sv, fr * 3.0, sv * 0.15,
+                             br * 1.00, br * 0.82, br * 0.58))
+            for idx in (0, 1, 2, 0, 2, 3):
+                bore.append(quad[idx])
+        # exterior ridge slabs (left base -> apex -> right base)
+        for (xa0, ya0, xa1, ya1) in (
+                (-(TUNNEL_R + 12.0), -1.5, 0.0, 12.5),
+                (0.0, 12.5, (TUNNEL_R + 12.0), -1.5)):
+            quad = []
+            for (sv, xo, yo) in ((sa, xa0, ya0), (sb, xa0, ya0),
+                                 (sb, xa1, ya1), (sa, xa1, ya1)):
+                quad.append((curve_x(sv) + xo, curve_y(sv) + yo, -sv,
+                             xo * 0.06, sv * 0.06))
+            for idx in (0, 1, 2, 0, 2, 3):
+                shell.append(quad[idx])
+    # portal faces: annulus from the arch out to the ridge silhouette
+    for s_face in (s0, s1):
+        for j in range(n_ring - 1):
+            fa, fb = j / (n_ring - 1.0), (j + 1) / (n_ring - 1.0)
+            quad = []
+            for fr, rad in ((fa, TUNNEL_R), (fb, TUNNEL_R),
+                            (fb, TUNNEL_R + 6.8), (fa, TUNNEL_R + 6.8)):
+                th = math.pi * fr
+                x = curve_x(s_face) + rad * math.cos(th)
+                y = curve_y(s_face) + rad * math.sin(th)
+                quad.append((x, y, -s_face, fr * 2.0, rad * 0.10))
+            for idx in (0, 1, 2, 0, 2, 3):
+                shell.append(quad[idx])
+    vb = {
+        'bore': _make_vbo(np.array(bore, dtype=np.float32)),
+        'shell': _make_vbo(np.array(shell, dtype=np.float32)),
+    }
+    if len(_TUNNEL_VBOS) > 6:
+        for old in list(_TUNNEL_VBOS.values()):
+            for part in old.values():
+                glDeleteBuffers(1, [part[0]])
+        _TUNNEL_VBOS.clear()
+    _TUNNEL_VBOS[key] = vb
+    return vb
+
+
+def draw_tunnel(s_car, concrete_tex, terrain_tex, amb_rgb, night_a,
+                horizon_rgb, cam_depth):
+    t = tunnel_near(s_car)
+    if t is None:
+        return
+    if t['s1'] < s_car - 30.0 or t['s0'] > s_car + 850.0:
+        return
+    vb = _build_tunnel_vbos(t)
+
+    glEnableClientState(GL_VERTEX_ARRAY)
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY)
+    glEnable(GL_TEXTURE_2D)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glPushMatrix()
+    glTranslatef(0.0, 0.0, s_car)
+
+    # exterior ridge + portal faces: rocky concrete, daylight-tinted
+    glBindTexture(GL_TEXTURE_2D, terrain_tex)
+    glColor3f(min(1.0, amb_rgb[0] * 0.62),
+              min(1.0, amb_rgb[1] * 0.56),
+              min(1.0, amb_rgb[2] * 0.50))
+    _vbo_draw(vb['shell'])
+
+    # bore interior: per-vertex sodium pooling, sky-independent
+    glBindTexture(GL_TEXTURE_2D, concrete_tex)
+    glColor3f(1.0, 1.0, 1.0)
+    vbo, count = vb['bore']
+    glBindBuffer(GL_ARRAY_BUFFER, vbo)
+    glEnableClientState(GL_COLOR_ARRAY)
+    glVertexPointer(3, GL_FLOAT, 32, ctypes.c_void_p(0))
+    glTexCoordPointer(2, GL_FLOAT, 32, ctypes.c_void_p(12))
+    glColorPointer(3, GL_FLOAT, 32, ctypes.c_void_p(20))
+    glDrawArrays(GL_TRIANGLES, 0, count)
+    glDisableClientState(GL_COLOR_ARRAY)
+    glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+    glPopMatrix()
+    glDisableClientState(GL_VERTEX_ARRAY)
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY)
+    glDisable(GL_TEXTURE_2D)
+
+    # --- additive pass: ceiling lamps, road light pools, exit glow ---
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+    glDepthMask(GL_FALSE)
+    n_lamp = int((t['s1'] - t['s0']) / TUNNEL_LAMP_STEP)
+    for i in range(n_lamp + 1):
+        sl = t['s0'] + TUNNEL_LAMP_STEP * 0.5 + i * TUNNEL_LAMP_STEP
+        if sl > t['s1'] or sl < s_car - 10.0 or sl > s_car + 600.0:
+            continue
+        x = curve_x(sl)
+        zc = -(sl - s_car)
+        # sodium lamp head at the crown
+        y = curve_y(sl) + TUNNEL_R - 0.45
+        glBegin(GL_QUADS)
+        glColor4f(1.0, 0.78, 0.42, 0.9)
+        glVertex3f(x - 0.45, y, zc + 0.18)
+        glVertex3f(x + 0.45, y, zc + 0.18)
+        glVertex3f(x + 0.45, y + 0.22, zc - 0.18)
+        glVertex3f(x - 0.45, y + 0.22, zc - 0.18)
+        glEnd()
+        # warm pool on the pavement below — gradient fan so the light
+        # feathers out instead of printing a hard rectangle
+        yr = curve_y(sl) + 0.05
+        glBegin(GL_TRIANGLE_FAN)
+        glColor4f(1.0, 0.72, 0.38, 0.20)
+        glVertex3f(x, yr, zc)
+        glColor4f(1.0, 0.72, 0.38, 0.0)
+        for k in range(13):
+            th = 2 * math.pi * k / 12
+            glVertex3f(x + math.cos(th) * 3.4, yr,
+                       zc + math.sin(th) * 5.6)
+        glEnd()
+    # exit-portal daylight glow seen from inside the bore
+    if cam_depth > 0.15:
+        s_exit = t['s1']
+        if s_exit > s_car + 2.0:
+            gx = curve_x(s_exit)
+            gy = curve_y(s_exit) + TUNNEL_R * 0.45
+            gz = -(s_exit - s_car)
+            bright_out = (amb_rgb[0] + amb_rgb[1] + amb_rgb[2]) / 3.0
+            a = min(0.85, 1.35 * bright_out) * cam_depth
+            glBegin(GL_TRIANGLE_FAN)
+            glColor4f(min(1.0, horizon_rgb[0] * 1.2),
+                      min(1.0, horizon_rgb[1] * 1.2),
+                      min(1.0, horizon_rgb[2] * 1.2), a)
+            glVertex3f(gx, gy, gz)
+            glColor4f(horizon_rgb[0], horizon_rgb[1], horizon_rgb[2],
+                      0.0)
+            for i in range(17):
+                th = 2 * math.pi * i / 16
+                glVertex3f(gx + math.cos(th) * TUNNEL_R * 0.92,
+                           gy + math.sin(th) * TUNNEL_R * 0.80, gz)
+            glEnd()
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
 
 
 # ---------------------------------------------------------------------
@@ -11919,6 +12206,17 @@ def main(argv=None):
         sun_d = sun_dir_at(t_day)
         moon_d = -sun_d  # opposite
 
+        # Tunnel exposure (plan v2 phase 2): inside a bore the ambient
+        # blends to a dim sodium-warm interior over the portal skirts.
+        # At night this makes the tunnel BRIGHTER than outside — the
+        # classic reversal.
+        tun_depth = tunnel_depth_at(s_car)
+        if tun_depth > 0.0:
+            ti = (0.36, 0.29, 0.20)
+            amb = (amb[0] * (1.0 - tun_depth) + ti[0] * tun_depth,
+                   amb[1] * (1.0 - tun_depth) + ti[1] * tun_depth,
+                   amb[2] * (1.0 - tun_depth) + ti[2] * tun_depth)
+
         # --- Wet-road memory (Phase 3.2) ---
         # Rain soaks the pavement within seconds; drying takes 2-4
         # simulated hours (10-22 s wall-clock), faster under the midday
@@ -11926,7 +12224,12 @@ def main(argv=None):
         # instead of the instantaneous storm value, so the road stays
         # wet — and traffic stays careful — after the sun comes out.
         frost_i = frost_intensity_at(s_car)
-        rain_i = rain_intensity_from(storm_i) * (1.0 - frost_i)
+        # No precipitation under the rock: rain (and the wetness gain
+        # it drives, the hiss, the lens drops) gates off through the
+        # portal skirts; the wet patches near the mouths persist via
+        # the wetness memory and dry out on their own clock.
+        rain_i = rain_intensity_from(storm_i) * (1.0 - frost_i) \
+            * (1.0 - tun_depth)
         if args.wetness is not None:
             wetness = float(args.wetness)
         elif rain_i > 0.04:
@@ -11964,7 +12267,16 @@ def main(argv=None):
         # shrink the fog-end distance so the linear ramp ends sooner.
         vis_end = 920.0 / (1.0 + 0.10 * frost_i + 0.30 * storm_i
                            + 1.5 * dawn_fog)
-        glFogf(GL_FOG_START, 180.0 * (1.0 - 0.65 * dawn_fog))
+        # Inside a tunnel: short neutral-dark fog so the bore reads as
+        # enclosed air, not an open horizon.
+        if tun_depth > 0.0:
+            vis_end = vis_end * (1.0 - tun_depth) + 320.0 * tun_depth
+            fog_c = (fog_c[0] * (1.0 - 0.7 * tun_depth),
+                     fog_c[1] * (1.0 - 0.7 * tun_depth),
+                     fog_c[2] * (1.0 - 0.75 * tun_depth), 1.0)
+            glFogfv(GL_FOG_COLOR, fog_c)
+        glFogf(GL_FOG_START, 180.0 * (1.0 - 0.65 * dawn_fog)
+               * (1.0 - 0.6 * tun_depth))
         glFogf(GL_FOG_END, vis_end)
         glClearColor(horizon[0], horizon[1], horizon[2], 1.0)
 
@@ -12109,7 +12421,13 @@ def main(argv=None):
                         + float(open_exp_trees) * 0.035
                         + ENV['wind_speed'] * 0.0042) \
                 * (1.0 + 0.9 * mtn_w)
-            audio_player.set_volumes(rain=rain_vol, wind=wind_vol)
+            # Inside a tunnel the outside world ducks away and the
+            # car's own rumble reverberates a touch louder. No new
+            # mechanical sounds — just the existing layers reshaped.
+            duck = 1.0 - 0.8 * tun_depth
+            audio_player.set_volumes(
+                rain=rain_vol * duck, wind=wind_vol * duck,
+                brown=0.085 * (1.0 + 0.10 * tun_depth))
 
             # Traffic soundscape (5.1): automobile pass-bys only.
             update_traffic_audio(
@@ -12129,28 +12447,33 @@ def main(argv=None):
             audio_player.set_loop(
                 'birds',
                 0.085 * birds_w * song_w * (1.0 - storm_i)
-                * (1.0 - night_a))
+                * (1.0 - night_a) * duck)
 
-        draw_sky(sky_state, cx, cy, cz, t_time, t_day, storm_i, flash,
-                 cloud_phase=cloud_phase)
+        # Sky, sun and moon are culled once the camera is fully inside
+        # a bore — saves fill and sells the enclosure (phase 2).
+        if tun_depth < 0.95:
+            draw_sky(sky_state, cx, cy, cz, t_time, t_day, storm_i,
+                     flash, cloud_phase=cloud_phase)
 
-        # sun + moon sit on top of the sky pass but behind terrain
-        sc = sun_color(t_day)
-        draw_celestial(cx, cy, cz, sun_d, radius=14.0,
-                       core_color=sc,
-                       glow_color=(sc[0], sc[1] * 0.8, sc[2] * 0.6))
-        # moon — slightly smaller, cool silver. Fades out when sun is
-        # up; waxes and wanes over the MOON_PERIOD_DAYS cycle, with the
-        # glow following the lit fraction (Phase 3.4).
-        moon_full = moon_fullness()
-        moon_alpha = _smooth((0.3 - bright) / 0.3) \
-            * (0.35 + 0.65 * moon_full)
-        if moon_alpha > 0.02 and moon_d[1] > -0.25:
-            draw_celestial(cx, cy, cz, moon_d, radius=9.0,
-                           core_color=(0.92, 0.94, 1.0),
-                           glow_color=(0.55, 0.65, 0.85),
-                           core_alpha=moon_alpha,
-                           phase_frac=moon_full)
+            # sun + moon sit on top of the sky pass but behind terrain
+            sc = sun_color(t_day)
+            draw_celestial(cx, cy, cz, sun_d, radius=14.0,
+                           core_color=sc,
+                           glow_color=(sc[0], sc[1] * 0.8, sc[2] * 0.6))
+            # moon — slightly smaller, cool silver. Fades out when sun
+            # is up; waxes and wanes over the MOON_PERIOD_DAYS cycle,
+            # with the glow following the lit fraction (Phase 3.4).
+            moon_full = moon_fullness()
+            moon_alpha = _smooth((0.3 - bright) / 0.3) \
+                * (0.35 + 0.65 * moon_full)
+            if moon_alpha > 0.02 and moon_d[1] > -0.25:
+                draw_celestial(cx, cy, cz, moon_d, radius=9.0,
+                               core_color=(0.92, 0.94, 1.0),
+                               glow_color=(0.55, 0.65, 0.85),
+                               core_alpha=moon_alpha,
+                               phase_frac=moon_full)
+        else:
+            glClear(GL_COLOR_BUFFER_BIT)
 
         # Shooting stars (Phase 3.4): rare meteor streaks, clear nights
         # only — a quiet reward for night drives between storms.
@@ -12181,7 +12504,7 @@ def main(argv=None):
             shooting_star['p'][2] += shooting_star['v'][2] * dt
             if shooting_star['age'] >= shooting_star['life']:
                 shooting_star = None
-        if shooting_star is not None:
+        if shooting_star is not None and tun_depth < 0.5:
             draw_shooting_star(shooting_star, cx, cy, cz)
 
         # Rare high-altitude aircraft (4.4): contrail + strobe.
@@ -12193,7 +12516,7 @@ def main(argv=None):
                     aircraft = spawn_aircraft(bolt_rng, s_car)
         else:
             aircraft = update_aircraft(aircraft, dt, bolt_rng, s_car)
-            if aircraft is not None:
+            if aircraft is not None and tun_depth < 0.5:
                 draw_aircraft(aircraft, s_car, night_a, t_time)
 
         draw_terrain(terrain_tex, snow_ground_tex, s_car, t_time, amb)
@@ -12255,6 +12578,9 @@ def main(argv=None):
         # on drop-offs, meaningful signage, rural power lines, billboards
         # and bus shelters at the phase-2 stop slots.
         draw_overpasses(s_car, concrete_tex, amb, frost_i)
+        # Tunnel bore + portals + ridge + sodium lamps (plan v2 ph. 2)
+        draw_tunnel(s_car, concrete_tex, terrain_tex, amb, night_a,
+                    horizon, tun_depth)
         draw_guardrails(s_car, amb)
         draw_road_signs(s_car, phase4_props, amb, night_a)
         draw_power_lines(s_car, amb)
@@ -12320,8 +12646,8 @@ def main(argv=None):
         # snowfall: per-side gating. Flakes only fall where that side of
         # the road is in a frost biome; if left is frost and right isn't,
         # snow falls only to the left.
-        wL_frost = frost_weight_at(s_car, -1)
-        wR_frost = frost_weight_at(s_car, +1)
+        wL_frost = frost_weight_at(s_car, -1) * (1.0 - tun_depth)
+        wR_frost = frost_weight_at(s_car, +1) * (1.0 - tun_depth)
         update_snow(snow_state, dt, t_time, wind_x=wind_x)
         draw_snow(snow_state, snowflake_tex, wL_frost, wR_frost, cx, cy, cz)
 
@@ -12370,9 +12696,10 @@ def main(argv=None):
                         W, H, flare_smoothed)
 
         # Lens weather drops: spawn + advance + draw, gated by actual
-        # precipitation (not the overcast build-up) and snow.
+        # precipitation (not the overcast build-up) and snow — both
+        # shielded inside a tunnel bore.
         rain_lens_i = rain_i
-        snow_lens_i = frost_i
+        snow_lens_i = frost_i * (1.0 - tun_depth)
         lens_overlay.update(dt, rain_lens_i, snow_lens_i, W, H)
         lens_overlay.draw(lens_drop_tex, lens_flake_tex, W, H)
 
