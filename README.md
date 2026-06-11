@@ -415,6 +415,34 @@ research as the design criterion. Per-cycle snapshots live under
   after. Emergency code-3 runs are exempt.
 - All incidents are silent, per the serene-mix preference.
 
+### Road corners & cornering dynamics (light branch — plan v2 phase 1)
+- **Real bends**: deterministic corner zones layer smoothly-windowed
+  sin³ lateral bumps directly inside `curve_x` (the single source of
+  truth), so the road mesh, terrain, traffic, furniture and camera all
+  inherit them. ~31% of zones wind through chained S-bends, ~12% carry
+  a single sharp bend (curvature budgeted against the local base path
+  and capped at the terrain-skirt fold limit, R ≥ ~95 m), and ~16%
+  damp the global wiggle into genuine straightaways.
+- **Superelevation**: the cross-section rolls into bends (up to 8°,
+  from design-speed × curvature). The banked edge carries through the
+  terrain skirt, lane snow, decals, guardrails, lamps, signs and cones
+  via a shared `road_y_at(s, lateral)`; vehicles sit ON the banked
+  surface and roll with it; the camera's up-vector leans into sweeps,
+  damped and time-smoothed.
+- **Traffic corners like drivers**: each driver rolls a lateral-g
+  budget (aggressive ~3.2 m/s², calm ~2.0; trucks/buses ~60%,
+  motorcycles ~145%), reduced on wet or frosty roads. A curvature
+  look-ahead caps desired speed at `v = sqrt(a_lat/κ)` feeding the
+  IDM — braking into corners (brake lights on entry) and accelerating
+  out of the apex emerge naturally. Verified: 17.2 m/s through a
+  κ=0.0076 hairpin vs 26.3 m/s on the straights, no overlaps.
+  Emergency runs respect physics through bends too.
+- **Corner furniture**: yellow chevron boards stand on the OUTSIDE of
+  sharp bends pointing through them (retroreflective at night);
+  guardrails extend along corner outsides wherever centripetal math
+  says a design-speed vehicle would leave the road; skid-mark decals
+  drift toward the outside through the hardest apexes.
+
 ### Metropolitan traffic model
 - `TRAFFIC_DENSITY_SP` — 24-hour density table [0..1] calibrated
   against public big-city traffic bulletins, origin-destination
@@ -493,6 +521,36 @@ tree, so the forest is stable across frames without any storage.
 | **Space** | re-center the camera to the forward view |
 | **T** | trigger a lightning strike (and thunder clap) |
 | **Esc** | quit |
+
+## Performance notes
+
+The GL context is hardware-accelerated (verify with the renderer
+string — e.g. "Apple M4 / 2.1 Metal"); the frame budget is dominated
+by CPU-side work, attacked without touching visual quality:
+
+- **Trees as static VBOs** — display-list replay of immediate-mode
+  trees is CPU-bound in the GL-on-Metal driver (~0.3 ms per tree). The
+  recursive generator's exact rng walk is re-captured into triangle
+  arrays: near trees (<180 m) draw from per-variant VBOs with live
+  wind sway; far trees bake into world-space chunk VBOs (sway eased to
+  zero at the hand-off, where it is sub-pixel anyway). Forest pass:
+  62.8 → 3.3 ms/frame, identical geometry.
+- **Cinematic grade via 256³ LUT** — the colour chain is a pure
+  function of the 8-bit input pixel, so a full-resolution lookup table
+  reproduces it bit-exactly (verified max diff 0) at one gather per
+  pixel; the vignette applies in 16-bit fixed point (±1 LSB at the
+  darkened edges); writeback uses a streaming texture + quad instead
+  of the slow glDrawPixels path. The LUT builds in ~1 s and caches to
+  disk (`.grade_lut_*.npy`, gitignored).
+- **PyOpenGL per-call error checking disabled** (millions of redundant
+  glGetError round-trips per second; the test suites and GL harnesses
+  gate correctness instead).
+- **Memoised world queries** — zone biomes, single-sample biome
+  weights at fixed hash-slot positions, per-slot tree placement
+  decisions, road curvature bins.
+
+Net effect at 720p in a forest zone: ~8 → ~33 fps with the full
+cinematic grade, ~20 → ~100 fps without it.
 
 ## Status
 

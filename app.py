@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import math
 import sys
 import numpy as np
@@ -128,6 +129,14 @@ except Exception as _exc:
     _print_help_banner("Procedural music disabled (FluidSynth not ready)",
                        _lines)
 
+# PyOpenGL wraps EVERY GL call in glGetError by default — millions of
+# redundant checks per second of frame time in this app, all pure
+# overhead once the code is correct (the test suites + GL draw-path
+# harnesses gate that). Must be set before the first OpenGL.GL import.
+import OpenGL
+OpenGL.ERROR_CHECKING = False
+OpenGL.ERROR_LOGGING = False
+
 from OpenGL.GL import *
 from OpenGL.GLU import (
     gluPerspective, gluLookAt, gluNewQuadric, gluQuadricTexture,
@@ -207,10 +216,128 @@ SKY_DOME_R = 1000.0    # large enough to enclose the deeper visible terrain
 
 
 # --- Path curves ---
+# --- Corner zones (plan v2, phase 1) ---------------------------------------
+# The base path is three gentle global sines — pleasant, but never a
+# real corner. Corner zones layer deterministic, smoothly-windowed
+# lateral bend bumps ON TOP of that base, inside curve_x itself, so the
+# road mesh, terrain, traffic, furniture and camera all inherit the
+# bends from the single source of truth.
+#
+# Bump shape: A·sin³(πu) over u∈[0,1] — C² at both edges (value, slope
+# AND curvature reach zero), so there is never a kink where a bend
+# starts. Peak curvature of one bump ≈ 3Aπ²/L².
+#
+# Curvature is capped at ~0.011 (radius ≥ ~90 m): the terrain skirt
+# extends 80 m perpendicular from the road, and a tighter radius would
+# fold the inside terrain band through the centre of the bend.
+CORNER_ZONE_LEN = 900.0
+CORNER_KAPPA_MAX = 0.011
+V_DESIGN = 25.0          # design speed for banking/guardrail logic
+MAX_BANK = 0.14          # tan(8°) superelevation cap (dy per dx)
+
+_CORNER_CACHE = {}
+
+
+def _base_curv(s):
+    """Closed-form curvature of the BASE road (no bends) — used at
+    zone-build time to budget bump curvature so base + bump never
+    exceeds the terrain-fold limit."""
+    return -(18.0 * 0.0055 ** 2 * math.sin(s * 0.0055)
+             + 9.0 * 0.013 ** 2 * math.sin(s * 0.013 + 1.3)
+             + 3.0 * 0.031 ** 2 * math.sin(s * 0.031 + 0.7))
+
+
+def _bump_kappa_budget(s0, L, kap_wanted):
+    """Cap a bump's peak curvature so that, combined with the worst
+    base curvature across its span, the total stays under the fold
+    limit. Returns 0.0 if the base is already too curvy here."""
+    base_worst = max(abs(_base_curv(s0 + L * f))
+                     for f in (0.2, 0.35, 0.5, 0.65, 0.8))
+    avail = CORNER_KAPPA_MAX - base_worst - 0.0005
+    if avail < 0.0035:
+        return 0.0
+    return min(kap_wanted, avail)
+
+
+def corner_zone_params(zone_idx):
+    """Deterministic corner profile for one 900 m zone:
+    {'bumps': [(s0, L, A), ...], 'damp': (d0, dL) | None}.
+
+    ~30% winding (2-3 alternating S-bends), ~15% hairpin-lite (one
+    strong bend), ~20% straightaway (the global wiggle is damped so
+    long flats exist too), rest untouched base road."""
+    prm = _CORNER_CACHE.get(zone_idx)
+    if prm is not None:
+        return prm
+    key = _zone_hash(zone_idx, 7741)
+    base = zone_idx * CORNER_ZONE_LEN
+    bumps = []
+    damp = None
+    r = key % 100
+    if r < 30:          # winding S-bends
+        n = 2 + ((key >> 8) & 1)
+        pos = base + 110.0 + ((key >> 9) & 0x3F) / 63.0 * 120.0
+        sign = 1.0 if ((key >> 15) & 1) else -1.0
+        for i in range(n):
+            L = 150.0 + ((key >> (16 + i * 4)) & 0xF) / 15.0 * 70.0
+            if pos + L > base + CORNER_ZONE_LEN - 90.0:
+                break
+            kap = _bump_kappa_budget(
+                pos, L,
+                0.0055 + ((key >> (18 + i * 3)) & 0x7) / 7.0 * 0.003)
+            if kap > 0.0:
+                A = sign * kap * L * L / (3.0 * math.pi ** 2)
+                bumps.append((pos, L, A))
+            pos += L * 0.92
+            sign = -sign
+    elif r < 45:        # hairpin-lite
+        L = 130.0 + ((key >> 8) & 0xF) / 15.0 * 40.0
+        s0 = base + 200.0 + ((key >> 16) & 0xFF) / 255.0 \
+            * (CORNER_ZONE_LEN - 400.0 - L)
+        kap = _bump_kappa_budget(
+            s0, L,
+            0.0085 + ((key >> 12) & 0x7) / 7.0 * (CORNER_KAPPA_MAX
+                                                  - 0.0085))
+        if kap > 0.0:
+            A = (1.0 if ((key >> 15) & 1) else -1.0) \
+                * kap * L * L / (3.0 * math.pi ** 2)
+            bumps.append((s0, L, A))
+    elif r < 65:        # straightaway: damp the global wiggle
+        damp = (base + 90.0, CORNER_ZONE_LEN - 180.0)
+    prm = {'bumps': bumps, 'damp': damp}
+    _CORNER_CACHE[zone_idx] = prm
+    return prm
+
+
+def _wiggle(s):
+    """The two higher-frequency base terms (what straightaways damp)."""
+    return (9.0 * math.sin(s * 0.013 + 1.3)
+            + 3.0 * math.sin(s * 0.031 + 0.7))
+
+
+def _corner_bend(s):
+    prm = corner_zone_params(int(s // CORNER_ZONE_LEN))
+    b = 0.0
+    for (s0, L, A) in prm['bumps']:
+        u = (s - s0) / L
+        if 0.0 < u < 1.0:
+            sn = math.sin(math.pi * u)
+            b += A * sn * sn * sn
+    if prm['damp'] is not None:
+        d0, dL = prm['damp']
+        u = (s - d0) / dL
+        if 0.0 < u < 1.0:
+            w = min(1.0, min(u, 1.0 - u) / 0.22)
+            w = w * w * (3.0 - 2.0 * w)
+            b -= w * 0.80 * _wiggle(s)
+    return b
+
+
 def curve_x(s):
     return (18.0 * math.sin(s * 0.0055)
             + 9.0 * math.sin(s * 0.013 + 1.3)
-            + 3.0 * math.sin(s * 0.031 + 0.7))
+            + 3.0 * math.sin(s * 0.031 + 0.7)
+            + _corner_bend(s))
 
 
 def curve_y(s):
@@ -219,16 +346,91 @@ def curve_y(s):
             + 0.8 * math.sin(s * 0.043))
 
 
+def _corner_bend_np(s):
+    s = np.asarray(s)
+    out = np.zeros(s.shape, dtype=np.float64)
+    for z in np.unique((s // CORNER_ZONE_LEN).astype(np.int64)):
+        prm = corner_zone_params(int(z))
+        for (s0, L, A) in prm['bumps']:
+            u = (s - s0) / L
+            m = (u > 0.0) & (u < 1.0)
+            if np.any(m):
+                sn = np.sin(np.pi * u[m])
+                out[m] += A * sn * sn * sn
+        if prm['damp'] is not None:
+            d0, dL = prm['damp']
+            u = (s - d0) / dL
+            m = (u > 0.0) & (u < 1.0)
+            if np.any(m):
+                w = np.minimum(1.0, np.minimum(u[m], 1.0 - u[m]) / 0.22)
+                w = w * w * (3.0 - 2.0 * w)
+                out[m] -= w * 0.80 * (
+                    9.0 * np.sin(s[m] * 0.013 + 1.3)
+                    + 3.0 * np.sin(s[m] * 0.031 + 0.7))
+    return out
+
+
 def curve_x_np(s):
     return (18.0 * np.sin(s * 0.0055)
             + 9.0 * np.sin(s * 0.013 + 1.3)
-            + 3.0 * np.sin(s * 0.031 + 0.7))
+            + 3.0 * np.sin(s * 0.031 + 0.7)
+            + _corner_bend_np(s))
 
 
 def curve_y_np(s):
     return (6.0 * np.sin(s * 0.006 + 0.5)
             + 2.5 * np.sin(s * 0.017 + 2.1)
             + 0.8 * np.sin(s * 0.043))
+
+
+# --- Curvature / superelevation helpers ------------------------------------
+# Signed road curvature (≈ x'' for these gentle slopes), cached on an
+# 8 m grid with linear interpolation between bin centres — it feeds the
+# per-vehicle corner-speed budget and the banking, so it's hot.
+_ROLLBIN_CACHE = {}
+
+
+def _curv_bin(k):
+    v = _ROLLBIN_CACHE.get(k)
+    if v is None:
+        sc = (k + 0.5) * 8.0
+        v = (curve_x(sc + 6.0) - 2.0 * curve_x(sc)
+             + curve_x(sc - 6.0)) / 36.0
+        if len(_ROLLBIN_CACHE) > 16384:
+            _ROLLBIN_CACHE.clear()
+        _ROLLBIN_CACHE[k] = v
+    return v
+
+
+def road_curv(s):
+    """Signed curvature at s (smooth, piecewise-linear interpolated)."""
+    x = (s - 4.0) / 8.0
+    k = math.floor(x)
+    f = x - k
+    return _curv_bin(int(k)) * (1.0 - f) + _curv_bin(int(k) + 1) * f
+
+
+def road_roll(s):
+    """Superelevation as a lateral slope dy/dx: positive raises the
+    LEFT (-x) edge — banking into a bend toward +x. Clamped to ~8°."""
+    r = V_DESIGN * V_DESIGN * road_curv(s) / 9.81
+    return max(-MAX_BANK, min(MAX_BANK, r))
+
+
+def road_roll_np(s):
+    r = (V_DESIGN * V_DESIGN / 9.81) \
+        * (curve_x_np(s + 6.0) - 2.0 * curve_x_np(s)
+           + curve_x_np(s - 6.0)) / 36.0
+    return np.clip(r, -MAX_BANK, MAX_BANK)
+
+
+def road_y_at(s, lx):
+    """Road-surface height at lateral offset lx from the centreline,
+    including superelevation. Offsets beyond the shoulders hold the
+    edge value (the terrain skirt blends from there)."""
+    lim = ROAD_WIDTH / 2 + 3.0
+    lxc = max(-lim, min(lim, lx))
+    return curve_y(s) - lxc * road_roll(s)
 
 
 # --- Biomes ---
@@ -321,8 +523,22 @@ def _biome_at_uncached(zone_idx, side):
     return bl if side < 0 else br
 
 
+# Single-sample biome-weight memo: dozens of draw passes query weights
+# at FIXED hash-slot positions every frame (trees, flowers, houses,
+# pedestrians, scenery, lamps, audio...), so the same (s, side) keys
+# recur for as long as the slot is in view. The biome layout is
+# immutable within a run, so cached rows never go stale; rows are
+# returned by reference and must be treated as read-only.
+_BW_CACHE = {}
+
+
 def biome_weights_vec(s_arr, side):
     NS = len(s_arr)
+    if NS == 1:
+        ck = (float(s_arr[0]), side < 0)
+        hit = _BW_CACHE.get(ck)
+        if hit is not None:
+            return hit
     out = np.zeros((NS, BIOME_COUNT), dtype=np.float32)
     for i, s in enumerate(s_arr):
         idx = int(s // ZONE_LEN)
@@ -342,6 +558,10 @@ def biome_weights_vec(s_arr, side):
             out[i, nxt] += 1.0 - t
         else:
             out[i, cur] = 1.0
+    if NS == 1:
+        if len(_BW_CACHE) > 65536:
+            _BW_CACHE.clear()
+        _BW_CACHE[ck] = out
     return out
 
 
@@ -3297,6 +3517,12 @@ def build_side_arrays(s_arr, s_car, side, t_time, amb_rgb):
     edge_fac = np.clip(d / 3.0, 0.0, 1.0)
     edge_fac = edge_fac * edge_fac * (3 - 2 * edge_fac)  # smoothstep
     off = off * edge_fac[None, :]
+    # Superelevation: the terrain skirt meets the BANKED road edge and
+    # blends back to the natural profile over the first ~12 m.
+    roll = road_roll_np(s_arr)
+    edge_y = (-side * (ROAD_WIDTH / 2)) * roll
+    bank_blend = np.clip(1.0 - d / 12.0, 0.0, 1.0)
+    off = off + edge_y[:, None] * bank_blend[None, :]
     x = rx[:, None] + side * (ROAD_WIDTH / 2 + d[None, :])
     y = ry[:, None] + off
     z = np.broadcast_to(rz[:, None], (NS, K))
@@ -3485,7 +3711,7 @@ def _draw_bridges(s_arr, bridge_w, base_col, frost_i, s_car):
         def emit(i, alpha, side=side):
             s = float(s_arr[i])
             x = curve_x(s) + side * (ROAD_WIDTH / 2 + 0.10)
-            y_base = curve_y(s) + 0.05
+            y_base = road_y_at(s, side * (ROAD_WIDTH / 2 + 0.10)) + 0.05
             z = -(s - s_car)
             u = s * 0.18
             glColor4f(base_bot[0], base_bot[1], base_bot[2], alpha)
@@ -3566,13 +3792,14 @@ def draw_surface_details(s_car, amb_rgb):
         if wc < 0.5:
             continue
         x = curve_x(s)
-        y = curve_y(s) + 0.035
+        yl = road_y_at(s, -ROAD_WIDTH / 2) + 0.035
+        yr = road_y_at(s, ROAD_WIDTH / 2) + 0.035
         z = -(s - s_car)
         glColor4f(0.04, 0.04, 0.05, 0.45 * wc)
-        glVertex3f(x - ROAD_WIDTH / 2, y, z + 0.05)
-        glVertex3f(x + ROAD_WIDTH / 2, y, z + 0.05)
-        glVertex3f(x + ROAD_WIDTH / 2, y, z - 0.05)
-        glVertex3f(x - ROAD_WIDTH / 2, y, z - 0.05)
+        glVertex3f(x - ROAD_WIDTH / 2, yl, z + 0.05)
+        glVertex3f(x + ROAD_WIDTH / 2, yr, z + 0.05)
+        glVertex3f(x + ROAD_WIDTH / 2, yr, z - 0.05)
+        glVertex3f(x - ROAD_WIDTH / 2, yl, z - 0.05)
     glEnd()
 
     # Old-asphalt damage: potholes (dark ellipses) + tar patches
@@ -3588,31 +3815,62 @@ def draw_surface_details(s_car, amb_rgb):
             continue
         lat = (((key >> 8) & 0xFF) / 255.0 - 0.5) * (ROAD_WIDTH - 2.6)
         x = curve_x(s) + lat
-        y = curve_y(s) + 0.034
         z = -(s - s_car)
         if ((key >> 16) & 1) == 0:
-            # pothole — dark ragged ellipse
+            # pothole — dark ragged ellipse hugging the banked surface
             rx = 0.22 + ((key >> 20) & 0x7) / 7.0 * 0.35
             rz = rx * (1.2 + ((key >> 23) & 0x3) / 3.0 * 0.5)
             glColor4f(0.05, 0.05, 0.055, 0.62 * wo)
             glBegin(GL_TRIANGLE_FAN)
-            glVertex3f(x, y, z)
+            glVertex3f(x, road_y_at(s, lat) + 0.034, z)
             for k in range(13):
                 a = 2 * math.pi * k / 12
                 rr = 1.0 + 0.18 * math.sin(a * 3 + key)
-                glVertex3f(x + math.cos(a) * rx * rr, y,
+                lx = lat + math.cos(a) * rx * rr
+                glVertex3f(x + math.cos(a) * rx * rr,
+                           road_y_at(s, lx) + 0.034,
                            z + math.sin(a) * rz * rr)
             glEnd()
         else:
             # tar patch — fresher black rectangle over the bleach
             pw = 0.9 + ((key >> 20) & 0x7) / 7.0 * 0.9
             pl = 1.6 + ((key >> 23) & 0x7) / 7.0 * 1.8
+            yl = road_y_at(s, lat - pw) + 0.034
+            yr = road_y_at(s, lat + pw) + 0.034
             glColor4f(0.07, 0.07, 0.08, 0.38 * wo)
             glBegin(GL_QUADS)
-            glVertex3f(x - pw, y, z + pl)
-            glVertex3f(x + pw, y, z + pl)
-            glVertex3f(x + pw, y, z - pl)
-            glVertex3f(x - pw, y, z - pl)
+            glVertex3f(x - pw, yl, z + pl)
+            glVertex3f(x + pw, yr, z + pl)
+            glVertex3f(x + pw, yr, z - pl)
+            glVertex3f(x - pw, yl, z - pl)
+            glEnd()
+
+    # Skid marks through the sharpest apexes (plan v2 phase 1): paired
+    # dark streaks where the corner-speed math says drivers work hardest.
+    s0 = math.ceil(s_car / 24.0) * 24.0
+    for i in range(int(360.0 / 24.0)):
+        s = s0 + i * 24.0
+        kap_s = road_curv(s)
+        if abs(kap_s) < 0.0080:
+            continue
+        key = (int(s // 24.0) * 2654435761 + 911) & 0xFFFFFFFF
+        if (key & 0xFF) / 255.0 > 0.5:
+            continue
+        # marks drift toward the OUTSIDE of the bend through the apex
+        out_sgn = -1.0 if kap_s > 0.0 else 1.0
+        lane_c = -out_sgn * 2.6   # the lane fighting the bend
+        glColor4f(0.05, 0.05, 0.06, 0.30)
+        for wo in (-0.55, 0.55):
+            glBegin(GL_QUAD_STRIP)
+            for k in range(7):
+                t = k / 6.0
+                sv = s - 9.0 + t * 18.0
+                lx = lane_c + wo + out_sgn * 0.8 * math.sin(math.pi * t)
+                xv = curve_x(sv) + lx
+                yv = road_y_at(sv, lx) + 0.037
+                zv = -(sv - s_car)
+                glVertex3f(xv - 0.09, yv, zv)
+                glVertex3f(xv + 0.09, yv, zv)
             glEnd()
 
     glDisable(GL_POLYGON_OFFSET_FILL)
@@ -3701,13 +3959,18 @@ def draw_road(tex_id, s_car, amb_rgb, storm_i=0.0, horizon_rgb=None):
         y = curve_y(s)
         z = -(s - s_car)
         v = s * 0.12
+        # Superelevation (plan v2 phase 1): the cross-section rolls
+        # into bends — outside edge rises, inside drops.
+        ro = road_roll(s) * (ROAD_WIDTH / 2)
         # Per-vertex surface-zone tint (Phase 4.1): bleached old
         # asphalt and lighter concrete sections slide by smoothly.
         tr, tg, tb = _surf_tint(s)
         glColor3f(min(1.0, dr * tr), min(1.0, dg * tg),
                   min(1.0, db * tb))
-        glTexCoord2f(0.0, v); glVertex3f(x - ROAD_WIDTH / 2, y + 0.03, z)
-        glTexCoord2f(1.0, v); glVertex3f(x + ROAD_WIDTH / 2, y + 0.03, z)
+        glTexCoord2f(0.0, v)
+        glVertex3f(x - ROAD_WIDTH / 2, y + 0.03 + ro, z)
+        glTexCoord2f(1.0, v)
+        glVertex3f(x + ROAD_WIDTH / 2, y + 0.03 - ro, z)
     glEnd()
     glDisable(GL_TEXTURE_2D)
 
@@ -3723,12 +3986,13 @@ def draw_road(tex_id, s_car, amb_rgb, storm_i=0.0, horizon_rgb=None):
             x = curve_x(s)
             y = curve_y(s)
             z = -(s - s_car)
+            ro = road_roll(s) * (ROAD_WIDTH / 2)
             rel = max(0.0, (s - s_car)) / max(1.0, N_SEG * SEG_LEN)
             rel = min(1.0, rel)
             sr, sg, sb = _asphalt_specular(storm_i, horizon_rgb, rel)
             glColor3f(sr, sg, sb)
-            glVertex3f(x - ROAD_WIDTH / 2, y + 0.031, z)
-            glVertex3f(x + ROAD_WIDTH / 2, y + 0.031, z)
+            glVertex3f(x - ROAD_WIDTH / 2, y + 0.031 + ro, z)
+            glVertex3f(x + ROAD_WIDTH / 2, y + 0.031 - ro, z)
         glEnd()
         glDepthFunc(GL_LESS)
         glDepthMask(GL_TRUE)
@@ -3821,8 +4085,11 @@ def draw_road_snow_overlay(snow_tex, s_car, amb_rgb):
         alpha = float(min(1.0, frost_w[i] * 0.95))
         glColor4f(tint[0], tint[1], tint[2], alpha)
         v = s * 0.18
-        glTexCoord2f(0.0, v); glVertex3f(x - ROAD_WIDTH / 2, y + 0.04, z)
-        glTexCoord2f(0.45, v); glVertex3f(x + ROAD_WIDTH / 2, y + 0.04, z)
+        ro = road_roll(s) * (ROAD_WIDTH / 2)
+        glTexCoord2f(0.0, v)
+        glVertex3f(x - ROAD_WIDTH / 2, y + 0.04 + ro, z)
+        glTexCoord2f(0.45, v)
+        glVertex3f(x + ROAD_WIDTH / 2, y + 0.04 - ro, z)
     glEnd()
 
     glDisable(GL_POLYGON_OFFSET_FILL)
@@ -3845,12 +4112,13 @@ def draw_lamps(s_car, night_a):
         s = s_start + i * LAMP_SPACING
         if not is_plain_either_side(s):
             continue
-        x = curve_x(s); y = curve_y(s); z = -(s - s_car)
+        x = curve_x(s); z = -(s - s_car)
         # Mirror the lamp pair across the road — lights bracket both
         # sides simultaneously, so the right side always gets the mirror
         # of whatever the left side gets.
         for side in (-1, 1):
             px = x + side * (ROAD_WIDTH / 2 + 0.6)
+            y = road_y_at(s, side * (ROAD_WIDTH / 2 + 0.6))
             glVertex3f(px, y, z); glVertex3f(px, y + 3.2, z)
             glVertex3f(px, y + 3.2, z); glVertex3f(px - side * 1.0, y + 3.2, z)
     glEnd()
@@ -3866,10 +4134,10 @@ def draw_lamps(s_car, night_a):
         if not is_plain_either_side(s):
             continue
         fade = max(0.0, 1.0 - d / (N_LAMPS * LAMP_SPACING * 0.9)) * night_a
-        x = curve_x(s); y = curve_y(s); z = -d
+        x = curve_x(s); z = -d
         for side in (-1, 1):
             px = x + side * (ROAD_WIDTH / 2 + 0.6) - side * 1.0
-            py = y + 3.15
+            py = road_y_at(s, side * (ROAD_WIDTH / 2 + 0.6)) + 3.15
             for (r, a) in ((1.4, 0.15), (0.7, 0.35), (0.28, 0.9)):
                 rr = r * (0.6 + 0.6 * (1.0 - min(1.0, d / 300.0)))
                 glColor4f(1.0, 0.92, 0.55, a * fade)
@@ -4149,7 +4417,247 @@ def build_tree_variants(bark_tex, leaf_tex, n=N_TREE_VARIANTS):
     return [build_tree_variant(101 + i * 37, bark_tex, leaf_tex) for i in range(n)]
 
 
-def draw_forest(s_car, tree_lists, frost_tree_lists, amb_rgb,
+# --- Tree geometry capture → VBOs (performance, no visual change) ----------
+# Display-list replay of immediate-mode trees is CPU-bound in the
+# GL-on-Metal driver (~0.3 ms PER TREE measured), which made forests the
+# frame-time hog. These helpers walk the SAME recursive generator with
+# the SAME rng sequence, but capture the triangles into arrays uploaded
+# once as static VBOs — the GPU then draws a whole tree (or a whole
+# baked far-chunk) in two glDrawArrays calls. Geometry and UVs match
+# the display-list version; the bark cylinder is re-emitted manually
+# with gluCylinder's ring layout.
+
+def _mT(x, y, z):
+    m = np.eye(4, dtype=np.float64)
+    m[0, 3], m[1, 3], m[2, 3] = x, y, z
+    return m
+
+
+def _mR(deg, ax):
+    r = math.radians(deg)
+    c, s = math.cos(r), math.sin(r)
+    m = np.eye(4, dtype=np.float64)
+    if ax == 'x':
+        m[1, 1], m[1, 2], m[2, 1], m[2, 2] = c, -s, s, c
+    elif ax == 'y':
+        m[0, 0], m[0, 2], m[2, 0], m[2, 2] = c, s, -s, c
+    else:
+        m[0, 0], m[0, 1], m[1, 0], m[1, 1] = c, -s, s, c
+    return m
+
+
+def _emit_tris(mat, pts, uvs, out):
+    """Transform local-space triangle points by mat and append
+    interleaved (x, y, z, u, v) float32 rows."""
+    p = np.asarray(pts, dtype=np.float64)
+    w = (mat[:3, :3] @ p.T).T + mat[:3, 3]
+    row = np.empty((len(p), 5), dtype=np.float32)
+    row[:, :3] = w
+    row[:, 3:] = np.asarray(uvs, dtype=np.float32)
+    out.append(row)
+
+
+def _capture_quad(mat, s, out):
+    """The standard foliage quad (matches the GL_QUADS emission)."""
+    q = [(-s, -s * 0.3, 0.0), (s, -s * 0.3, 0.0),
+         (s, s * 1.7, 0.0), (-s, s * 1.7, 0.0)]
+    uv = [(0, 0), (1, 0), (1, 1), (0, 1)]
+    tri = [q[0], q[1], q[2], q[0], q[2], q[3]]
+    uvt = [uv[0], uv[1], uv[2], uv[0], uv[2], uv[3]]
+    _emit_tris(mat, tri, uvt, out)
+
+
+def _capture_cylinder(mat, radius, tip, length, out):
+    """Tapered 8-slice cylinder along +Y (the -90° X-rotated
+    gluCylinder), with circumferential u and lengthwise v."""
+    pts, uvs = [], []
+    for i in range(8):
+        a0 = 2.0 * math.pi * i / 8.0
+        a1 = 2.0 * math.pi * (i + 1) / 8.0
+        b0 = (radius * math.cos(a0), 0.0, -radius * math.sin(a0))
+        b1 = (radius * math.cos(a1), 0.0, -radius * math.sin(a1))
+        t0 = (tip * math.cos(a0), length, -tip * math.sin(a0))
+        t1 = (tip * math.cos(a1), length, -tip * math.sin(a1))
+        u0, u1 = i / 8.0, (i + 1) / 8.0
+        pts += [b0, b1, t1, b0, t1, t0]
+        uvs += [(u0, 0), (u1, 0), (u1, 1), (u0, 0), (u1, 1), (u0, 1)]
+    _emit_tris(mat, pts, uvs, out)
+
+
+def _capture_leaf_cluster(rng, mat, size, out):
+    """Mirrors _draw_leaf_cluster's rng sequence exactly."""
+    n = rng.randint(6, 9)
+    for _ in range(n):
+        yaw = rng.uniform(0.0, 360.0)
+        pitch = rng.uniform(-45.0, 45.0)
+        roll = rng.uniform(-30.0, 30.0)
+        jx = rng.uniform(-size * 0.25, size * 0.25)
+        jy = rng.uniform(-size * 0.15, size * 0.35)
+        jz = rng.uniform(-size * 0.25, size * 0.25)
+        m = (mat @ _mT(jx, jy, jz) @ _mR(yaw, 'y')
+             @ _mR(pitch, 'x') @ _mR(roll, 'z'))
+        s = size * rng.uniform(1.05, 1.35)
+        _capture_quad(m, s, out)
+
+
+def _capture_branch(rng, mat, length, radius, depth, max_depth,
+                    bark_out, leaf_out):
+    """Mirrors _emit_branch's structure and rng sequence exactly."""
+    tip = radius * 0.72
+    _capture_cylinder(mat, radius, tip, length, bark_out)
+
+    terminal = depth >= max_depth or length < 0.35
+    if terminal:
+        leaf_size = max(0.55, radius * 9.0 + 0.6)
+        _capture_leaf_cluster(rng, mat @ _mT(0.0, length, 0.0),
+                              leaf_size, leaf_out)
+        return
+
+    if depth >= max_depth // 2 + 1:
+        m2 = mat @ _mT(0.0, length * 0.70, 0.0)
+        mid_size = max(0.35, radius * 6.0 + 0.3)
+        n = rng.randint(2, 4)
+        for _ in range(n):
+            yaw = rng.uniform(0.0, 360.0)
+            pitch = rng.uniform(-25.0, 25.0)
+            s = mid_size * rng.uniform(1.0, 1.2)
+            _capture_quad(m2 @ _mR(yaw, 'y') @ _mR(pitch, 'x'),
+                          s, leaf_out)
+
+    m2 = mat @ _mT(0.0, length, 0.0)
+    n_children = (rng.choice([2, 2, 3]) if depth < max_depth - 1
+                  else rng.choice([1, 2]))
+    base_yaw = rng.uniform(0.0, 360.0)
+    for i in range(n_children):
+        yaw = base_yaw + (360.0 / n_children) * i \
+            + rng.uniform(-22.0, 22.0)
+        pitch = rng.uniform(22.0, 46.0) * (1.0 - depth * 0.06)
+        child_len = length * rng.uniform(0.62, 0.80)
+        child_rad = tip * rng.uniform(0.82, 0.98)
+        _capture_branch(rng, m2 @ _mR(yaw, 'y') @ _mR(pitch, 'x'),
+                        child_len, child_rad, depth + 1, max_depth,
+                        bark_out, leaf_out)
+
+
+def build_tree_geometry(seed):
+    """(bark_tris, leaf_tris) interleaved float32 (N,5) arrays for one
+    tree — same rng order as build_tree_variant, so shapes match the
+    display-list version variant for variant."""
+    rng = random.Random(seed)
+    trunk_len = rng.uniform(2.8, 4.4)
+    trunk_rad = rng.uniform(0.18, 0.32)
+    max_depth = rng.choice([4, 5, 5])
+    bark_out, leaf_out = [], []
+    _capture_branch(rng, np.eye(4), trunk_len, trunk_rad, 0, max_depth,
+                    bark_out, leaf_out)
+    return (np.concatenate(bark_out).astype(np.float32),
+            np.concatenate(leaf_out).astype(np.float32))
+
+
+def _make_vbo(arr):
+    vbo = int(glGenBuffers(1))
+    glBindBuffer(GL_ARRAY_BUFFER, vbo)
+    glBufferData(GL_ARRAY_BUFFER, arr.nbytes, arr, GL_STATIC_DRAW)
+    glBindBuffer(GL_ARRAY_BUFFER, 0)
+    return (vbo, len(arr))
+
+
+def build_tree_meshes(n=N_TREE_VARIANTS):
+    """Per-variant static VBOs (geometry is shared between the normal
+    and frost sets — only the bound textures differ)."""
+    meshes = []
+    for i in range(n):
+        bark, leaf = build_tree_geometry(101 + i * 37)
+        meshes.append({'bark': _make_vbo(bark), 'leaf': _make_vbo(leaf),
+                       'bark_arr': bark, 'leaf_arr': leaf})
+    return meshes
+
+
+def _vbo_draw(vbo_count):
+    vbo, count = vbo_count
+    glBindBuffer(GL_ARRAY_BUFFER, vbo)
+    glVertexPointer(3, GL_FLOAT, 20, ctypes.c_void_p(0))
+    glTexCoordPointer(2, GL_FLOAT, 20, ctypes.c_void_p(12))
+    glDrawArrays(GL_TRIANGLES, 0, count)
+
+
+FOREST_ANIM_DIST = 180.0     # trees nearer than this sway individually
+FOREST_CHUNK_SLOTS = 16      # far trees bake in 16-slot display lists
+_TREE_SLOTS = {}             # (slot, side) -> None | placement tuple
+_FOREST_CHUNKS = {}          # chunk_idx -> display list id (0 = empty)
+
+
+def _tree_slot(slot, side, nvar):
+    """Memoised per-slot tree decision: None (no tree) or
+    (tx, ty, s, variant, yaw, scale, phase, use_frost). Identical math
+    to the original per-frame inline version — just computed once."""
+    ck = (slot, side)
+    if ck in _TREE_SLOTS:
+        return _TREE_SLOTS[ck]
+    s = slot * TREE_SPACING
+    w = biome_weights_vec(np.array([s], dtype=np.float32), side)[0]
+    fw = float(w[BIOME_FOREST])
+    frw = float(w[BIOME_FROST])
+    rec = None
+    tree_density = fw + frw
+    if tree_density >= 0.28:
+        key = (int(s * 97) * 2654435761
+               + (0 if side < 0 else 7919)
+               + 1013904223) & 0xFFFFFFFF
+        if ((key & 0xFFFF) / 65535.0) <= tree_density * 0.95:
+            d_edge = 1.2 + ((key >> 16) & 0xFF) / 255.0 * TREE_MAX_PERP
+            variant = ((key >> 24) & 0x07) % nvar
+            yaw = ((key >> 8) & 0xFF) / 255.0 * 360.0
+            scale = 0.78 + ((key >> 4) & 0x0F) / 15.0 * 0.55
+            phase = ((key >> 12) & 0x3FFF) * (2.0 * math.pi / 0x3FFF)
+            tx = curve_x(s) + side * (ROAD_WIDTH / 2 + d_edge)
+            ty = curve_y(s) - 0.15
+            rec = (tx, ty, s, variant, yaw, scale, phase, frw > fw)
+    if len(_TREE_SLOTS) > 120000:
+        _TREE_SLOTS.clear()
+    _TREE_SLOTS[ck] = rec
+    return rec
+
+
+def _forest_chunk_vbos(chunk, tree_meshes, nvar):
+    """All far trees of one chunk CPU-transformed into WORLD space
+    (z = -s) and concatenated into up to four static VBOs, split by
+    (normal|frost) × (bark|leaf). The caller replays them behind a
+    single glTranslatef(0, 0, s_car). None means 'chunk is empty'."""
+    hit = _FOREST_CHUNKS.get(chunk)
+    if hit is not None or chunk in _FOREST_CHUNKS:
+        return hit
+    slot0 = chunk * FOREST_CHUNK_SLOTS
+    parts = {'bn': [], 'ln': [], 'bf': [], 'lf': []}
+    for slot in range(slot0, slot0 + FOREST_CHUNK_SLOTS):
+        for side in (-1, +1):
+            rec = _tree_slot(slot, side, nvar)
+            if rec is None:
+                continue
+            tx, ty, s, variant, yaw, scale, phase, use_frost = rec
+            mesh = tree_meshes[variant]
+            r = math.radians(yaw)
+            c_, s_ = math.cos(r), math.sin(r)
+            for part, dst in (('bark_arr', 'bf' if use_frost else 'bn'),
+                              ('leaf_arr', 'lf' if use_frost else 'ln')):
+                a = mesh[part]
+                out = a.copy()
+                x, z = a[:, 0] * scale, a[:, 2] * scale
+                out[:, 0] = c_ * x + s_ * z + tx
+                out[:, 1] = a[:, 1] * scale + ty
+                out[:, 2] = -s_ * x + c_ * z - s
+                parts[dst].append(out)
+    if not any(parts.values()):
+        _FOREST_CHUNKS[chunk] = None
+        return None
+    vb = {}
+    for k, lst in parts.items():
+        vb[k] = _make_vbo(np.concatenate(lst)) if lst else None
+    _FOREST_CHUNKS[chunk] = vb
+    return vb
+
+
+def draw_forest(s_car, tree_meshes, tex_normal, tex_frost, amb_rgb,
                 t_time=0.0, wind_strength=0.0):
     """Instance baked tree lists across positions in forest/frost biome zones.
     Picks the frost (snow-covered) variant set where the slot is in a frost
@@ -4169,11 +4677,7 @@ def draw_forest(s_car, tree_lists, frost_tree_lists, amb_rgb,
       * Per-tree phase from the same deterministic slot hash so
         neighbouring trees don't move in unison.
     """
-    s_start = math.floor(s_car / TREE_SPACING) * TREE_SPACING
-    max_s = s_car + N_SEG * SEG_LEN
-    n_steps = int((max_s - s_start) / TREE_SPACING) + 1
-    nvar = len(tree_lists)
-
+    nvar = len(tree_meshes)
     # Wind terms computed once per frame
     sway_active = wind_strength > 0.02
     if sway_active:
@@ -4194,53 +4698,100 @@ def draw_forest(s_car, tree_lists, frost_tree_lists, amb_rgb,
               min(1.0, amb_rgb[1]),
               min(1.0, amb_rgb[2]))
 
-    for i in range(n_steps):
+    # --- Performance architecture (no visual change) ---
+    # 1. The per-slot DECISION (biome gate, hash rolls, world position)
+    #    is immutable for the run, so it is memoised per slot+side.
+    # 2. Trees within FOREST_ANIM_DIST of the camera draw individually
+    #    with the live wind sway. Beyond that the canopy sway is
+    #    sub-pixel, so 16-slot CHUNKS of far trees are baked into
+    #    display lists once (world-space, replayed with a single
+    #    camera-relative translate) — ~14 GL calls replace thousands.
+    #    Animated sway eases to zero approaching the chunk boundary so
+    #    the hand-off never pops.
+    cut_s = s_car + FOREST_ANIM_DIST
+    chunk_len = FOREST_CHUNK_SLOTS * TREE_SPACING
+    first_chunk = int(math.ceil(cut_s / chunk_len))
+    max_s = s_car + N_SEG * SEG_LEN
+
+    glEnableClientState(GL_VERTEX_ARRAY)
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY)
+
+    # near band: individual trees, animated, drawn from per-variant VBOs
+    s_start = math.floor(s_car / TREE_SPACING) * TREE_SPACING
+    n_near = int((first_chunk * chunk_len - s_start) / TREE_SPACING) + 1
+    for i in range(n_near):
         s = s_start + i * TREE_SPACING
-        if s < s_car - 1.0:
+        if s < s_car - 1.0 or s >= first_chunk * chunk_len:
             continue
+        slot = int(round(s / TREE_SPACING))
         for side in (-1, +1):
-            w = biome_weights_vec(np.array([s], dtype=np.float32), side)[0]
-            fw = float(w[BIOME_FOREST])
-            frw = float(w[BIOME_FROST])
-            tree_density = fw + frw  # trees grow in both
-            if tree_density < 0.28:
+            t_rec = _tree_slot(slot, side, nvar)
+            if t_rec is None:
                 continue
-            key = (int(s * 97) * 2654435761
-                   + (0 if side < 0 else 7919)
-                   + 1013904223) & 0xFFFFFFFF
-            if ((key & 0xFFFF) / 65535.0) > tree_density * 0.95:
-                continue
-            d_edge = 1.2 + ((key >> 16) & 0xFF) / 255.0 * TREE_MAX_PERP
-            variant = ((key >> 24) & 0x07) % nvar
-            yaw = ((key >> 8) & 0xFF) / 255.0 * 360.0
-            scale = 0.78 + ((key >> 4) & 0x0F) / 15.0 * 0.55
-
-            tx = curve_x(s) + side * (ROAD_WIDTH / 2 + d_edge)
-            ty = curve_y(s) - 0.15
-            tz = -(s - s_car)
-
-            use_frost = frw > fw
-            lst = frost_tree_lists[variant] if use_frost else tree_lists[variant]
-
+            tx, ty, s_t, variant, yaw, scale, phase, use_frost = t_rec
+            mesh = tree_meshes[variant]
+            bark_tex, leaf_tex = tex_frost if use_frost else tex_normal
             glPushMatrix()
-            glTranslatef(tx, ty, tz)
+            glTranslatef(tx, ty, -(s_t - s_car))
             glRotatef(yaw, 0, 1, 0)
-
-            # Wind sway — rotate around the tree's base (local origin)
             if sway_active:
-                # Per-tree phase from the same hash, spread across [0, 2π)
-                phase = ((key >> 12) & 0x3FFF) * (2.0 * math.pi / 0x3FFF)
-                sx = lean_deg + amp_deg * math.sin(t_time * omega + phase)
-                sz = amp_deg * 0.6 * math.sin(
-                    t_time * omega * 1.25 + phase + 0.7
-                )
+                # fade sway out toward the static-chunk boundary
+                fade = max(0.0, min(1.0, (cut_s - s_t) / 50.0))
+                sx = (lean_deg + amp_deg * math.sin(t_time * omega
+                                                    + phase)) * fade
+                sz = amp_deg * 0.6 * fade * math.sin(
+                    t_time * omega * 1.25 + phase + 0.7)
                 glRotatef(sx, 1.0, 0.0, 0.0)
                 glRotatef(sz, 0.0, 0.0, 1.0)
-
             glScalef(scale, scale, scale)
-            glCallList(lst)
+            glDisable(GL_ALPHA_TEST)
+            glBindTexture(GL_TEXTURE_2D, bark_tex)
+            _vbo_draw(mesh['bark'])
+            glEnable(GL_ALPHA_TEST)
+            glAlphaFunc(GL_GREATER, 0.25)
+            glBindTexture(GL_TEXTURE_2D, leaf_tex)
+            _vbo_draw(mesh['leaf'])
             glPopMatrix()
 
+    # far band: baked world-space chunk VBOs, two-or-four draws each
+    last_chunk = int(max_s // chunk_len)
+    glPushMatrix()
+    glTranslatef(0.0, 0.0, s_car)
+    for ch in range(first_chunk, last_chunk + 1):
+        vb = _forest_chunk_vbos(ch, tree_meshes, nvar)
+        if vb is None:
+            continue
+        glDisable(GL_ALPHA_TEST)
+        if vb['bn']:
+            glBindTexture(GL_TEXTURE_2D, tex_normal[0])
+            _vbo_draw(vb['bn'])
+        if vb['bf']:
+            glBindTexture(GL_TEXTURE_2D, tex_frost[0])
+            _vbo_draw(vb['bf'])
+        glEnable(GL_ALPHA_TEST)
+        glAlphaFunc(GL_GREATER, 0.25)
+        if vb['ln']:
+            glBindTexture(GL_TEXTURE_2D, tex_normal[1])
+            _vbo_draw(vb['ln'])
+        if vb['lf']:
+            glBindTexture(GL_TEXTURE_2D, tex_frost[1])
+            _vbo_draw(vb['lf'])
+    glPopMatrix()
+    # evict chunk VBOs far outside the active window
+    if len(_FOREST_CHUNKS) > 64:
+        lo = s_car - 400.0
+        hi = s_car + 1400.0
+        for ch in [k for k in _FOREST_CHUNKS
+                   if (k + 1) * chunk_len < lo or k * chunk_len > hi]:
+            vb = _FOREST_CHUNKS.pop(ch)
+            if vb:
+                for part in vb.values():
+                    if part:
+                        glDeleteBuffers(1, [part[0]])
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0)
+    glDisableClientState(GL_VERTEX_ARRAY)
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY)
     glDisable(GL_ALPHA_TEST)
 
 
@@ -4267,7 +4818,8 @@ def draw_snow_shoulders(snow_tex, s_car, amb_rgb):
         for i in range(NS):
             s = s_arr[i]
             a = float(min(1.0, warr[i] * 1.3))
-            x = curve_x(s); y = curve_y(s); z = -(s - s_car)
+            x = curve_x(s); z = -(s - s_car)
+            y = road_y_at(s, side * (ROAD_WIDTH / 2))
             inner = x + side * (ROAD_WIDTH / 2 + 0.02)
             outer = x + side * (ROAD_WIDTH / 2 + SNOW_SHOULDER_W)
             v = s * 0.25
@@ -6337,11 +6889,17 @@ def trap_near(s):
 # Roughly: 20% aggressive / 60% normal / 20% calm, each with per-driver
 # jitter applied in _roll_driver so no two drivers are identical.
 DRIVER_PROFILES = [
-    # (weight, v0_mul, T,    a_max, b,    eager)
-    (0.20,    1.12,   1.15,  1.9,   2.7,  1.5),   # aggressive
-    (0.60,    1.00,   1.50,  1.5,   2.2,  1.0),   # normal
-    (0.20,    0.88,   1.95,  1.2,   1.8,  0.6),   # calm
+    # (weight, v0_mul, T,    a_max, b,    eager, a_lat)
+    (0.20,    1.12,   1.15,  1.9,   2.7,  1.5,   3.2),   # aggressive
+    (0.60,    1.00,   1.50,  1.5,   2.2,  1.0,   2.6),   # normal
+    (0.20,    0.88,   1.95,  1.2,   1.8,  0.6,   2.0),   # calm
 ]
+
+# Lateral-acceleration budget multiplier per vehicle class (plan v2
+# phase 1): heavy/tall vehicles corner gingerly; motorcycles lean and
+# carry more lateral grip through bends.
+VEH_ALAT_MUL = {'car': 1.0, 'van': 0.9, 'truck': 0.62, 'bus': 0.60,
+                'motorcycle': 1.45, 'emergency': 1.2}
 
 # Automotive paint palette — broad spread mirroring real-world colour
 # popularity (reds / blacks / whites / silvers / greys dominate per
@@ -7027,7 +7585,7 @@ def _roll_driver(rng, kind):
         if r <= acc:
             chosen = prof
             break
-    _, v0_mul, T, amax, b, eager = chosen
+    _, v0_mul, T, amax, b, eager, a_lat = chosen
 
     def jit(x, j):
         return x * float(rng.uniform(1.0 - j, 1.0 + j))
@@ -7038,6 +7596,7 @@ def _roll_driver(rng, kind):
         'amax': jit(amax, 0.12) * k['amax_mul'],
         'b': jit(b, 0.10),
         'eager': eager * k['eager_mul'],
+        'alat': jit(a_lat, 0.10) * VEH_ALAT_MUL.get(kind, 1.0),
         'hl_thr': float(rng.uniform(0.04, 0.30)),
         'hl_storm_thr': float(rng.uniform(0.28, 0.48)),
     }
@@ -7161,6 +7720,7 @@ def _respawn_vehicle(c, rng, kind, n_variants, s_car, player_speed,
     c['amax'] = prof['amax']
     c['bcomf'] = prof['b']
     c['eager'] = prof['eager']
+    c['alat'] = prof['alat']
     c['hl_thr'] = prof['hl_thr']
     c['hl_storm_thr'] = prof['hl_storm_thr']
     # Per-car visibility threshold [0, 1]. The car is rendered only when
@@ -7409,10 +7969,30 @@ def update_traffic(states, dt, s_car, player_speed,
             v0_eff = c['v0'] * cond_v
             T_eff = c['T'] * T_mult
 
+            # --- corner speed budget (plan v2 phase 1): cap desired
+            # speed so lateral acceleration through the bend ahead
+            # stays inside this driver's comfort — braking into
+            # corners and accelerating out emerge from the IDM.
+            dirn_c = 1.0 if lane == -1 else -1.0
+            kap = max(abs(road_curv(c['s'] + dirn_c * 25.0)),
+                      abs(road_curv(c['s'] + dirn_c * 55.0)),
+                      abs(road_curv(c['s'] + dirn_c * 90.0)),
+                      abs(road_curv(c['s'] + dirn_c * 130.0)))
+            if kap > 3e-4:
+                a_lat = c.get('alat', 2.6) \
+                    * (1.0 - 0.40 * storm_i) * (1.0 - 0.50 * frost_i)
+                v0_eff = min(v0_eff,
+                             math.sqrt(max(0.4, a_lat) / kap))
+
             # --- emergency runs hot: sirens clear the congestion ---
+            # (but even a code-3 run respects physics through a bend)
             if kind == 'emergency':
                 v0_eff = max(c['v0'] * cond_v, float(player_speed) + 6.0,
                              30.0)
+                if kap > 3e-4:
+                    v0_eff = min(v0_eff,
+                                 math.sqrt(max(0.4, c.get('alat', 3.1))
+                                           / kap))
 
             # --- yield to an active emergency vehicle approaching from
             # behind: pull to the outer lane and ease off the gas ---
@@ -7772,9 +8352,11 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
         if s < s_car - 15.0 or s > s_car + N_SEG * SEG_LEN:
             continue
         cx = curve_x(s)
-        cy = curve_y(s)
-        cz = -(s - s_car)
         lane_sign = c['lane']  # -1 = left of player, +1 = right
+        # Superelevation: sit ON the banked surface at this lateral
+        # offset, and roll the body with the bank below.
+        cy = road_y_at(s, lane_sign * c['off'])
+        cz = -(s - s_car)
         cx += lane_sign * c['off']
         # Storm-gust lateral buffeting: tall/light vehicles wander a few
         # centimetres in heavy wind (Phase 3.5). Visual only — the IDM
@@ -7798,6 +8380,12 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
         glPushMatrix()
         glTranslatef(cx, cy, cz)
         glRotatef(yaw_deg, 0.0, 1.0, 0.0)
+        # Bank roll: align the body with the superelevated surface
+        # (positive local-x roll tips toward the vehicle's right).
+        bank = road_roll(s)
+        if abs(bank) > 0.004:
+            glRotatef(-lane_sign * math.degrees(math.atan(bank)),
+                      1.0, 0.0, 0.0)
         if kind == 'motorcycle':
             # Lean into the curve: roll = atan(v²·κ / g), where κ is the
             # path curvature; positive local-x roll tips toward the
@@ -7886,7 +8474,7 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
         if head_i < 0.02 and tail_i < 0.02 and not c.get('bd_phase'):
             continue
         cx = curve_x(s)
-        cy = curve_y(s)
+        cy = road_y_at(s, c['lane'] * c['off'])
         cz = -(s - s_car)
         cx += c['lane'] * c['off']
         ds = 0.5
@@ -9231,7 +9819,7 @@ def draw_pedestrians(s_car, ped_lists, umb_lists, amb_rgb, night_a,
                 yaw = ((kk >> 4) & 0xFF) / 255.0 * 360.0
                 phase = ((kk >> 20) & 0x3FF) * 0.006
                 tx = curve_x(s) + side * (d_base + jd)
-                ty = curve_y(s) - 0.20      # city pavement datum
+                ty = road_y_at(s, side * (d_base + jd)) - 0.20
                 tz = -(s - s_car) + jx
                 glPushMatrix()
                 glTranslatef(tx, ty, tz)
@@ -9484,11 +10072,10 @@ def draw_lamp_moths(s_car, night_a, t_time):
             continue
         fade = max(0.0, 1.0 - d / 130.0) * night_a
         x = curve_x(s)
-        y = curve_y(s)
         z = -d
         for side in (-1, 1):
             px = x + side * (ROAD_WIDTH / 2 + 0.6) - side * 1.0
-            py = y + 3.15
+            py = road_y_at(s, side * (ROAD_WIDTH / 2 + 0.6)) + 3.15
             for k in range(5):
                 r = 0.18 + 0.06 * ((k * 37 + int(s)) % 5)
                 ang = t_time * (1.5 + 0.45 * k) + k * 2.1 + s * 0.13
@@ -9588,6 +10175,18 @@ def make_sign_face(kind, w=96, h=96):
             else:            # "0": one hole
                 fill(hole & (yy >= cy - 13) & (yy < cy + 13),
                      (0.95, 0.95, 0.95))
+    elif kind in ('chev_l', 'chev_r'):
+        # Sharp-bend chevron board: black on warning yellow, three
+        # arrows pointing through the corner.
+        panel = (xx >= 2) & (xx < w - 2) & (yy >= 30) & (yy < h - 30)
+        fill(panel, (0.95, 0.72, 0.04))
+        dirn = -1 if kind == 'chev_l' else 1
+        for cx0 in (20, 48, 76):
+            ax = cx0 if dirn > 0 else w - cx0
+            arm = (np.abs((yy - cy)) <= (xx - ax) * dirn + 8) \
+                & ((xx - ax) * dirn >= -8) & ((xx - ax) * dirn <= 8) \
+                & (np.abs(yy - cy) <= 14)
+            fill(arm, (0.05, 0.05, 0.05))
     elif kind == 'city':
         panel = (xx >= 4) & (xx < w - 4) & (yy >= 26) & (yy < h - 26)
         fill(panel, (0.05, 0.35, 0.16))
@@ -9675,7 +10274,8 @@ def build_phase4_props():
     glEndList()
     P['pole'] = lid
     # Sign panels: textured quads, double-sided, no baked colour.
-    for kind in ('curve_l', 'curve_r', 'speed', 'city'):
+    for kind in ('curve_l', 'curve_r', 'speed', 'city',
+                 'chev_l', 'chev_r'):
         tex = upload_texture(make_sign_face(kind),
                              internal=GL_RGBA, src=GL_RGBA)
         lid = glGenLists(1)
@@ -9881,23 +10481,32 @@ def _ground_y(s, side, d, w_b, t_time):
 
 
 def draw_guardrails(s_car, amb_rgb):
-    """Steel W-beam barriers where the terrain actually drops away:
-    mountain ledges and river banks."""
+    """Steel W-beam barriers where the terrain actually drops away
+    (mountain ledges, river banks) AND along the outside of sharp
+    corners — centripetal logic: rail wherever a design-speed vehicle
+    leaving the bend would leave the road (plan v2 phase 1)."""
     NS = 90
     s_arr = (np.arange(NS, dtype=np.float32) * 4.0) + s_car
     wL = biome_weights_vec(s_arr, -1)
     wR = biome_weights_vec(s_arr, +1)
+    curv = np.array([road_curv(float(sv)) for sv in s_arr],
+                    dtype=np.float32)
     glDisable(GL_TEXTURE_2D)
     rail = (min(1.0, amb_rgb[0] * 0.80), min(1.0, amb_rgb[1] * 0.82),
             min(1.0, amb_rgb[2] * 0.86))
     post = (amb_rgb[0] * 0.35, amb_rgb[1] * 0.35, amb_rgb[2] * 0.38)
     for side, w in ((-1, wL), (+1, wR)):
-        drop = w[:, BIOME_MOUNTAIN] + w[:, BIOME_RIVER]
+        # outside of a bend toward +x is the -x side: side*curv < 0
+        corner_need = np.clip(
+            np.where(curv * side < 0.0, np.abs(curv), 0.0)
+            * V_DESIGN * V_DESIGN / 2.2 - 0.55, 0.0, 1.0)
+        drop = np.maximum(w[:, BIOME_MOUNTAIN] + w[:, BIOME_RIVER],
+                          corner_need)
 
         def emit(i, alpha, side=side):
             s = float(s_arr[i])
             x = curve_x(s) + side * (ROAD_WIDTH / 2 + 0.45)
-            y = curve_y(s)
+            y = road_y_at(s, side * (ROAD_WIDTH / 2 + 0.45))
             z = -(s - s_car)
             glColor4f(rail[0], rail[1], rail[2], alpha)
             glVertex3f(x, y + 0.50, z)
@@ -9914,7 +10523,7 @@ def draw_guardrails(s_car, amb_rgb):
                 continue
             s = float(s_arr[i])
             x = curve_x(s) + side * (ROAD_WIDTH / 2 + 0.45)
-            y = curve_y(s)
+            y = road_y_at(s, side * (ROAD_WIDTH / 2 + 0.45))
             z = -(s - s_car)
             glVertex3f(x - 0.05, y, z + 0.05)
             glVertex3f(x + 0.05, y, z - 0.05)
@@ -9961,7 +10570,7 @@ def draw_road_signs(s_car, P, amb_rgb, night_a):
         if panel is None:
             continue
         x = curve_x(s) + (ROAD_WIDTH / 2 + 1.3)
-        y = curve_y(s)
+        y = road_y_at(s, ROAD_WIDTH / 2 + 1.3)
         z = -d
         retro = night_a * max(0.0, min(1.0, (90.0 - d) / 70.0))
         glPushMatrix()
@@ -9974,12 +10583,37 @@ def draw_road_signs(s_car, P, amb_rgb, night_a):
                   min(1.0, amb_rgb[2] * (1.0 + 1.6 * retro)))
         glCallList(P[panel])
         glPopMatrix()
+    # Chevron boards through sharp apexes (plan v2 phase 1): on the
+    # OUTSIDE of the bend, every 50 m while the curvature stays high.
+    s0c = math.ceil((s_car + 15.0) / 40.0) * 40.0
+    for i in range(11):
+        s = s0c + i * 40.0
+        kap_s = road_curv(s)
+        if abs(kap_s) < 0.0045:
+            continue
+        side_out = -1 if kap_s > 0.0 else +1
+        x_off = side_out * (ROAD_WIDTH / 2 + 1.1)
+        d = s - s_car
+        retro = night_a * max(0.0, min(1.0, (90.0 - d) / 70.0))
+        glPushMatrix()
+        glTranslatef(curve_x(s) + x_off, road_y_at(s, x_off), -d)
+        glRotatef(_road_yaw_deg(s) + 90.0, 0, 1, 0)
+        glColor3f(*pole_col)
+        glCallList(P['pole'])
+        glColor3f(min(1.0, amb_rgb[0] * (1.0 + 1.8 * retro)),
+                  min(1.0, amb_rgb[1] * (1.0 + 1.8 * retro)),
+                  min(1.0, amb_rgb[2] * (1.0 + 1.6 * retro)))
+        # arrows point INTO the bend (away from the outside)
+        glCallList(P['panel_chev_l' if side_out == +1
+                     else 'panel_chev_r'])
+        glPopMatrix()
     # km markers every 500 m.
     s_km = math.ceil(s_car / 500.0) * 500.0
     if s_km - s_car < 400.0:
         x = curve_x(s_km) + (ROAD_WIDTH / 2 + 1.0)
         glPushMatrix()
-        glTranslatef(x, curve_y(s_km), -(s_km - s_car))
+        glTranslatef(x, road_y_at(s_km, ROAD_WIDTH / 2 + 1.0),
+                     -(s_km - s_car))
         glRotatef(_road_yaw_deg(s_km) + 90.0, 0, 1, 0)
         glColor3f(min(1.0, amb_rgb[0]), min(1.0, amb_rgb[1]),
                   min(1.0, amb_rgb[2]))
@@ -10088,7 +10722,8 @@ def draw_billboards_shelters(s_car, P, amb_rgb, night_a, t_time):
                 continue
             x = curve_x(s) + side * (ROAD_WIDTH / 2 + 1.6)
             glPushMatrix()
-            glTranslatef(x, curve_y(s) - 0.18, -(s - s_car))
+            glTranslatef(x, road_y_at(s, side * (ROAD_WIDTH / 2 + 1.6))
+                         - 0.18, -(s - s_car))
             glRotatef(_road_yaw_deg(s) + (270.0 if side < 0 else 90.0),
                       0, 1, 0)
             glColor3f(amb_rgb[0] * 0.62, amb_rgb[1] * 0.63,
@@ -10424,16 +11059,16 @@ def draw_roadworks(s_car, P6, amb_rgb, sun_d, night_a, t_time):
         t_frac = min(1.0, i / max(1, n_taper))
         x_off = x_from + (x_to - x_from) * t_frac
         glPushMatrix()
-        glTranslatef(curve_x(s) + sgn * x_off, curve_y(s),
-                     -(s - s_car))
+        glTranslatef(curve_x(s) + sgn * x_off,
+                     road_y_at(s, sgn * x_off), -(s - s_car))
         glCallList(P6['cone'])
         glPopMatrix()
     # arrow board just before the taper, in the closed lane
     s_ab = ent - dirn * 10.0
     ab_x = x_from if rw['sub'] == 1 else ROAD_WIDTH / 2 - 1.2
     glPushMatrix()
-    glTranslatef(curve_x(s_ab) + sgn * ab_x, curve_y(s_ab),
-                 -(s_ab - s_car))
+    glTranslatef(curve_x(s_ab) + sgn * ab_x,
+                 road_y_at(s_ab, sgn * ab_x), -(s_ab - s_car))
     glRotatef(_road_yaw_deg(s_ab) + (90.0 if sgn < 0 else -90.0),
               0, 1, 0)
     glCallList(P6['arrow_stand'])
@@ -10447,7 +11082,7 @@ def draw_roadworks(s_car, P6, amb_rgb, sun_d, night_a, t_time):
         glBlendFunc(GL_SRC_ALPHA, GL_ONE)
         glDepthMask(GL_FALSE)
         bx = curve_x(s_ab) + sgn * ab_x
-        by = curve_y(s_ab) + 1.75
+        by = road_y_at(s_ab, sgn * ab_x) + 1.75
         bz = -(s_ab - s_car)
         ds = 1.0
         dxds = (curve_x(s_ab + ds) - curve_x(s_ab - ds)) / (2.0 * ds)
@@ -10518,7 +11153,8 @@ def draw_speed_trap(s_car, emerg_variants, amb_rgb, sun_d):
     s = trap['s']
     _prop_light_begin(amb_rgb, sun_d)
     glPushMatrix()
-    glTranslatef(curve_x(s) - (ROAD_WIDTH / 2 + 1.7), curve_y(s), -d)
+    glTranslatef(curve_x(s) - (ROAD_WIDTH / 2 + 1.7),
+                 road_y_at(s, -(ROAD_WIDTH / 2 + 1.7)), -d)
     glRotatef(_road_yaw_deg(s) + 6.0, 0, 1, 0)
     glCallList(v['list'])
     glPopMatrix()
@@ -10587,16 +11223,12 @@ CINEMATIC_CFG = {
 }
 
 
-def _cinematic_post_process(W, H, cfg=CINEMATIC_CFG):
-    """Read the back buffer, apply the cinematic grade, and write it
-    back. Call right before pygame.display.flip()."""
-    # Read. BGRA would be faster on some drivers, but RGB/ubyte is the
-    # conservative fixed-function choice.
-    raw = glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE)
-    img = np.frombuffer(raw, dtype=np.uint8).reshape(H, W, 3).astype(np.float32) / 255.0
-
+def _grade_colors(x, cfg):
+    """The colour-only part of the cinematic grade (steps 1-6) on a
+    float32 (..., 3) array in [0, 1]. Shared verbatim by the direct
+    path and the LUT builder so they are mathematically identical."""
     # 1. Exposure
-    x = img * cfg["exposure"]
+    x = x * cfg["exposure"]
 
     # 2. ACES fitted (Narkowicz 2015). Applied per channel in linear-ish
     # space. This squashes highlights and gives the image filmic roll-off.
@@ -10638,6 +11270,65 @@ def _cinematic_post_process(W, H, cfg=CINEMATIC_CFG):
     if abs(sat - 1.0) > 1e-3:
         gray = (x[..., 0] * 0.2126 + x[..., 1] * 0.7152 + x[..., 2] * 0.0722)[..., None]
         x = np.clip(gray + (x - gray) * sat, 0.0, 1.0)
+    return x
+
+
+# 256³ → RGB lookup table for the grade. The colour chain above is a
+# pure function of the 8-bit input pixel, so a full-resolution LUT
+# reproduces it BIT-EXACTLY while turning ~25 full-frame float ops into
+# one integer gather per pixel. Built once (in slabs to bound memory)
+# and cached on disk keyed by the grade parameters.
+_GRADE_LUT = None
+
+
+def _get_grade_lut(cfg=CINEMATIC_CFG):
+    global _GRADE_LUT
+    if _GRADE_LUT is not None:
+        return _GRADE_LUT
+    import hashlib
+    key = hashlib.sha1(repr(sorted(cfg.items())).encode()).hexdigest()[:12]
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        ".grade_lut_%s.npy" % key)
+    try:
+        _GRADE_LUT = np.load(path)
+        if _GRADE_LUT.shape == (256, 256, 256, 3):
+            return _GRADE_LUT
+    except Exception:
+        pass
+    lut = np.empty((256, 256, 256, 3), dtype=np.uint8)
+    gb = np.empty((8, 256, 256, 3), dtype=np.float32)
+    g = np.arange(256, dtype=np.float32)[:, None] / 255.0
+    b = np.arange(256, dtype=np.float32)[None, :] / 255.0
+    gb[..., 1] = g[None, :, :]
+    gb[..., 2] = b[None, :, :]
+    for r0 in range(0, 256, 8):
+        for k in range(8):
+            gb[k, ..., 0] = (r0 + k) / 255.0
+        graded = _grade_colors(gb, cfg)
+        lut[r0:r0 + 8] = np.clip(graded * 255.0 + 0.5, 0.0,
+                                 255.0).astype(np.uint8)
+    try:
+        np.save(path, lut)
+    except Exception:
+        pass
+    _GRADE_LUT = lut
+    return lut
+
+
+def _cinematic_post_process(W, H, cfg=CINEMATIC_CFG):
+    """Read the back buffer, apply the cinematic grade, and write it
+    back. Call right before pygame.display.flip().
+
+    Performance path: the colour grade runs through the precomputed
+    256³ LUT (bit-exact vs the float chain, ±0 LSB); the vignette mask
+    applies in 16-bit fixed point (±1 LSB at the darkened edges); and
+    the writeback uses a texture + fullscreen quad instead of
+    glDrawPixels, which the GL-on-Metal driver handles far faster."""
+    raw = glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE)
+    img = np.frombuffer(raw, dtype=np.uint8).reshape(H, W, 3)
+
+    lut = _get_grade_lut(cfg)
+    x = lut[img[..., 0], img[..., 1], img[..., 2]]
 
     # 7. Vignette. Precompute a cached radial mask on first call.
     vkey = (W, H, cfg["vignette_strength"], cfg["vignette_inner"], cfg["vignette_outer"])
@@ -10652,17 +11343,34 @@ def _cinematic_post_process(W, H, cfg=CINEMATIC_CFG):
         inn = cfg["vignette_inner"]; out_ = cfg["vignette_outer"]
         t = np.clip((rn - inn) / max(1e-4, out_ - inn), 0.0, 1.0)
         t = t * t * (3.0 - 2.0 * t)
-        mask = (1.0 - cfg["vignette_strength"] * t).astype(np.float32)
+        # 16-bit fixed-point mask (×256) — applied to the uint8 LUT
+        # output with rounding; differs from the float path by at most
+        # one 8-bit step, only where the vignette darkens.
+        mask = np.round((1.0 - cfg["vignette_strength"] * t)
+                        * 256.0).astype(np.uint16)
         # Cap cache size so long interactive sessions don't leak.
         if len(cache) > 4:
             cache.clear()
         cache[vkey] = mask
-    x = x * mask[..., None]
+    out = ((x.astype(np.uint16) * mask[..., None] + 128) >> 8
+           ).astype(np.uint8)
 
-    # Final 8-bit encode and write back.
-    out = (np.clip(x, 0.0, 1.0) * 255.0).astype(np.uint8)
-    # glDrawPixels writes at the current raster pos. Reset projection to
-    # identity pixel space so (0,0) is bottom-left and pixels land 1:1.
+    # Write back via a streaming texture + fullscreen quad (the
+    # GL-on-Metal driver runs glDrawPixels on a slow path).
+    tcache = _cinematic_post_process.__dict__.setdefault("_tcache", {})
+    tex = tcache.get((W, H))
+    if tex is None:
+        tex = int(glGenTextures(1))
+        glBindTexture(GL_TEXTURE_2D, tex)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, W, H, 0,
+                     GL_RGB, GL_UNSIGNED_BYTE, None)
+        tcache[(W, H)] = tex
+    glBindTexture(GL_TEXTURE_2D, tex)
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H,
+                    GL_RGB, GL_UNSIGNED_BYTE, out)
+
     glMatrixMode(GL_PROJECTION)
     glPushMatrix()
     glLoadIdentity()
@@ -10673,10 +11381,18 @@ def _cinematic_post_process(W, H, cfg=CINEMATIC_CFG):
     glDisable(GL_DEPTH_TEST)
     glDisable(GL_BLEND)
     glDisable(GL_FOG)
-    glDisable(GL_TEXTURE_2D)
     glDisable(GL_LIGHTING)
-    glRasterPos2i(0, 0)
-    glDrawPixels(W, H, GL_RGB, GL_UNSIGNED_BYTE, out.tobytes())
+    glEnable(GL_TEXTURE_2D)
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE)
+    glColor3f(1.0, 1.0, 1.0)
+    glBegin(GL_QUADS)
+    glTexCoord2f(0, 0); glVertex2f(0, 0)
+    glTexCoord2f(1, 0); glVertex2f(W, 0)
+    glTexCoord2f(1, 1); glVertex2f(W, H)
+    glTexCoord2f(0, 1); glVertex2f(0, H)
+    glEnd()
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    glDisable(GL_TEXTURE_2D)
     glPopMatrix()
     glMatrixMode(GL_PROJECTION)
     glPopMatrix()
@@ -10857,8 +11573,12 @@ def main(argv=None):
     snow_bark_tex = upload_texture(make_snow_bark_texture(bark_rgb))
     leaf_tex = upload_texture(make_leaf_texture(), internal=GL_RGBA, src=GL_RGBA)
     snow_leaf_tex = upload_texture(make_snow_leaf_texture(), internal=GL_RGBA, src=GL_RGBA)
-    tree_lists = build_tree_variants(bark_tex, leaf_tex)
-    frost_tree_lists = build_tree_variants(snow_bark_tex, snow_leaf_tex)
+    # Tree geometry as static VBOs (shared between the normal and frost
+    # sets — only the textures differ). Display-list trees remain only
+    # for the standalone viewer.
+    tree_meshes = build_tree_meshes()
+    tree_tex_normal = (bark_tex, leaf_tex)
+    tree_tex_frost = (snow_bark_tex, snow_leaf_tex)
     snow_ground_tex = upload_texture(load_texture_file("textures/Snow001_1K-JPG_Color.jpg"))
     snowflake_tex = upload_texture(make_snowflake_texture(), internal=GL_RGBA, src=GL_RGBA)
     snow_state = init_snow()
@@ -11070,6 +11790,7 @@ def main(argv=None):
     t_day = (args.time / 24.0) % 1.0 if args.time is not None else 0.18
     speed = SPEED
     camera_yaw = 0.0    # degrees; + rotates view right, - rotates left
+    cam_roll = 0.0      # smoothed camera lean into banked corners
     manual_strike_queued = False
     manual_ca_queued = False
     running = True
@@ -11274,7 +11995,13 @@ def main(argv=None):
             lx = cx + rx
             lz = cz + rz
 
-        gluLookAt(cx, cy, cz, lx, ly, lz, 0.0, 1.0, 0.0)
+        # Camera lean (plan v2 phase 1): tilt the up-vector with the
+        # local superelevation, damped and time-smoothed so banked
+        # sweeps feel carved rather than jarring.
+        cam_roll_t = math.atan(road_roll(s_cam)) * 0.55
+        cam_roll += (cam_roll_t - cam_roll) * min(1.0, dt / 0.45)
+        gluLookAt(cx, cy, cz, lx, ly, lz,
+                  math.sin(cam_roll), math.cos(cam_roll), 0.0)
 
         # Try to trigger a new bolt now that we have the camera position.
         # Strikes are deliberately rare: poll once per second, low success
@@ -11487,8 +12214,8 @@ def main(argv=None):
         flora_amb = (min(1.0, amb[0] * (1.0 + 0.10 * dry_season)),
                      amb[1] * (1.0 - 0.10 * dry_season),
                      amb[2] * (1.0 - 0.30 * dry_season))
-        draw_forest(s_car, tree_lists, frost_tree_lists, flora_amb,
-                    t_time, wind_strength)
+        draw_forest(s_car, tree_meshes, tree_tex_normal, tree_tex_frost,
+                    flora_amb, t_time, wind_strength)
         # Rural houses: farther than trees, closer than city skyscrapers.
         # Snow accumulates on roofs during frost biome, melts off when
         # the biome transitions back to plain/forest. Windows follow a
