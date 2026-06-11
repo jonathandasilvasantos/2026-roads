@@ -238,7 +238,24 @@ def biome_at(zone_idx, side):
     key_r = (zone_idx * 2654435761 + 9277) & 0xFFFFFFFF
     bl = key_l % BIOME_COUNT
     br = key_r % BIOME_COUNT
+    # Seasonal frost gating, anchored to the ZONE's position on the
+    # distance-based season cycle (never the camera) so a zone's biome
+    # is immutable — no terrain popping as time passes. Frost zones are
+    # rare in summer, common in deep winter; deep winter also upgrades
+    # the occasional plain zone to frost.
+    wint = winter_weight(season_phase_at(zone_idx * ZONE_LEN))
     if bl == BIOME_FROST or br == BIOME_FROST:
+        if ((key_l >> 9) & 0xFF) / 255.0 < (0.06 + 0.94 * wint):
+            return BIOME_FROST
+        # Melted out this season: re-roll each side without frost.
+        if bl == BIOME_FROST:
+            bl = (key_l >> 16) % BIOME_COUNT
+            bl = BIOME_PLAIN if bl == BIOME_FROST else bl
+        if br == BIOME_FROST:
+            br = (key_r >> 16) % BIOME_COUNT
+            br = BIOME_PLAIN if br == BIOME_FROST else br
+    elif (wint > 0.70 and (bl == BIOME_PLAIN or br == BIOME_PLAIN)
+            and ((key_l >> 20) & 0xFF) / 255.0 < (wint - 0.70) * 1.2):
         return BIOME_FROST
     return bl if side < 0 else br
 
@@ -333,11 +350,54 @@ def terrain_heights(s, d, t_time):
 
 # --- Day/Night model ---
 # t_day in [0, 1): 0=midnight, 0.25=sunrise, 0.5=noon, 0.75=sunset
+# --- Shared environment state (Phase 3) ----------------------------------
+# Written once per frame by the main loop (view.py and tests leave the
+# defaults), read by the day/night model, biome zoning, terrain snow and
+# particle systems — so weather, season, moon and wind stay coherent
+# across every subsystem without threading ten extra parameters through
+# long-stable signatures.
+ENV = {
+    'winter': 0.0,        # 0 = midsummer .. 1 = deep winter (SP, southern)
+    'season_off': 0.0,    # CLI season phase offset [0,1)
+    'moon_phase': 0.5,    # 0 = new .. 0.5 = full .. 1 = new again
+    'wind_dir': 0.8,      # radians; world-XZ heading the wind blows toward
+    'wind_speed': 2.5,    # m/s
+    'wetness': 0.0,       # wet-road memory 0..1
+}
+
+# Seasons are anchored to *distance*, not wall-clock: the world ahead was
+# "generated in the season you reach it", so a zone's biome never flips
+# under the camera (no terrain popping) and driving the endless road is
+# also a drive through the year. One full year every YEAR_DIST metres
+# (~14 minutes at cruise speed).
+YEAR_DIST = 24000.0
+MOON_PERIOD_DAYS = 4.0   # moon phase cycle in day-cycles
+
+
+def season_phase_at(s):
+    """0..1 around the year at road position s (0 = midsummer)."""
+    return (s / YEAR_DIST + ENV['season_off']) % 1.0
+
+
+def winter_weight(phase):
+    """0 at midsummer (phase 0), 1 at midwinter (phase 0.5)."""
+    return 0.5 - 0.5 * math.cos(2.0 * math.pi * phase)
+
+
+def moon_fullness():
+    """0 new moon .. 1 full moon, from the shared phase state."""
+    return 0.5 - 0.5 * math.cos(2.0 * math.pi * ENV['moon_phase'])
+
+
 def sun_dir_at(t_day):
     angle = 2 * math.pi * (t_day - 0.25)  # 0 rad at sunrise
-    # Base arc in the X-Y plane; slight tilt on Z so sun traces a real arc
+    # Base arc in the X-Y plane; slight tilt on Z so sun traces a real arc.
+    # Winter (ENV['winter']) flattens and lowers the arc — the sun rises
+    # later, climbs less, and sets earlier, so day length shortens
+    # automatically through the elevation-driven ambient/night factors.
+    w = ENV['winter']
     x = math.cos(angle)
-    y = math.sin(angle)
+    y = math.sin(angle) * (1.0 - 0.18 * w) - 0.22 * w
     z = -0.18 * math.cos(angle)
     v = np.array([x, y, z], dtype=np.float32)
     return v / (np.linalg.norm(v) + 1e-9)
@@ -440,7 +500,10 @@ def ambient_at(t_day, storm=0.0, flash=0.0):
     """Returns (brightness scalar, RGB tint) affecting terrain/road."""
     el = sun_dir_at(t_day)[1]
     day = _smooth((el + 0.15) / 0.50)
-    bright = 0.22 + 0.78 * day
+    # Night floor scales with the moon: full-moon nights are visibly
+    # brighter than new-moon nights.
+    night_floor = 0.22 * (0.80 + 0.40 * moon_fullness())
+    bright = night_floor + (1.0 - night_floor) * day
     warm = _smooth(1.0 - abs(el) / 0.25) * (1.0 if el > -0.25 else 0.0)
     cold = _smooth((-el - 0.10) / 0.60)
     r = 1.0 + 0.20 * warm - 0.25 * cold
@@ -631,6 +694,108 @@ def storm_intensity_at(t_time):
     return x * x * (3.0 - 2.0 * x)
 
 
+# --- Weather lifecycle (Phase 3.1) ----------------------------------------
+# The triple-sine storm_intensity_at above is kept as a legacy forcing
+# reference, but live weather now runs through a Markov-ish state machine:
+# storms are EVENTS with a visible build-up and decay, not a value that
+# drifts. Humidity carries between events (a rain dumps it; clear air
+# slowly recharges it, faster in summer), and the chance of a front
+# forming peaks in the late afternoon (SP convective pattern) and in
+# summer.
+WEATHER_CLEAR = 0
+WEATHER_CLOUDING = 1
+WEATHER_OVERCAST = 2
+WEATHER_RAIN = 3
+WEATHER_CLEARING = 4
+WEATHER_NAMES = ['clear', 'clouding', 'overcast', 'rain', 'clearing']
+
+# Output levels per state. Values below RAIN_ONSET darken the sky
+# without precipitation (see rain_intensity_from); the RAIN state pushes
+# past it up to its rolled peak.
+WEATHER_TARGETS = {
+    WEATHER_CLEAR: 0.0,
+    WEATHER_CLOUDING: 0.28,
+    WEATHER_OVERCAST: 0.38,
+    WEATHER_CLEARING: 0.12,
+}
+RAIN_ONSET = 0.30   # storm level where actual precipitation begins
+
+# CLI pins for --weather: each named state's steady output level.
+WEATHER_PIN = {
+    'clear': 0.0,
+    'clouding': 0.28,
+    'overcast': 0.38,
+    'rain': 0.65,
+    'storm': 0.95,
+}
+
+
+def rain_intensity_from(storm_level):
+    """Precipitation 0..1 from the unified storm level: nothing through
+    the clouding/overcast band, ramping once the cell actually opens."""
+    return max(0.0, (storm_level - RAIN_ONSET) / (1.0 - RAIN_ONSET))
+
+
+class WeatherSystem:
+    def __init__(self, seed=515):
+        self.rng = np.random.default_rng(seed)
+        self.state = WEATHER_CLEAR
+        self.t_left = float(self.rng.uniform(40.0, 160.0))
+        self.humidity = 0.55
+        self.peak = 0.0      # rolled intensity of the current rain event
+        self.level = 0.0     # smoothed output (this is storm_i)
+
+    def update(self, dt, t_day, summer_w=0.5):
+        if self.state in (WEATHER_CLEAR, WEATHER_CLOUDING):
+            self.humidity = min(1.0, self.humidity
+                                + dt * (0.0012 + 0.0018 * summer_w))
+        self.t_left -= dt
+        if self.t_left <= 0.0:
+            self._transition(t_day, summer_w)
+        target = (self.peak if self.state == WEATHER_RAIN
+                  else WEATHER_TARGETS[self.state])
+        # Fronts build a little slower than they clear.
+        tau = 25.0 if self.state in (WEATHER_CLOUDING,
+                                     WEATHER_OVERCAST) else 16.0
+        self.level += (target - self.level) * min(1.0, dt / tau)
+        return self.level
+
+    def _transition(self, t_day, summer_w):
+        rng = self.rng
+        if self.state == WEATHER_CLEAR:
+            # Convective trigger: humidity charges the gun, the
+            # afternoon heating window and summer pull the trigger.
+            hour = (t_day % 1.0) * 24.0
+            conv = math.exp(-((hour - 16.5) ** 2) / (2.0 * 3.5 ** 2))
+            p = (0.18 + 0.50 * self.humidity) \
+                * (0.40 + 0.60 * conv) * (0.55 + 0.75 * summer_w)
+            if rng.random() < p:
+                self.state = WEATHER_CLOUDING
+                self.t_left = float(rng.uniform(35.0, 80.0))
+            else:
+                self.t_left = float(rng.uniform(45.0, 170.0))
+        elif self.state == WEATHER_CLOUDING:
+            self.state = WEATHER_OVERCAST
+            self.t_left = float(rng.uniform(20.0, 55.0))
+        elif self.state == WEATHER_OVERCAST:
+            if rng.random() < 0.80:
+                self.state = WEATHER_RAIN
+                self.peak = min(1.0, (0.45 + 0.55 * self.humidity)
+                                * float(rng.uniform(0.65, 1.10)))
+                self.t_left = float(rng.uniform(45.0, 150.0))
+            else:
+                # Dry front — the deck drifts apart without opening.
+                self.state = WEATHER_CLEARING
+                self.t_left = float(rng.uniform(30.0, 70.0))
+        elif self.state == WEATHER_RAIN:
+            self.humidity = max(0.15, self.humidity - 0.35)
+            self.state = WEATHER_CLEARING
+            self.t_left = float(rng.uniform(30.0, 70.0))
+        else:  # CLEARING
+            self.state = WEATHER_CLEAR
+            self.t_left = float(rng.uniform(60.0, 280.0))
+
+
 def init_rain(seed=91):
     rng = np.random.default_rng(seed)
     pos = np.zeros((RAIN_N, 3), dtype=np.float32)
@@ -638,14 +803,18 @@ def init_rain(seed=91):
     pos[:, 1] = rng.uniform(RAIN_Y_BOTTOM, RAIN_Y_TOP, RAIN_N)
     pos[:, 2] = rng.uniform(-RAIN_BOX_Z, RAIN_BOX_Z * 0.25, RAIN_N)
     vel = np.zeros((RAIN_N, 3), dtype=np.float32)
-    vel[:, 0] = 2.2 + rng.uniform(-0.8, 0.8, RAIN_N)   # wind drift on X
+    # Per-drop X jitter; the shared wind adds on top each update so the
+    # streak slant follows the live wind vector (Phase 3.5).
+    jx = rng.uniform(-0.8, 0.8, RAIN_N).astype(np.float32)
+    vel[:, 0] = jx + 2.2
     vel[:, 1] = rng.uniform(-25.0, -17.0, RAIN_N)       # hard fall
     vel[:, 2] = rng.uniform(-0.6, 0.6, RAIN_N)
-    return pos, vel
+    return pos, vel, jx
 
 
-def update_rain(state, dt):
-    pos, vel = state
+def update_rain(state, dt, wind_x=2.2):
+    pos, vel, jx = state
+    vel[:, 0] = jx + wind_x      # streak tails read the same vector
     pos += vel * dt
     below = pos[:, 1] < RAIN_Y_BOTTOM
     outX = np.abs(pos[:, 0]) > RAIN_BOX_X
@@ -665,7 +834,7 @@ def draw_rain(state, intensity, cam_x, cam_y, cam_z):
     streak matches the motion, length approximates motion blur."""
     if intensity < 0.04:
         return
-    pos, vel = state
+    pos, vel = state[0], state[1]
     # streak ends: tail trails behind the head by streak_dt of motion
     tails = pos - vel * RAIN_STREAK_DT
     lines = np.empty((RAIN_N * 2, 3), dtype=np.float32)
@@ -1922,6 +2091,35 @@ def draw_ponds(pond_tex, s_car, storm_i, horizon_rgb, amb_rgb, t_time):
     glDisable(GL_BLEND)
 
 
+def draw_shooting_star(star, cam_x, cam_y, cam_z):
+    """One meteor streak on the dome: an additive line from the head
+    back along the velocity, brightness enveloped over its short life."""
+    a = math.sin(math.pi * min(1.0, star['age'] / star['life']))
+    if a <= 0.01:
+        return
+    px, py, pz = star['p']
+    vx, vy, vz = star['v']
+    glDisable(GL_TEXTURE_2D)
+    glDisable(GL_FOG)
+    glDisable(GL_DEPTH_TEST)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+    glDepthMask(GL_FALSE)
+    glLineWidth(1.8)
+    glBegin(GL_LINES)
+    glColor4f(1.0, 0.98, 0.92, 0.95 * a)
+    glVertex3f(cam_x + px, cam_y + py, cam_z + pz)
+    glColor4f(0.6, 0.7, 1.0, 0.0)
+    glVertex3f(cam_x + px - vx * 0.14,
+               cam_y + py - vy * 0.14,
+               cam_z + pz - vz * 0.14)
+    glEnd()
+    glDepthMask(GL_TRUE)
+    glDisable(GL_BLEND)
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_FOG)
+
+
 def generate_bolt(rng, cam_x, cam_y, cam_z):
     """Classic storm bolt via recursive midpoint displacement (Reed &
     Wyvill 1986). Horizontal displacement decays geometrically per
@@ -2544,7 +2742,7 @@ def compute_dome_colors(vfrac, zenith, horizon):
 
 
 def draw_sky(sky_state, cam_x, cam_y, cam_z, t_time, t_day,
-             storm=0.0, flash=0.0):
+             storm=0.0, flash=0.0, cloud_phase=None):
     # sky_state can optionally include a 7th element (overcast_tex) for
     # the dense storm cloud layer. Older callers that pass only 6 still
     # work — we just skip the overcast pass.
@@ -2586,10 +2784,13 @@ def draw_sky(sky_state, cam_x, cam_y, cam_z, t_time, t_day,
         glColor4f(night_a, night_a, night_a, night_a)
         glEnableClientState(GL_TEXTURE_COORD_ARRAY)
         glTexCoordPointer(2, GL_FLOAT, 0, tcs)
-        # slow rotation for celestial drift
+        # slow drift + a gentle rotation about the texture centre so the
+        # field visibly wheels over the course of the night (Phase 3.4)
         glMatrixMode(GL_TEXTURE)
         glLoadIdentity()
-        glTranslatef(t_day * 0.5, 0.0, 0.0)
+        glTranslatef(0.5 + t_day * 0.5, 0.5, 0.0)
+        glRotatef(t_day * 30.0, 0.0, 0.0, 1.0)
+        glTranslatef(-0.5, -0.5, 0.0)
         glMatrixMode(GL_MODELVIEW)
         glDrawElements(GL_TRIANGLES, len(idx), GL_UNSIGNED_INT, idx)
         glMatrixMode(GL_TEXTURE); glLoadIdentity(); glMatrixMode(GL_MODELVIEW)
@@ -2613,7 +2814,12 @@ def draw_sky(sky_state, cam_x, cam_y, cam_z, t_time, t_day,
         glTexCoordPointer(2, GL_FLOAT, 0, tcs)
         glMatrixMode(GL_TEXTURE)
         glLoadIdentity()
-        glTranslatef(t_time * 0.004 * (1.0 + 1.5 * storm), 0.0, 0.0)
+        # cloud_phase is the wind-integrated scroll accumulated by the
+        # main loop (Phase 3.5) — clouds speed up and slow down with the
+        # live wind without jumping. Fallback keeps view.py behaviour.
+        if cloud_phase is None:
+            cloud_phase = t_time * 0.004 * (1.0 + 1.5 * storm)
+        glTranslatef(cloud_phase, 0.0, 0.0)
         glMatrixMode(GL_MODELVIEW)
         glDrawElements(GL_TRIANGLES, len(idx), GL_UNSIGNED_INT, idx)
         glMatrixMode(GL_TEXTURE); glLoadIdentity(); glMatrixMode(GL_MODELVIEW)
@@ -2672,8 +2878,13 @@ def draw_sky(sky_state, cam_x, cam_y, cam_z, t_time, t_day,
 
 # --- Sun / Moon billboards ---
 def draw_celestial(cam_x, cam_y, cam_z, direction, radius,
-                   core_color, glow_color, core_alpha=1.0):
-    """Billboard disc with soft glow, placed on the dome along `direction`."""
+                   core_color, glow_color, core_alpha=1.0,
+                   phase_frac=None):
+    """Billboard disc with soft glow, placed on the dome along `direction`.
+
+    phase_frac (moon only): 0 = new .. 1 = full. Rendered with the
+    classic occluder-disc trick — a dark disc offset across the bright
+    one carves the crescent; at full the occluder slides clear off."""
     if direction[1] < -0.25:
         return  # well below horizon
     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -2727,6 +2938,25 @@ def draw_celestial(cam_x, cam_y, cam_z, direction, radius,
         glColor4f(core_color[0], core_color[1], core_color[2], alt_fade * core_alpha)
         glVertex3f(*p)
     glEnd()
+
+    # Lunar phase occluder: a near-black disc slides across the core.
+    # New moon (0) sits dead-centre and swallows it; full (1) is fully
+    # offset and the disc reads round.
+    if phase_frac is not None and phase_frac < 0.97:
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        ro = r * 1.08
+        off = right * (r * 2.10 * phase_frac)
+        oc = center + off
+        glBegin(GL_TRIANGLE_FAN)
+        glColor4f(0.015, 0.020, 0.045, 0.94 * alt_fade * core_alpha)
+        glVertex3f(*oc)
+        for i in range(33):
+            t = 2 * math.pi * i / 32
+            p = oc + right * (ro * math.cos(t)) + up2 * (ro * math.sin(t))
+            glColor4f(0.015, 0.020, 0.045, 0.94 * alt_fade * core_alpha)
+            glVertex3f(*p)
+        glEnd()
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
 
     glDepthMask(GL_TRUE)
     glDisable(GL_BLEND)
@@ -2811,9 +3041,12 @@ def build_side_arrays(s_arr, s_car, side, t_time, amb_rgb):
     v = np.broadcast_to((s_arr * 0.08)[:, None], (NS, K))
     tcs = np.stack([u, v], axis=-1).reshape(-1, 2).astype(np.float32)
 
-    # Snow overlay alpha: full cover in frost biome, altitude cap on mountains
+    # Snow overlay alpha: full cover in frost biome, altitude cap on
+    # mountains. The snow line rides the season: ~17 m in midsummer
+    # (only the tallest peaks keep caps), down to ~6 m in deep winter.
     frost_cov = np.broadcast_to(weights[:, BIOME_FROST:BIOME_FROST + 1], (NS, K))
-    alt_cap = np.clip((y - 11.0) / 11.0, 0.0, 1.0) ** 1.4 * 0.90
+    snow_line = 17.0 - 11.0 * ENV['winter']
+    alt_cap = np.clip((y - snow_line) / 11.0, 0.0, 1.0) ** 1.4 * 0.90
     snow_a = np.maximum(frost_cov, alt_cap).reshape(-1).astype(np.float32)
 
     snow_rgba = np.zeros((NS * K, 4), dtype=np.float32)
@@ -3674,12 +3907,13 @@ def init_snow(seed=77):
     return pos, vel, seeds
 
 
-def update_snow(state, dt, t_time):
+def update_snow(state, dt, t_time, wind_x=0.0):
     pos, vel, seeds = state
-    # vertical fall + gentle horizontal swirl
+    # vertical fall + gentle horizontal swirl + a fraction of the shared
+    # wind (flakes are light but fall slowly, so they drift visibly)
     swirl_x = 0.55 * np.sin(t_time * 1.25 + seeds)
     swirl_z = 0.45 * np.cos(t_time * 0.85 + seeds * 1.3)
-    pos[:, 0] += (vel[:, 0] + swirl_x) * dt
+    pos[:, 0] += (vel[:, 0] + swirl_x + 0.20 * wind_x) * dt
     pos[:, 1] += vel[:, 1] * dt
     pos[:, 2] += (vel[:, 2] + swirl_z) * dt
 
@@ -3995,7 +4229,8 @@ def build_flower_variant(flower_tex):
     return list_id
 
 
-def draw_flowers(s_car, flower_variants, amb_rgb, t_time, wind_strength):
+def draw_flowers(s_car, flower_variants, amb_rgb, t_time, wind_strength,
+                 bloom=1.0):
     """Instance flowers + clusters along flat-ground biomes. Wind sway
     uses a larger amplitude and higher frequency than trees so flowers
     feel lighter. Distance-culled past ~280 m because they're tiny."""
@@ -4039,8 +4274,10 @@ def draw_flowers(s_car, flower_variants, amb_rgb, t_time, wind_strength):
 
             key = (int(s * 41) * 2654435761
                    + (0 if side < 0 else 3019)) & 0xFFFFFFFF
-            # Density gate — probability of a flower at this slot
-            density = 0.40 * ok
+            # Density gate — probability of a flower at this slot.
+            # `bloom` is the seasonal factor: full carpets in spring/
+            # summer, sparse survivors through the dry winter.
+            density = 0.40 * ok * bloom
             if (key & 0xFF) / 255.0 > density:
                 continue
 
@@ -6894,6 +7131,12 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
         cz = -(s - s_car)
         lane_sign = c['lane']  # -1 = left of player, +1 = right
         cx += lane_sign * c['off']
+        # Storm-gust lateral buffeting: tall/light vehicles wander a few
+        # centimetres in heavy wind (Phase 3.5). Visual only — the IDM
+        # lane state is untouched.
+        if storm_i > 0.05 and kind in ('truck', 'bus', 'van',
+                                       'motorcycle'):
+            cx += math.sin(t_time * 1.7 + s * 0.13) * 0.07 * storm_i
 
         ds = 0.5
         dxds = (curve_x(s + ds) - curve_x(s - ds)) / (2.0 * ds)
@@ -8787,6 +9030,18 @@ def _build_arg_parser():
                    metavar="HOURS",
                    help="Force time of day in hours 0..24. 6=dawn, 12=noon, "
                         "18=dusk, 22=night. Default: lets the sim drift.")
+    p.add_argument("--season", type=str, default=None,
+                   help="Season phase: 'summer'/'autumn'/'winter'/'spring' "
+                        "or a numeric phase offset 0-1 around the year. "
+                        "Seasons otherwise advance with distance driven.")
+    p.add_argument("--weather", choices=tuple(WEATHER_PIN.keys()),
+                   default=None,
+                   help="Pin the weather lifecycle to a named state "
+                        "(clear/clouding/overcast/rain/storm).")
+    p.add_argument("--wetness", type=float, default=None,
+                   help="Pin the wet-road memory 0-1 (for screenshots).")
+    p.add_argument("--moon", type=float, default=None,
+                   help="Pin the moon phase 0-1 (0=new, 0.5=full).")
     p.add_argument("--storm", type=float, default=None,
                    help="Force storm intensity 0..1. Default: sim-driven.")
     p.add_argument("--s-car", dest="s_car", type=float, default=None,
@@ -9071,8 +9326,26 @@ def main(argv=None):
     active_ca_charge = None
     ca_charge_frames_left = 0
     ca_time_to_strike = 5.0
-    # Seed the EMA with the starting storm value so we don't ramp in from 0
-    storm_smoothed = storm_intensity_at(0.0)
+    # Live weather: the Phase-3 lifecycle machine (CLEAR → CLOUDING →
+    # OVERCAST → RAIN → CLEARING) replaces the raw triple-sine EMA.
+    weather = WeatherSystem()
+    wetness = 0.0          # wet-road memory (Phase 3.2)
+    thunder_queue = []     # [delay_remaining, volume] — speed-of-sound
+    shooting_star = None
+    shoot_timer = 8.0
+    cloud_phase = 0.0      # wind-integrated cloud scroll
+    wind_dir = ENV['wind_dir']
+    # CLI season: named or numeric phase offset around the year.
+    if args.season is not None:
+        named = {'summer': 0.0, 'autumn': 0.25, 'winter': 0.5,
+                 'spring': 0.75}
+        try:
+            ENV['season_off'] = named.get(args.season.lower(),
+                                          None)
+            if ENV['season_off'] is None:
+                ENV['season_off'] = float(args.season) % 1.0
+        except ValueError:
+            ENV['season_off'] = 0.0
     sv, stc, sfr, sidx = build_sky_dome()
     sky_state = (sv, stc, sfr, sidx, cloud_tex, stars_tex, overcast_tex)
 
@@ -9148,17 +9421,47 @@ def main(argv=None):
         if audio_player is not None:
             audio_player.set_speed(0.25 + (speed / SPEED) * 0.75)
 
-        # weather tick: storm intensity and lightning lifecycle.
-        # EMA on the raw storm signal so intensity climbs and falls over
-        # ~30 seconds rather than whatever the sine product happens to do —
-        # looks like weather building gradually, not flicking on and off.
-        storm_raw = storm_intensity_at(t_time)
-        storm_tau = 60.0   # weather blends over ~1 min
-        storm_smoothed += (storm_raw - storm_smoothed) * min(1.0, dt / storm_tau)
-        storm_i = storm_smoothed
+        # weather tick (Phase 3): season + moon + lifecycle machine.
+        # Season is anchored to distance (the zone you reach was rolled
+        # in the season you reach it), so the camera's winter weight
+        # drives the sun arc, snow line and flora without terrain pops.
+        # Moon phase cycles every MOON_PERIOD_DAYS day-cycles and
+        # lifts/dims the ambient night floor.
+        ENV['winter'] = winter_weight(season_phase_at(s_car))
+        ENV['moon_phase'] = (t_time / (DAY_PERIOD
+                                       * MOON_PERIOD_DAYS)) % 1.0
+        if args.moon is not None:
+            ENV['moon_phase'] = float(args.moon) % 1.0
+        summer_w = 1.0 - ENV['winter']
+        # Live weather is the lifecycle machine: CLEAR → CLOUDING →
+        # OVERCAST → RAIN → CLEARING, humidity carried between events,
+        # convective likelihood peaking on summer afternoons. The
+        # machine's own EMA replaces the old raw-sine smoothing.
+        storm_i = weather.update(dt, t_day, summer_w)
         if _headless_storm_override:
             storm_i = float(args.storm)
-            storm_smoothed = storm_i
+            weather.level = storm_i
+        elif args.weather is not None:
+            storm_i = WEATHER_PIN[args.weather]
+            weather.level = storm_i
+
+        # Unified wind (Phase 3.5): heading wanders slowly; speed =
+        # calm base + triple-LFO gusting + storm forcing. The cloud
+        # scroll integrates the live speed so clouds accelerate with
+        # the front instead of jumping.
+        wind_dir += (0.06 * math.sin(t_time * 0.013)
+                     + 0.04 * math.sin(t_time * 0.041 + 1.7)) * dt
+        gust = ((0.55 + 0.45 * math.sin(t_time * 2 * math.pi / 5.3))
+                * (0.55 + 0.45 * math.sin(t_time * 2 * math.pi / 7.8
+                                          + 2.1))
+                * (0.55 + 0.45 * math.sin(t_time * 2 * math.pi / 3.1
+                                          + 4.0)))
+        wind_speed = 1.6 + 2.6 * gust + 7.0 * storm_i
+        ENV['wind_dir'] = wind_dir
+        ENV['wind_speed'] = wind_speed
+        wind_x = math.cos(wind_dir) * wind_speed
+        cloud_phase += dt * 0.004 * (0.4 + wind_speed / 5.0)
+
         if active_bolt is not None:
             bolt_age += dt
             if bolt_age > BOLT_LIFE:
@@ -9181,18 +9484,51 @@ def main(argv=None):
         sun_d = sun_dir_at(t_day)
         moon_d = -sun_d  # opposite
 
+        # --- Wet-road memory (Phase 3.2) ---
+        # Rain soaks the pavement within seconds; drying takes 2-4
+        # simulated hours (10-22 s wall-clock), faster under the midday
+        # sun. Puddles, road specular and traffic caution all read this
+        # instead of the instantaneous storm value, so the road stays
+        # wet — and traffic stays careful — after the sun comes out.
+        frost_i = frost_intensity_at(s_car)
+        rain_i = rain_intensity_from(storm_i) * (1.0 - frost_i)
+        if args.wetness is not None:
+            wetness = float(args.wetness)
+        elif rain_i > 0.04:
+            wetness = min(1.0, wetness + rain_i * dt / 6.0)
+        else:
+            day_w = _smooth((float(sun_d[1]) + 0.15) / 0.50)
+            wetness = max(0.0, wetness - dt / (22.0 - 12.0 * day_w))
+        ENV['wetness'] = wetness
+
+        # Camera-local biome weights (used by fog, wind exposure, audio).
+        wL_c = biome_weights_vec(
+            np.array([s_car], dtype=np.float32), -1)[0]
+        wR_c = biome_weights_vec(
+            np.array([s_car], dtype=np.float32), +1)[0]
+        open_exp_trees = 0.5 * (
+            wL_c[BIOME_PLAIN] + wL_c[BIOME_MOUNTAIN] + wL_c[BIOME_FROST]
+            + wR_c[BIOME_PLAIN] + wR_c[BIOME_MOUNTAIN] + wR_c[BIOME_FROST]
+        )
+
         # fog fades into the horizon color of the moment
         fog_c = (horizon[0] * bright * 0.9 + 0.05,
                  horizon[1] * bright * 0.9 + 0.05,
                  horizon[2] * bright * 0.9 + 0.05, 1.0)
         glFogfv(GL_FOG_COLOR, fog_c)
-        # Gradually thicken fog up to +10% when the camera is in frost biome.
-        # frost_intensity_at returns the smoothstep-blended biome weight so
-        # density eases in/out at zone transitions rather than snapping.
-        frost_i = frost_intensity_at(s_car)
-        # Frost biome and heavy storm both reduce visibility: shrink the
-        # fog-end distance so the linear fog ramp terminates sooner.
-        vis_end = 920.0 / (1.0 + 0.10 * frost_i + 0.30 * storm_i)
+        # Radiation fog at dawn (Phase 3.1): clear nights over open or
+        # wet ground leave a fog bank through sunrise that burns off by
+        # mid-morning — strongest over river/plain zones.
+        dawn_w = max(0.0, 1.0 - abs(t_day - 0.265) / 0.05)
+        low_ground = 0.5 * float(
+            wL_c[BIOME_PLAIN] + wL_c[BIOME_RIVER]
+            + wR_c[BIOME_PLAIN] + wR_c[BIOME_RIVER])
+        dawn_fog = dawn_w * low_ground * (1.0 - storm_i)
+        # Frost biome, heavy storm and dawn fog all reduce visibility:
+        # shrink the fog-end distance so the linear ramp ends sooner.
+        vis_end = 920.0 / (1.0 + 0.10 * frost_i + 0.30 * storm_i
+                           + 1.5 * dawn_fog)
+        glFogf(GL_FOG_START, 180.0 * (1.0 - 0.65 * dawn_fog))
         glFogf(GL_FOG_END, vis_end)
         glClearColor(horizon[0], horizon[1], horizon[2], 1.0)
 
@@ -9250,10 +9586,23 @@ def main(argv=None):
         if triggered_bolt:
             # Lightning startles every bird flock into a burst climb.
             birds_startle(bird_state)
-        if triggered_bolt and audio_player is not None:
-            thunder_vol = 0.40 + max(storm_i, 0.5) * 0.40 \
-                          + float(bolt_rng.uniform(-0.05, 0.15))
-            audio_player.trigger_thunder(volume=thunder_vol)
+            # Distance-correct thunder (Phase 3.4): the flash is
+            # instant, the clap crosses the gap at ~343 m/s — nearby
+            # strikes crack at once, far ones rumble in seconds later
+            # (and a touch quieter).
+            ground = active_bolt[0][-1]
+            d_bolt = math.hypot(float(ground[0]) - cx,
+                                float(ground[2]) - cz)
+            vol = (0.40 + max(storm_i, 0.5) * 0.40
+                   + float(bolt_rng.uniform(-0.05, 0.15)))
+            vol *= max(0.45, 1.0 - d_bolt / 700.0)
+            thunder_queue.append([d_bolt / 343.0, vol])
+        for _ev in thunder_queue:
+            _ev[0] -= dt
+        while thunder_queue and thunder_queue[0][0] <= 0.0:
+            _ev = thunder_queue.pop(0)
+            if audio_player is not None:
+                audio_player.trigger_thunder(volume=_ev[1])
 
         # CA electric charge — *separate* flash, 1-4 frames of full
         # brightness. Fires independently on rare dice rolls during
@@ -9297,59 +9646,88 @@ def main(argv=None):
         # than snapping. Levels are ~50% of the previous scale so the
         # weather sits under the music, not on top of it.
         if audio_player is not None:
-            rain_vol = storm_i * (1.0 - frost_i) * 0.17
-            wL_now = biome_weights_vec(
-                np.array([s_car], dtype=np.float32), -1)[0]
-            wR_now = biome_weights_vec(
-                np.array([s_car], dtype=np.float32), +1)[0]
-            open_exp = 0.5 * (
-                wL_now[BIOME_PLAIN] + wL_now[BIOME_MOUNTAIN] + wL_now[BIOME_FROST]
-                + wR_now[BIOME_PLAIN] + wR_now[BIOME_MOUNTAIN] + wR_now[BIOME_FROST]
-            )
+            # Rain hiss tracks actual precipitation (not the overcast
+            # build-up); the wind layer tracks the unified wind speed.
+            rain_vol = rain_i * 0.17
             speed_ratio = speed / SPEED
-            wind_vol = (0.015
+            wind_vol = (0.012
                         + speed_ratio * 0.025
-                        + open_exp * 0.040
-                        + storm_i * 0.035)
+                        + float(open_exp_trees) * 0.035
+                        + ENV['wind_speed'] * 0.0042)
             audio_player.set_volumes(rain=rain_vol, wind=wind_vol)
 
-        draw_sky(sky_state, cx, cy, cz, t_time, t_day, storm_i, flash)
+        draw_sky(sky_state, cx, cy, cz, t_time, t_day, storm_i, flash,
+                 cloud_phase=cloud_phase)
 
         # sun + moon sit on top of the sky pass but behind terrain
         sc = sun_color(t_day)
         draw_celestial(cx, cy, cz, sun_d, radius=14.0,
                        core_color=sc,
                        glow_color=(sc[0], sc[1] * 0.8, sc[2] * 0.6))
-        # moon — slightly smaller, cool silver. Fades out when sun is up.
-        moon_alpha = _smooth((0.3 - bright) / 0.3)
+        # moon — slightly smaller, cool silver. Fades out when sun is
+        # up; waxes and wanes over the MOON_PERIOD_DAYS cycle, with the
+        # glow following the lit fraction (Phase 3.4).
+        moon_full = moon_fullness()
+        moon_alpha = _smooth((0.3 - bright) / 0.3) \
+            * (0.35 + 0.65 * moon_full)
         if moon_alpha > 0.02 and moon_d[1] > -0.25:
             draw_celestial(cx, cy, cz, moon_d, radius=9.0,
                            core_color=(0.92, 0.94, 1.0),
                            glow_color=(0.55, 0.65, 0.85),
-                           core_alpha=moon_alpha)
+                           core_alpha=moon_alpha,
+                           phase_frac=moon_full)
+
+        # Shooting stars (Phase 3.4): rare meteor streaks, clear nights
+        # only — a quiet reward for night drives between storms.
+        if shooting_star is None:
+            shoot_timer -= dt
+            if shoot_timer <= 0.0:
+                shoot_timer = float(bolt_rng.uniform(5.0, 16.0))
+                if (night_a > 0.6 and storm_i < 0.10
+                        and bolt_rng.random() < 0.5):
+                    az = float(bolt_rng.uniform(0.0, 2.0 * math.pi))
+                    alt = float(bolt_rng.uniform(0.35, 0.75))
+                    R = SKY_DOME_R * 0.85
+                    vaz = az + (math.pi / 2 if bolt_rng.random() < 0.5
+                                else -math.pi / 2)
+                    shooting_star = {
+                        'p': [math.cos(az) * math.cos(alt) * R,
+                              math.sin(alt) * R,
+                              math.sin(az) * math.cos(alt) * R],
+                        'v': [math.cos(vaz) * R * 0.55, -R * 0.18,
+                              math.sin(vaz) * R * 0.55],
+                        'age': 0.0,
+                        'life': float(bolt_rng.uniform(0.5, 0.9)),
+                    }
+        else:
+            shooting_star['age'] += dt
+            shooting_star['p'][0] += shooting_star['v'][0] * dt
+            shooting_star['p'][1] += shooting_star['v'][1] * dt
+            shooting_star['p'][2] += shooting_star['v'][2] * dt
+            if shooting_star['age'] >= shooting_star['life']:
+                shooting_star = None
+        if shooting_star is not None:
+            draw_shooting_star(shooting_star, cx, cy, cz)
 
         draw_terrain(terrain_tex, snow_ground_tex, s_car, t_time, amb)
         draw_city(s_car, building_lists, facade_texes, emission_tex,
                   amb, night_a, t_time,
                   storm_i=storm_i, frost_i=frost_i,
                   snow_tex=snow_ground_tex)
-        # Wind strength drives tree sway. Built from the same ingredients as
-        # wind audio: storm intensity dominates, open biomes add exposure,
-        # camera speed a touch. Clamped so peak sway stays around 3-4°.
-        wL_c = biome_weights_vec(
-            np.array([s_car], dtype=np.float32), -1)[0]
-        wR_c = biome_weights_vec(
-            np.array([s_car], dtype=np.float32), +1)[0]
-        open_exp_trees = 0.5 * (
-            wL_c[BIOME_PLAIN] + wL_c[BIOME_MOUNTAIN] + wL_c[BIOME_FROST]
-            + wR_c[BIOME_PLAIN] + wR_c[BIOME_MOUNTAIN] + wR_c[BIOME_FROST]
-        )
+        # Tree/flower sway now reads the unified wind (Phase 3.5): the
+        # same vector that slants the rain and pushes the clouds.
         wind_strength = min(
-            0.8,
-            0.10 + 0.30 * storm_i + 0.18 * open_exp_trees
+            0.85,
+            ENV['wind_speed'] / 14.0 + 0.16 * open_exp_trees
                  + 0.05 * (speed / SPEED),
         )
-        draw_forest(s_car, tree_lists, frost_tree_lists, amb,
+        # Seasonal flora (Phase 3.3): São Paulo's winter is the dry
+        # season — foliage desaturates toward straw, flowers thin out.
+        dry_season = 0.38 * ENV['winter']
+        flora_amb = (min(1.0, amb[0] * (1.0 + 0.10 * dry_season)),
+                     amb[1] * (1.0 - 0.10 * dry_season),
+                     amb[2] * (1.0 - 0.30 * dry_season))
+        draw_forest(s_car, tree_lists, frost_tree_lists, flora_amb,
                     t_time, wind_strength)
         # Rural houses: farther than trees, closer than city skyscrapers.
         # Snow accumulates on roofs during frost biome, melts off when
@@ -9357,20 +9735,23 @@ def main(argv=None):
         draw_houses(s_car, house_variants, snow_ground_tex, amb, night_a)
         # Flowers along the shoulders — same wind as the trees so the
         # whole landscape pulses together when a gust rolls through.
-        draw_flowers(s_car, flower_variants, amb, t_time, wind_strength)
-        # Road pavement with subtle wet darkening during rain, then the
-        # snow overlay pass that fades in/out with frost biome transitions.
-        draw_road(road_tex, s_car, amb, storm_i, horizon_rgb=horizon)
+        draw_flowers(s_car, flower_variants, flora_amb, t_time,
+                     wind_strength,
+                     bloom=0.35 + 0.65 * (1.0 - ENV['winter']))
+        # Road pavement wet-darkens from the wetness MEMORY (not the
+        # instantaneous storm), then the snow overlay pass fades in/out
+        # with frost biome transitions.
+        draw_road(road_tex, s_car, amb, wetness, horizon_rgb=horizon)
         draw_road_snow_overlay(snow_ground_tex, s_car, amb)
         # Ponds draw *after* the road so any puddle sits on top of the
-        # pavement (including its imperfections and snow overlay). This
-        # is the reason cracks / dirt never show through a puddle — the
-        # puddle's alpha composite is the last paint.
-        draw_ponds(pond_tex, s_car, storm_i, horizon, amb, t_time)
+        # pavement (including its imperfections and snow overlay).
+        # Driven by wetness, so puddles linger and shrink as the road
+        # dries instead of vanishing with the last raindrop.
+        draw_ponds(pond_tex, s_car, wetness, horizon, amb, t_time)
         # Bridges + tunnels: placed where biomes dictate (river / mountain)
         # so they never collide with trees, buildings, or other structures.
-        # Concrete tint reacts to storm (wet darkening) and frost (snow cap).
-        draw_civil_structures(s_car, concrete_tex, amb, storm_i, frost_i)
+        # Concrete tint wet-darkens off the same wetness memory.
+        draw_civil_structures(s_car, concrete_tex, amb, wetness, frost_i)
         draw_snow_shoulders(snow_ground_tex, s_car, amb)
         draw_lamps(s_car, night_a)
         draw_lamp_moths(s_car, night_a, t_time)
@@ -9400,9 +9781,12 @@ def main(argv=None):
         moto_d = moto_density_at(t_day)
         van_d = van_density_at(t_day)
         bus_d = bus_density_at(t_day)
+        # Drivers slow for active rain AND for a still-wet road (3.2) —
+        # the flow stays cautious after the cell has passed.
+        driving_wet = max(rain_i, 0.80 * wetness)
         update_traffic((car_state, truck_state, moto_state, van_state,
                         bus_state, emerg_state), dt, s_car, speed,
-                       t_day=t_day, storm_i=storm_i, frost_i=frost_i,
+                       t_day=t_day, storm_i=driving_wet, frost_i=frost_i,
                        night_a=night_a)
         draw_cars(car_state, car_variants, s_car, amb, sun_d,
                   night_a, flare_tex, density=traffic_d, storm_i=storm_i,
@@ -9428,13 +9812,14 @@ def main(argv=None):
         # snow falls only to the left.
         wL_frost = frost_weight_at(s_car, -1)
         wR_frost = frost_weight_at(s_car, +1)
-        update_snow(snow_state, dt, t_time)
+        update_snow(snow_state, dt, t_time, wind_x=wind_x)
         draw_snow(snow_state, snowflake_tex, wL_frost, wR_frost, cx, cy, cz)
 
-        # rain: storm active AND not in a frost biome (otherwise it's snow
-        # falling from the sibling snow system — don't draw both at once).
-        update_rain(rain_state, dt)
-        rain_i = storm_i * (1.0 - frost_i)
+        # rain: precipitation only once the cell has actually opened
+        # (rain_i, computed from the lifecycle level) AND not in a frost
+        # biome (otherwise it's snow from the sibling system). Streak
+        # slant follows the unified wind.
+        update_rain(rain_state, dt, wind_x=wind_x)
         draw_rain(rain_state, rain_i, cx, cy, cz)
 
         # Volumetric dust motes — rare, gated so they only appear in
@@ -9474,9 +9859,9 @@ def main(argv=None):
         draw_lens_flare(flare_tex, sun_d, cx, cy, cz, lx, ly, lz,
                         W, H, flare_smoothed)
 
-        # Lens weather drops: spawn + advance + draw, gated by rain/snow
-        # intensity so they only appear in their respective weather.
-        rain_lens_i = storm_i * (1.0 - frost_i)
+        # Lens weather drops: spawn + advance + draw, gated by actual
+        # precipitation (not the overcast build-up) and snow.
+        rain_lens_i = rain_i
         snow_lens_i = frost_i
         lens_overlay.update(dt, rain_lens_i, snow_lens_i, W, H)
         lens_overlay.draw(lens_drop_tex, lens_flake_tex, W, H)

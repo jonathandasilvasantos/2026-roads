@@ -301,6 +301,41 @@ research as the design criterion. Per-cycle snapshots live under
   sub-lanes it straddles; lane-change targets count as occupied from
   decision time; cut-ins keep an absolute 4 m bumper floor.
 
+### Weather & time realism (light branch — plan.txt Phase 3)
+- **Weather lifecycle machine**: live weather is now a state machine —
+  CLEAR → CLOUDING → OVERCAST → RAIN → CLEARING — with humidity carried
+  between events (a rain dumps it, clear air recharges it) and the
+  trigger probability peaking on summer afternoons (SP convective
+  pattern). Storms are events you watch build; precipitation only
+  starts once the level passes the rain onset, so the overcast band
+  darkens the sky without raining. ~20% of fronts pass dry.
+- **Wet-road memory**: rain soaks the pavement in seconds; drying takes
+  2-4 simulated hours (faster under the midday sun). Road darkening,
+  puddles, bridge concrete and traffic caution all read the wetness
+  memory — "sun's out but the road is still wet and the flow is still
+  slow" is now a real state. `--wetness` pins it for screenshots.
+- **Radiation dawn fog**: clear mornings over river/plain zones pull
+  the fog bank in close around sunrise, burning off by mid-morning.
+- **Distance-anchored seasons**: one full year every 24 km of road —
+  the zone you reach was rolled in the season you reach it, so biomes
+  never pop under the camera. Winter lowers/flattens the sun arc
+  (shorter days), multiplies frost zones (rare in summer, common in
+  winter, plains upgrade to frost in deep winter), drops the mountain
+  snow line from ~17 m to ~6 m, desaturates flora toward dry-season
+  straw and thins the flowers. `--season summer|autumn|winter|spring`
+  (or a 0-1 phase) offsets the cycle.
+- **Astronomy**: the moon waxes/wanes over 4 day-cycles with a real
+  crescent (occluder-disc mask) and scales the ambient night floor —
+  full-moon nights are ~50% brighter than new-moon nights. The star
+  field wheels slowly over the night; rare shooting stars streak
+  across clear night skies. Thunder is distance-correct: the clap
+  arrives bolt-distance ÷ 343 m/s after the flash, quieter when far.
+- **Unified wind**: a single wind state (wandering heading, calm base +
+  triple-LFO gusts + storm forcing) now drives rain streak slant, snow
+  drift, tree/flower sway, cloud scroll speed (integrated, so clouds
+  accelerate with a front instead of jumping), the ambient wind audio
+  layer, and lateral buffeting on trucks/buses/vans/motorcycles.
+
 ### São Paulo traffic model
 - `TRAFFIC_DENSITY_SP` — 24-hour density table [0..1] calibrated from
   CET-SP bulletins, Metrô 2017 O-D survey, Waze for Cities aggregates.
