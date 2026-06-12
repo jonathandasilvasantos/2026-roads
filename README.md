@@ -443,6 +443,29 @@ research as the design criterion. Per-cycle snapshots live under
   says a design-speed vehicle would leave the road; skid-mark decals
   drift toward the outside through the hardest apexes.
 
+### Bridges & viaducts (light branch — plan v2 phase 3)
+- **River bridges**: the old parapet strips over river zones are now a
+  true structure — deck fascia with an upstand, underside slab, twin
+  edge girders, piers every 18 m down to the water with splash
+  collars, and a see-through railing (posts + double rail) replacing
+  the guardrail across the span. Baked per span into world-space VBOs
+  split by shade group, so daylight modulates with three glColor
+  calls.
+- **Ravine viaducts**: the base terrain never drops far below the
+  road, so valleys are created — deterministic transverse ravines
+  (9-15 m deep, 75-135 m long) carved through hill/mountain zones,
+  applied after the road-edge blend so the ground genuinely falls away
+  under the deck (verified: −12 to −15 m at centre span). The viaduct
+  then spans the gap it created, piers reaching the ravine floor —
+  the same "structure earns itself" logic as the tunnels.
+- **Landmark crossings** (~1 per 15 km): the longest river spans roll
+  cable-stay twin towers at the deck edges (H-frame + crossbeam, the
+  carriageway stays clear) with live-drawn cable fans to both edges.
+- **Integration**: bridge spans never overlap a tunnel bore (the rock
+  wins); guardrails, snow shoulders and ponds are suppressed on decks;
+  tall vehicles catch ~50% more crosswind buffeting mid-span; small
+  birds perch along the railings at dawn and dusk.
+
 ### Tunnels (light branch — plan v2 phase 2)
 - **Placement that earns itself**: one candidate per ~2.6 km hash
   cell, and the cell is *scanned* for a genuine mountain run (high
