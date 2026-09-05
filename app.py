@@ -1759,11 +1759,13 @@ class MinimalEnsemblePlayer:
         name is fed into audio.coreaudio.device, and we force the
         coreaudio driver so the per-device routing actually applies."""
         fs = _fluidsynth.Synth(samplerate=48000, gain=gain)
-        for k in ("audio.dsound.device", "audio.wasapi.device",
-                  "audio.waveout.device", "audio.coreaudio.device",
-                  "audio.pulseaudio.device", "audio.alsa.device"):
+        # A small real-time score does not need FluidSynth's default 256 voices.
+        # Bounding polyphony protects frame pacing; one effects group avoids the
+        # significant CPU multiplier documented for additional groups.
+        for key,value in (("synth.polyphony",64),("synth.effects-groups",1),
+                          ("synth.reverb.active",1),("synth.chorus.active",1)):
             try:
-                fs.setting(k, "")
+                fs.setting(key,value)
             except Exception:
                 pass
         try:
@@ -13289,4 +13291,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    # New Wave is the canonical application. Keeping the procedural audio and
+    # generation definitions in this module avoids a risky big-bang file split;
+    # the former linear-road entry point remains callable as main() for tests.
+    from new_wave.game import main as new_wave_main
+    new_wave_main(audio_module=sys.modules[__name__])

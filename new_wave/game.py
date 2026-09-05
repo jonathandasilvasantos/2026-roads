@@ -46,6 +46,7 @@ def parser():
     p.add_argument('--report',type=Path,help='write JSON performance and route evidence')
     p.add_argument('--screenshot',type=Path,help='save last frame')
     p.add_argument('--no-audio',action='store_true')
+    p.add_argument('--no-music',action='store_true',help='keep ambience but mute the procedural score')
     p.add_argument('--uncapped',action='store_true',help='disable frame limiter and vsync; recorded in report')
     p.add_argument('--no-hud',action='store_true')
     p.add_argument('--reduced-motion',action='store_true')
@@ -98,7 +99,7 @@ class Camera:
         return self.position,self.target
 
 
-def main(argv=None):
+def main(argv=None,audio_module=None):
     args=parser().parse_args(argv)
     replay=json.loads(args.replay.read_text()) if args.replay else None
     config=json.loads(args.config.read_text())
@@ -115,7 +116,7 @@ def main(argv=None):
         from .metal_renderer import MetalRenderer as Renderer
     else:
         from .gl_renderer import GLRenderer as Renderer
-    renderer=None;audio=None
+    renderer=None;audio=None;music=None
     try:
         renderer=Renderer(width,height,'ROADS / NEW WAVE',vsync=not args.uncapped,shadow_size=preset['shadow'])
         if args.fullscreen:
@@ -154,11 +155,26 @@ def main(argv=None):
         car.state.x,car.state.z=clear_position(world,car.state.x,car.state.z,prefer_road=False)
         car.recover(world.surface_height)
         traffic=Traffic(world,count=config.get('traffic_count',12),fog_distance=(world.config.radius-.4)*world.config.chunk_size)
-        if not args.no_audio and not args.benchmark and not args.frames:
+        if not args.no_audio and not args.benchmark:
             try:
-                import app
-                audio=app.AmbientAudioMixer();audio.set_volumes(brown=.025,wind=.018);audio.start()
-            except Exception as e:print(f'Audio unavailable: {e}',file=sys.stderr)
+                if audio_module is None:
+                    import app as audio_module
+                audio=audio_module.AmbientAudioMixer();audio.set_volumes(brown=.025,wind=.018);audio.start()
+            except Exception as e:print(f'Ambient audio unavailable: {e}',file=sys.stderr)
+            if not args.no_music:
+                try:
+                    if audio_module is None:
+                        import app as audio_module
+                    if not audio_module._FLUIDSYNTH_AVAILABLE:
+                        raise RuntimeError('FluidSynth is unavailable; install it with brew install fluid-synth')
+                    if not (ROOT/audio_module.SOUNDFONT_PATH).exists():
+                        raise RuntimeError('SoundFont missing; run ./env/bin/python setup_soundfonts.py')
+                    from .music import AdaptiveMusic
+                    gain=float(config.get('music_volume',.22))
+                    music=AdaptiveMusic(audio_module.MinimalEnsemblePlayer(
+                        sf2_path=str(ROOT/audio_module.SOUNDFONT_PATH),gain=gain),gain)
+                    music.start()
+                except Exception as e:print(f'Music unavailable: {e}',file=sys.stderr)
         from .hud import render_hud
         camera=Camera();mode=args.camera;paused=False;show_help=True;previous_keys=set();frame=0
         controls=config.get('controls',{})
@@ -285,6 +301,7 @@ def main(argv=None):
             rain={'clear':0.,'rain':.65,'storm':1.}[args.weather]
             if rain:
                 fog=fog*(1-rain*.22);sun[3]*=1-rain*.4;fog_distance*=1-rain*.18
+            if music:music.update(dt,state.speed,sun[3],rain,world.biome(state.x,state.z))
             fps=fps*.95+.05/max(frame_interval,.001)
             capture=None
             stop=(args.frames and frame+1>=args.frames) or (args.benchmark and elapsed>=args.benchmark+args.warmup)
@@ -324,11 +341,14 @@ def main(argv=None):
             peak_chunks=peak_chunks,peak_pending=peak_pending,peak_meshes=peak_meshes,generation=describe(world.generation_times_ms),last_render=stats,route=list(route),
             limitations=['GPU timestamps bracket shadow, scene and rain; Metal excludes HUD/presentation, OpenGL includes HUD but excludes blit/presentation','RSS is process high-water mark; unified driver allocation not separately available'],
             physics_dropped_seconds=car.dropped_time-(measured_dropped or 0),startup_dropped_seconds=measured_dropped,
-            weather=args.weather,time_hour=args.time,replay=str(args.replay) if args.replay else None,input_events=list(input_events))
+            weather=args.weather,time_hour=args.time,replay=str(args.replay) if args.replay else None,input_events=list(input_events),
+            audio_enabled=audio is not None,music_enabled=music is not None,
+            music_profile=asdict(music.current) if music else None)
         if args.report:
             args.report.parent.mkdir(parents=True,exist_ok=True);args.report.write_text(json.dumps(report,indent=2)+'\n')
         print(json.dumps(report,indent=2),flush=True)
     finally:
+        if music:music.stop()
         if audio:audio.stop()
         world.close()
         if renderer:renderer.close()

@@ -2,11 +2,10 @@
 
 ## New Wave — free driving on Metal and OpenGL
 
-The `new-wave` branch adds a playable car and an endless world in every horizontal
-direction. On macOS, the default renderer uses **Metal on the GPU**. The same
-game also runs through **OpenGL 4.1** with the same physics, world and assets.
-The original road demo, asset viewer, weather systems and soundscape remain
-available as Classic mode; their documentation continues below.
+New Wave is the canonical game: a playable car and an endless world in every
+horizontal direction. On macOS, the default renderer uses **Metal on the GPU**.
+The same game also runs through **OpenGL 4.1** with the same physics, world,
+assets and adaptive procedural score.
 
 ```bash
 ./env/bin/python -m pip install -r requirements.txt
@@ -14,7 +13,7 @@ available as Classic mode; their documentation continues below.
 ./run.sh --backend opengl          # same game through OpenGL
 ./run.sh --windowed                # development window
 ./run.sh --quality Quality         # more terrain and foliage, same resolution
-./run.sh --classic                 # original demo and audio routing menu
+./run.sh --no-music                # ambience only
 ```
 
 WASD or arrows drive; S/Down brakes then reverses. Space: handbrake. Left Ctrl:
@@ -24,8 +23,9 @@ right/left triggers, A for handbrake and Y for recovery.
 
 Configuration is in [new_wave/config.json](new_wave/config.json); see
 [New Wave guide](development/NEW_WAVE.md) for physics, world architecture,
-validation, performance evidence, references and limitations. The remainder
-of this README describes **Classic mode** (`app.py`).
+validation, performance evidence, references and limitations. The legacy
+implementation below remains internal reference material; it is no longer a
+separate public game mode.
 
 An endless driving demo in the spirit of the Atari 2600 *Enduro* camera, built
 with Python + PyOpenGL. A procedural road winds through procedural terrain
@@ -47,6 +47,10 @@ python3.12 -m venv env
 Press **Esc** to quit. Runs fullscreen at the native display resolution.
 
 ### Audio
+
+New Wave restores the existing procedural Rhodes-and-strings music and adapts
+its brightness, ambience and volume smoothly to speed, daylight, rain and biome.
+Use `--no-music` to keep environmental ambience only, or `--no-audio` for silence.
 
 - Continuous ambient **brown noise** (1/f² spectrum, FFT-synthesised) plays
   under the scene. Its playback speed tracks the camera speed so

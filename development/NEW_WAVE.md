@@ -1,8 +1,8 @@
 # Roads / New Wave
 
-Free exploration is a new native GPU game mode. Classic remains runnable unchanged
-with `python app.py` or `./run.sh --classic`, including its richer weather,
-traffic incidents, bridges, tunnels, soundscape and asset viewer.
+Free exploration is now the canonical game launched by both `python app.py` and
+`./run.sh`. The former Classic launcher is no longer exposed; selected mature
+systems, including its procedural score, are reused internally.
 
 ## Run
 
@@ -16,6 +16,7 @@ python3.12 -m venv env
 ./run.sh --quality Quality --width 1920 --height 1080
 ./run.sh --time 22 --weather rain
 ./run.sh --cycle --seed 42
+./run.sh --no-music
 ```
 
 Metal is the default on macOS; OpenGL is the explicit fallback and the default
@@ -32,6 +33,19 @@ to the display; it does not silently change render quality. All presets default
 to 1280×720 and are capped at 60 FPS.
 `--uncapped` disables the limiter and requests no vsync. No automatic resolution
 or quality reductions occur.
+
+The procedural Rhodes-and-strings score starts by default when FluidSynth and
+`soundfonts/GeneralUser-GS.sf2` are installed. It preserves the original
+composition while smoothly adapting gain, MIDI brightness, reverb and chorus to
+speed, daylight, rain and biome. Polyphony is capped at 64 and a single effects
+group is used to bound audio CPU cost. Run `setup_soundfonts.py` if the SoundFont
+is absent; `--no-music` disables the score without disabling ambience.
+The tuning follows FluidSynth's official settings reference: bounded polyphony
+limits active voices, gain stays conservative to avoid saturation, and additional
+effects groups are avoided because each group adds processing cost. The optional
+limiter setting is intentionally not forced because the installed FluidSynth
+build does not expose it. References: [settings](https://github.com/FluidSynth/fluidsynth/blob/master/doc/fluidsettings.xml)
+and [synth API](https://github.com/FluidSynth/fluidsynth/blob/master/include/fluidsynth/synth.h).
 
 | Preset | Chunk radius | Terrain divisions/chunk | Foliage multiplier | Shadow map |
 |---|---:|---:|---:|---:|
@@ -160,8 +174,8 @@ time. OpenGL had an isolated peak above budget; its p99 remained16.683ms.
 Metal process CPU averaged23.1% of one core. JSON files include the corresponding
 OpenGL CPU/subsystem figures and sampled route. CPU regression tests ran during
 part of the Metal run, so that result includes some additional system load.
-Classic's different calibration scene measured29.53 FPS with CPU color grading;
-its baseline JSON is diagnostic, not an identical-scene comparison.
+The former renderer's different calibration scene measured29.53 FPS with CPU
+color grading; its baseline JSON is diagnostic, not an identical-scene comparison.
 
 Selected real screenshots and generated concepts are in `development/reference`:
 `before-driving.png` (Classic baseline), `concept-road.png`, `concept-car.png`
@@ -183,7 +197,7 @@ next work is more authored landmark families and textured foliage/ground cover.
 
 Collision proxies are deliberately simple; buildings use conservative circular
 footprints, and vegetation canopies are non-solid. Traffic is a bounded ambient
-road-following model rather than the full Classic IDM/MOBIL and incident system.
+road-following model rather than the legacy IDM/MOBIL and incident system.
 The chassis remains supported by terrain rather than becoming an airborne rigid
 body. Recovery handles invalid/wedged states; rollover dynamics are not simulated.
 World seed reproduces geometry, not the travel-history-dependent ambient traffic

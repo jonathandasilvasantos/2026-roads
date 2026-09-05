@@ -29,7 +29,7 @@ Shows gray geometry obscuring sky. Source confirms CPU framebuffer readback and
 50 MB color LUT on every frame. Legacy road coordinates constrain travel to a
 single corridor and arrows rotate the camera rather than steering a vehicle.
 
-Decision: preserve original app/viewer and all content as Classic; add shared
+Initial decision: preserve the original app/viewer while building the slice; add shared
 free-drive simulation with Metal and OpenGL renderers. GPU-resident geometry,
 GPU color grading, deterministic 2D chunks, fixed 120 Hz vehicle physics. This
 avoids rewriting legacy weather/traffic functionality or breaking its tests.
@@ -144,3 +144,28 @@ Selected captures are reproducible with `tools/capture_scenes.py`.
 Launcher refinement: `run.sh` now requests fullscreen on the primary display;
 `--windowed` is an explicit development override. Esc exits immediately and P
 owns pause/resume. Both behaviors were verified on Metal and OpenGL.
+
+## Canonical integration and music restoration
+
+Area: entry point, launch behavior and procedural music. Acceptance: `app.py`
+and `run.sh` launch New Wave; launcher is fullscreen by default; Escape exits;
+the existing score plays without terminal errors; OpenGL remains functional.
+
+Implementation: New Wave became the sole public entry point, and the former
+implementation is retained only as an internal provider for mature audio code.
+The original Rhodes/strings generator now runs through an adaptive layer driven
+by speed, daylight, rain and biome. FluidSynth polyphony is capped at 64 and one
+effects group is used. Platform-invalid device resets and an unsupported limiter
+setting were removed. `--no-music` retains ambience; `--no-audio` silences both.
+
+Evidence: the complete validator passed 11/11 groups in 34.68s. A real 300-frame
+Metal run identified Apple M4/Metal, reported both audio and music enabled, and
+held 59.997 FPS with .801ms sampled GPU scene time; there were no FluidSynth
+errors. A separate OpenGL 4.1 context rendered successfully. The launcher report
+confirmed `fullscreen: true` at a 3840×2160 display with explicit 1280×720 render
+resolution. Short startup smoke reports include compilation/pipeline warmup and
+are compatibility evidence, not replacements for the sustained benchmarks.
+
+Final verification: passed. Reports are `music-metal-smoke.json`,
+`opengl-integration-smoke.json`, `fullscreen-launch-smoke.json`, and
+`validation-integration.json` under `development/evidence`.
