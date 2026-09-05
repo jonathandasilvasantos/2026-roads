@@ -6,11 +6,12 @@ import numpy as np
 import pygame
 from pygame.locals import (
     DOUBLEBUF, OPENGL, FULLSCREEN, QUIT, KEYDOWN, K_ESCAPE,
-    K_UP, K_DOWN, K_LEFT, K_RIGHT, K_SPACE, K_t,
+    K_UP, K_DOWN, K_LEFT, K_RIGHT, K_SPACE, K_t, K_l,
 )
 import random
 import os
 import threading
+import tempfile
 import time as _time_mod
 
 def _print_help_banner(title, lines):
@@ -186,6 +187,9 @@ TRANS_LEN = 95.0       # long smoothstep between zones so biomes shift gently
  BIOME_FARM, BIOME_WETLAND, BIOME_CERRADO,
  BIOME_INDUSTRIAL) = range(11)
 BIOME_COUNT = 11
+_BIOME_DBG_NAMES = ['plain', 'hill', 'mountain', 'river', 'forest',
+                    'frost', 'city', 'farm', 'wetland', 'cerrado',
+                    'industrial']
 
 BIOME_COLOR = np.array([
     [0.46, 0.70, 0.26],   # plain grass
@@ -1755,11 +1759,13 @@ class MinimalEnsemblePlayer:
         name is fed into audio.coreaudio.device, and we force the
         coreaudio driver so the per-device routing actually applies."""
         fs = _fluidsynth.Synth(samplerate=48000, gain=gain)
-        for k in ("audio.dsound.device", "audio.wasapi.device",
-                  "audio.waveout.device", "audio.coreaudio.device",
-                  "audio.pulseaudio.device", "audio.alsa.device"):
+        # A small real-time score does not need FluidSynth's default 256 voices.
+        # Bounding polyphony protects frame pacing; one effects group avoids the
+        # significant CPU multiplier documented for additional groups.
+        for key,value in (("synth.polyphony",64),("synth.effects-groups",1),
+                          ("synth.reverb.active",1),("synth.chorus.active",1)):
             try:
-                fs.setting(k, "")
+                fs.setting(key,value)
             except Exception:
                 pass
         try:
@@ -2533,8 +2539,10 @@ def draw_ponds(pond_tex, s_car, storm_i, horizon_rgb, amb_rgb, t_time):
             continue
         for side, warr in ((-1, wL), (+1, wR)):
             w = warr[i]
-            # skip river (already water) and frost (already snow)
-            if w[BIOME_RIVER] > 0.25 or w[BIOME_FROST] > 0.35:
+            # skip river (already water) and frost (already snow);
+            # nothing pools on a bridge deck or in a tunnel either
+            if w[BIOME_RIVER] > 0.25 or w[BIOME_FROST] > 0.35 \
+                    or on_bridge(s) or in_tunnel(s):
                 continue
             key = (int(s * 73) * 2654435761
                    + (0 if side < 0 else 8191)
@@ -3348,11 +3356,19 @@ def draw_sky(sky_state, cam_x, cam_y, cam_z, t_time, t_day,
             k = (storm - 0.55) / 0.45
             glColor4f(cloud_tint[0], cloud_tint[1], cloud_tint[2],
                       0.55 * k * over_alpha)
+            glMatrixMode(GL_TEXTURE)
             glLoadIdentity()
             glTranslatef(t_time * 0.0030 + 0.37, -t_time * 0.0008, 0.0)
             glMatrixMode(GL_MODELVIEW)
             glDrawElements(GL_TRIANGLES, len(idx), GL_UNSIGNED_INT, idx)
-            glMatrixMode(GL_TEXTURE)
+        # ALWAYS reset the texture matrix in TEXTURE mode. The previous
+        # cleanup ran glLoadIdentity() while still in MODELVIEW mode
+        # whenever storm <= 0.55, so the overcast scroll translation
+        # leaked into every textured draw for the rest of the frame —
+        # including the post-process writeback quad, which then drew
+        # the whole screen cyclically wrapped (the "extra camera
+        # views" bands at the edges, sliding with run time).
+        glMatrixMode(GL_TEXTURE)
         glLoadIdentity()
         glMatrixMode(GL_MODELVIEW)
         glDisableClientState(GL_TEXTURE_COORD_ARRAY)
@@ -3523,6 +3539,12 @@ def build_side_arrays(s_arr, s_car, side, t_time, amb_rgb):
     edge_y = (-side * (ROAD_WIDTH / 2)) * roll
     bank_blend = np.clip(1.0 - d / 12.0, 0.0, 1.0)
     off = off + edge_y[:, None] * bank_blend[None, :]
+    # Ravines (plan v2 phase 3): transverse valley cuts applied AFTER
+    # the road-edge blend, so the ground genuinely falls away under
+    # the viaduct deck instead of being pinned to the shoulder.
+    rav = ravine_depth_np(s_arr)
+    if float(rav.max()) > 0.0:
+        off = off - rav[:, None]
     x = rx[:, None] + side * (ROAD_WIDTH / 2 + d[None, :])
     y = ry[:, None] + off
     z = np.broadcast_to(rz[:, None], (NS, K))
@@ -3655,29 +3677,217 @@ def _snow_mix(base_col, frost_i, amount=0.70):
             base_col[2] * (1 - t) + snow[2] * t)
 
 
-def draw_civil_structures(s_car, concrete_tex, amb_rgb, storm_i, frost_i):
-    NS = N_SEG + 1
-    s_arr = np.arange(NS, dtype=np.float32) * SEG_LEN + s_car
-    wL = biome_weights_vec(s_arr, -1)
-    wR = biome_weights_vec(s_arr, +1)
-    bridge_w = np.maximum(wL[:, BIOME_RIVER], wR[:, BIOME_RIVER])
+# Span structure VBOs: per span, geometry baked once in WORLD space
+# split into shade groups (fascia/rails bright, piers mid, underside
+# and girders dark) so daylight modulates via one glColor per group.
+_BRIDGE_VBOS = {}
 
-    if bridge_w.max() < 0.25:
-        return  # no bridges in the visible window
 
+def _bspan_key(sp):
+    return (round(sp['s0'], 1), sp['kind'])
+
+
+def _build_bridge_vbos(sp):
+    key = _bspan_key(sp)
+    hit = _BRIDGE_VBOS.get(key)
+    if hit is not None:
+        return hit
+    s0, s1 = sp['s0'], sp['s1']
+    g100, g085, g055 = [], [], []
+
+    def quad(dst, p0, p1, p2, p3, uscale=0.18):
+        tri = [p0, p1, p2, p0, p2, p3]
+        for (x, y, z) in tri:
+            dst.append((x, y, z, x * 0.10, y * uscale))
+
+    half = ROAD_WIDTH / 2
+    seg = 8.0
+    svals = list(np.arange(s0, s1 + 0.001, seg))
+    if svals[-1] < s1:
+        svals.append(s1)
+    for i in range(len(svals) - 1):
+        sa, sb = svals[i], svals[i + 1]
+        for sgn in (-1.0, 1.0):
+            xa = curve_x(sa) + sgn * (half + 0.15)
+            xb = curve_x(sb) + sgn * (half + 0.15)
+            ya = road_y_at(sa, sgn * half)
+            yb = road_y_at(sb, sgn * half)
+            # side fascia: shallow upstand + deep deck face
+            quad(g100, (xa, ya + 0.35, -sa), (xb, yb + 0.35, -sb),
+                 (xb, yb - 1.35, -sb), (xa, ya - 1.35, -sa))
+            # girder slab under each edge
+            gx_a = curve_x(sa) + sgn * 2.8
+            gx_b = curve_x(sb) + sgn * 2.8
+            quad(g055, (gx_a, curve_y(sa) - 1.35, -sa),
+                 (gx_b, curve_y(sb) - 1.35, -sb),
+                 (gx_b, curve_y(sb) - 2.0, -sb),
+                 (gx_a, curve_y(sa) - 2.0, -sa))
+        # underside slab
+        quad(g055,
+             (curve_x(sa) - half - 0.15, curve_y(sa) - 1.35, -sa),
+             (curve_x(sa) + half + 0.15, curve_y(sa) - 1.35, -sa),
+             (curve_x(sb) + half + 0.15, curve_y(sb) - 1.35, -sb),
+             (curve_x(sb) - half - 0.15, curve_y(sb) - 1.35, -sb))
+    # piers down to the water / ravine floor, with splash collars
+    sp_pier = 18.0
+    n_pier = max(1, int((s1 - s0) / sp_pier))
+    for i in range(n_pier + 1):
+        sv = s0 + 9.0 + i * sp_pier
+        if sv > s1 - 4.0:
+            break
+        if sp['kind'] == 'river':
+            base_y = curve_y(sv) - 3.4
+        else:
+            base_y = curve_y(sv) - ravine_depth_at(sv) - 0.5
+        top_y = curve_y(sv) - 1.3
+        if top_y - base_y < 1.0:
+            continue
+        x = curve_x(sv)
+        for (hw, y0, y1, dst) in ((0.8, base_y, top_y, g085),
+                                  (1.15, base_y, base_y + 0.7, g085)):
+            for (dx0, dz0, dx1, dz1) in (
+                    (-hw, -hw, hw, -hw), (hw, -hw, hw, hw),
+                    (hw, hw, -hw, hw), (-hw, hw, -hw, -hw)):
+                quad(dst, (x + dx0, y0, -sv + dz0),
+                     (x + dx1, y0, -sv + dz1),
+                     (x + dx1, y1, -sv + dz1),
+                     (x + dx0, y1, -sv + dz0))
+    # see-through railing: posts every 4 m + two thin rails
+    for sgn in (-1.0, 1.0):
+        n_post = int((s1 - s0) / 4.0)
+        for i in range(n_post + 1):
+            sv = s0 + i * 4.0
+            x = curve_x(sv) + sgn * (half + 0.12)
+            y = road_y_at(sv, sgn * half)
+            quad(g100, (x - 0.05, y, -sv - 0.05),
+                 (x + 0.05, y, -sv + 0.05),
+                 (x + 0.05, y + 1.05, -sv + 0.05),
+                 (x - 0.05, y + 1.05, -sv - 0.05))
+        for ry in (0.55, 1.0):
+            for i in range(len(svals) - 1):
+                sa, sb = svals[i], svals[i + 1]
+                xa = curve_x(sa) + sgn * (half + 0.12)
+                xb = curve_x(sb) + sgn * (half + 0.12)
+                ya = road_y_at(sa, sgn * half) + ry
+                yb = road_y_at(sb, sgn * half) + ry
+                quad(g100, (xa, ya - 0.035, -sa), (xb, yb - 0.035, -sb),
+                     (xb, yb + 0.035, -sb), (xa, ya + 0.035, -sa))
+    # landmark cable-stay pylons: twin towers at the deck edges
+    # (H-frame) so the carriageway stays clear; cable fans drawn live
+    if sp.get('landmark'):
+        for f in (0.30, 0.70):
+            sv = s0 + (s1 - s0) * f
+            for sgn in (-1.0, 1.0):
+                x = curve_x(sv) + sgn * (half + 0.9)
+                for (hw, y0, y1) in ((0.85, curve_y(sv) - 3.4,
+                                      curve_y(sv) + 1.0),
+                                     (0.55, curve_y(sv) + 1.0,
+                                      curve_y(sv) + 21.0)):
+                    for (dx0, dz0, dx1, dz1) in (
+                            (-hw, -hw, hw, -hw), (hw, -hw, hw, hw),
+                            (hw, hw, -hw, hw), (-hw, hw, -hw, -hw)):
+                        quad(g085, (x + dx0, y0, -sv + dz0),
+                             (x + dx1, y0, -sv + dz1),
+                             (x + dx1, y1, -sv + dz1),
+                             (x + dx0, y1, -sv + dz0))
+            # crossbeam tying the towers above the road
+            xa = curve_x(sv) - (half + 0.9)
+            xb = curve_x(sv) + (half + 0.9)
+            yb0 = curve_y(sv) + 19.4
+            quad(g085, (xa, yb0, -sv - 0.55), (xb, yb0, -sv - 0.55),
+                 (xb, yb0 + 1.2, -sv + 0.55),
+                 (xa, yb0 + 1.2, -sv + 0.55))
+    vb = {}
+    for name, lst in (('g100', g100), ('g085', g085), ('g055', g055)):
+        vb[name] = _make_vbo(np.array(lst, dtype=np.float32)) \
+            if lst else None
+    if len(_BRIDGE_VBOS) > 24:
+        for old in list(_BRIDGE_VBOS.values()):
+            for part in old.values():
+                if part:
+                    glDeleteBuffers(1, [part[0]])
+        _BRIDGE_VBOS.clear()
+    _BRIDGE_VBOS[key] = vb
+    return vb
+
+
+def draw_civil_structures(s_car, concrete_tex, amb_rgb, storm_i,
+                          frost_i, t_day=0.5):
+    """True bridge structure over rivers and ravine viaducts (plan v2
+    phase 3): deck fascia + underside + girders + piers + see-through
+    railings, baked per span into world-space VBOs; rare cable-stay
+    landmark pylons get their cable fans drawn live."""
+    spans = [sp for sp in bridge_spans_near(s_car)
+             if sp['s1'] > s_car - 40.0 and sp['s0'] < s_car + 900.0]
+    if not spans:
+        return
     base = _structure_tint(amb_rgb, storm_i)
 
     glEnable(GL_TEXTURE_2D)
     glBindTexture(GL_TEXTURE_2D, concrete_tex)
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
-    glEnable(GL_BLEND)
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-    glDepthMask(GL_TRUE)  # solid structures participate in depth writes
+    glEnableClientState(GL_VERTEX_ARRAY)
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY)
+    glPushMatrix()
+    glTranslatef(0.0, 0.0, s_car)
+    for sp in spans:
+        vb = _build_bridge_vbos(sp)
+        for name, shade in (('g100', 1.0), ('g085', 0.85),
+                            ('g055', 0.55)):
+            part = vb[name]
+            if part:
+                glColor3f(min(1.0, base[0] * shade),
+                          min(1.0, base[1] * shade),
+                          min(1.0, base[2] * shade))
+                _vbo_draw(part)
+    glPopMatrix()
+    glBindBuffer(GL_ARRAY_BUFFER, 0)
+    glDisableClientState(GL_VERTEX_ARRAY)
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY)
+    glDisable(GL_TEXTURE_2D)
 
-    if bridge_w.max() >= 0.25:
-        _draw_bridges(s_arr, bridge_w, base, frost_i, s_car)
-
-    glDisable(GL_BLEND)
+    # cable fans + dawn birds, live (cheap lines/points)
+    crep = crepuscular_at(t_day)
+    glDisable(GL_TEXTURE_2D)
+    for sp in spans:
+        if sp.get('landmark'):
+            glLineWidth(1.2)
+            glColor3f(base[0] * 0.9, base[1] * 0.9, base[2] * 0.95)
+            glBegin(GL_LINES)
+            for f in (0.30, 0.70):
+                sv = sp['s0'] + (sp['s1'] - sp['s0']) * f
+                for tsgn in (-1.0, 1.0):
+                    half_w = ROAD_WIDTH / 2
+                    top = (curve_x(sv) + tsgn * (half_w + 0.9),
+                           curve_y(sv) + 20.4, -(sv - s_car))
+                    for k in range(1, 7):
+                        for sgn in (-1.0, 1.0):
+                            sd = sv + sgn * k * 11.0
+                            if sd < sp['s0'] or sd > sp['s1']:
+                                continue
+                            glVertex3f(*top)
+                            glVertex3f(curve_x(sd)
+                                       + tsgn * (half_w + 0.1),
+                                       road_y_at(sd, tsgn * half_w)
+                                       + 0.45, -(sd - s_car))
+            glEnd()
+        if crep > 0.3:
+            # birds perched along the railing at dawn/dusk
+            glPointSize(2.5)
+            glColor3f(amb_rgb[0] * 0.15, amb_rgb[1] * 0.15,
+                      amb_rgb[2] * 0.17)
+            glBegin(GL_POINTS)
+            sv = math.ceil(sp['s0'] / 7.0) * 7.0
+            while sv < sp['s1']:
+                key = (int(sv) * 2654435761 + 31337) & 0xFFFFFFFF
+                if (key & 0xFF) < 90:
+                    sgn = -1.0 if (key >> 9) & 1 else 1.0
+                    glVertex3f(curve_x(sv) + sgn * (ROAD_WIDTH / 2
+                                                    + 0.12),
+                               road_y_at(sv, sgn * ROAD_WIDTH / 2)
+                               + 1.12, -(sv - s_car))
+                sv += 7.0
+            glEnd()
 
 
 def _emit_strip_segments(s_arr, weight_arr, threshold, emit_pair):
@@ -3700,25 +3910,6 @@ def _emit_strip_segments(s_arr, weight_arr, threshold, emit_pair):
             emit_pair(i, alpha)
     if in_strip:
         glEnd()
-
-
-def _draw_bridges(s_arr, bridge_w, base_col, frost_i, s_car):
-    RAIL_H = 1.05
-    base_top = _snow_mix(base_col, frost_i, amount=0.80)  # snow caps the top
-    base_bot = base_col
-
-    for side in (-1, +1):
-        def emit(i, alpha, side=side):
-            s = float(s_arr[i])
-            x = curve_x(s) + side * (ROAD_WIDTH / 2 + 0.10)
-            y_base = road_y_at(s, side * (ROAD_WIDTH / 2 + 0.10)) + 0.05
-            z = -(s - s_car)
-            u = s * 0.18
-            glColor4f(base_bot[0], base_bot[1], base_bot[2], alpha)
-            glTexCoord2f(u, 0.0); glVertex3f(x, y_base, z)
-            glColor4f(base_top[0], base_top[1], base_top[2], alpha)
-            glTexCoord2f(u, 1.0); glVertex3f(x, y_base + RAIL_H, z)
-        _emit_strip_segments(s_arr, bridge_w, 0.25, emit)
 
 
 # --- Road surface zones (Phase 4.1) ---------------------------------------
@@ -4807,6 +4998,11 @@ def draw_snow_shoulders(snow_tex, s_car, amb_rgb):
     wR = biome_weights_vec(s_arr, +1)[:, BIOME_FROST]
     if wL.max() < 0.02 and wR.max() < 0.02:
         return
+    # no snow shoulders on bridge decks (they end at the railing)
+    span_mask = np.ones(NS, dtype=np.float32)
+    for sp in bridge_spans_near(s_car):
+        m = (s_arr >= sp['s0']) & (s_arr <= sp['s1'])
+        span_mask[m] = 0.0
 
     glEnable(GL_TEXTURE_2D)
     glBindTexture(GL_TEXTURE_2D, snow_tex)
@@ -4819,7 +5015,7 @@ def draw_snow_shoulders(snow_tex, s_car, amb_rgb):
         glBegin(GL_QUAD_STRIP)
         for i in range(NS):
             s = s_arr[i]
-            a = float(min(1.0, warr[i] * 1.3))
+            a = float(min(1.0, warr[i] * 1.3 * span_mask[i]))
             x = curve_x(s); z = -(s - s_car)
             y = road_y_at(s, side * (ROAD_WIDTH / 2))
             inner = x + side * (ROAD_WIDTH / 2 + 0.02)
@@ -6969,6 +7165,156 @@ def tunnel_depth_at(s):
                (t['s1'] + TUNNEL_SKIRT) - s)
     return max(0.0, min(1.0, d_in / (2.0 * TUNNEL_SKIRT)))
 
+
+# --- Ravines & bridge spans (plan v2, phase 3) ----------------------------
+# The base terrain never drops far below the road, so valley VIADUCTS
+# need genuine valleys: ravines are deterministic transverse
+# depressions carved through hill/mountain zones (applied inside the
+# terrain build, bypassing the road-edge blend so the ground really
+# falls away under the deck). The viaduct then spans the gap it
+# created — the same "structure earns itself" logic as the tunnels.
+# River crossings upgrade the old parapet strips into a true bridge:
+# deck fascia, underside, girders, piers down to the water.
+RAVINE_SPACING = 3300.0
+_RAVINE_CACHE = {}
+BRIDGE_CELL = 2000.0
+_BRIDGE_SPANS_CACHE = {}
+
+
+def ravine_for_cell(k):
+    rv = _RAVINE_CACHE.get(k)
+    if rv is not None or k in _RAVINE_CACHE:
+        return rv
+    rv = None
+    key = _zone_hash(k, 9311)
+    if (key & 0xFF) / 255.0 <= 0.60:
+        L = 75.0 + ((key >> 8) & 0xFF) / 255.0 * 60.0
+        s0 = k * RAVINE_SPACING + 500.0 + ((key >> 16) & 0xFF) / 255.0 \
+            * (RAVINE_SPACING - 1000.0 - L)
+        mid = s0 + L / 2.0
+        wl = biome_weights_vec(np.array([mid], dtype=np.float32), -1)[0]
+        wr = biome_weights_vec(np.array([mid], dtype=np.float32), +1)[0]
+        hilly = max(float(wl[BIOME_HILL] + wl[BIOME_MOUNTAIN]),
+                    float(wr[BIOME_HILL] + wr[BIOME_MOUNTAIN]))
+        if hilly >= 0.45 and tunnel_near(mid) is None:
+            depth = 9.0 + ((key >> 24) & 0x3F) / 63.0 * 6.0
+            rv = {'s0': s0, 's1': s0 + L, 'depth': depth}
+    _RAVINE_CACHE[k] = rv
+    return rv
+
+
+def ravine_near(s):
+    for k in {int((s - 300.0) // RAVINE_SPACING),
+              int((s + 300.0) // RAVINE_SPACING)}:
+        rv = ravine_for_cell(k)
+        if rv is not None and rv['s0'] - 300.0 < s < rv['s1'] + 300.0:
+            return rv
+    return None
+
+
+def ravine_depth_at(s):
+    rv = ravine_near(s)
+    if rv is None or not (rv['s0'] <= s <= rv['s1']):
+        return 0.0
+    u = (s - rv['s0']) / (rv['s1'] - rv['s0'])
+    sn = math.sin(math.pi * u)
+    return rv['depth'] * sn * sn
+
+
+def ravine_depth_np(s_arr):
+    out = np.zeros(len(s_arr), dtype=np.float32)
+    for k in np.unique((np.asarray(s_arr) // RAVINE_SPACING
+                        ).astype(np.int64)):
+        rv = ravine_for_cell(int(k))
+        if rv is None:
+            continue
+        u = (np.asarray(s_arr) - rv['s0']) / (rv['s1'] - rv['s0'])
+        m = (u > 0.0) & (u < 1.0)
+        if np.any(m):
+            sn = np.sin(np.pi * u[m])
+            out[m] = rv['depth'] * sn * sn
+    return out
+
+
+def _bridge_spans_cell(k):
+    """Bridge spans whose midpoint lies in cell k: contiguous runs of
+    strong river weight (true river bridges, rare long ones flagged as
+    cable-stay landmarks) plus the cell-overlapping ravine viaducts."""
+    if k in _BRIDGE_SPANS_CACHE:
+        return _BRIDGE_SPANS_CACHE[k]
+    spans = []
+    step = 20.0
+    base = k * BRIDGE_CELL
+    # scan past the cell edges so runs are never truncated mid-river;
+    # only runs whose midpoint lands in this cell are claimed by it
+    raw = []
+    run = None
+    sv = base - 400.0
+    while sv <= base + BRIDGE_CELL + 400.0:
+        w = max(float(biome_weights_vec(
+                      np.array([sv], dtype=np.float32), -1
+                      )[0][BIOME_RIVER]),
+                float(biome_weights_vec(
+                      np.array([sv], dtype=np.float32), +1
+                      )[0][BIOME_RIVER]))
+        if w >= 0.45:
+            if run is None:
+                run = sv
+        elif run is not None:
+            raw.append([run, sv - step])
+            run = None
+        sv += step
+    if run is not None:
+        raw.append([run, base + BRIDGE_CELL + 400.0])
+    # merge fragments separated by short dry gaps, drop slivers
+    merged = []
+    for r in raw:
+        if merged and r[0] - merged[-1][1] < 80.0:
+            merged[-1][1] = r[1]
+        else:
+            merged.append(r)
+    for (r0, r1) in merged:
+        if r1 - r0 < 60.0:
+            continue
+        if not (base <= (r0 + r1) / 2 < base + BRIDGE_CELL):
+            continue
+        # a mountain run on the other side may have claimed this
+        # stretch for a tunnel — the rock wins, no deck under a bore
+        tn = tunnel_near((r0 + r1) / 2)
+        if tn is not None and tn['s0'] < r1 and tn['s1'] > r0:
+            continue
+        key = _zone_hash(int(r0), 9477)
+        spans.append({'s0': r0, 's1': r1, 'kind': 'river',
+                      'landmark': (r1 - r0 >= 200.0
+                                   and (key & 0xFF) < 26)})
+    for rk in {int(base // RAVINE_SPACING),
+               int((base + BRIDGE_CELL) // RAVINE_SPACING)}:
+        rv = ravine_for_cell(rk)
+        if rv is not None and base <= (rv['s0'] + rv['s1']) / 2 \
+                < base + BRIDGE_CELL:
+            spans.append({'s0': rv['s0'], 's1': rv['s1'],
+                          'kind': 'viaduct', 'landmark': False,
+                          'depth': rv['depth']})
+    if len(_BRIDGE_SPANS_CACHE) > 256:
+        _BRIDGE_SPANS_CACHE.clear()
+    _BRIDGE_SPANS_CACHE[k] = spans
+    return spans
+
+
+def bridge_spans_near(s):
+    out = []
+    for k in range(int((s - 200.0) // BRIDGE_CELL),
+                   int((s + 1000.0) // BRIDGE_CELL) + 1):
+        out.extend(_bridge_spans_cell(k))
+    return out
+
+
+def on_bridge(s):
+    for sp in bridge_spans_near(s):
+        if sp['s0'] - 2.0 <= s <= sp['s1'] + 2.0:
+            return True
+    return False
+
 # Driver personalities, rolled once per spawned vehicle. T is desired
 # time headway (s); a_max comfortable acceleration and b comfortable
 # braking (m/s²); eager scales the lane-change incentive threshold.
@@ -8452,7 +8798,9 @@ def draw_cars(state, car_variants, s_car, amb_rgb, sun_dir,
         # lane state is untouched.
         if storm_i > 0.05 and kind in ('truck', 'bus', 'van',
                                        'motorcycle'):
-            cx += math.sin(t_time * 1.7 + s * 0.13) * 0.07 * storm_i
+            # exposed bridge decks catch ~50% more crosswind
+            buf = 0.07 * storm_i * (1.5 if on_bridge(s) else 1.0)
+            cx += math.sin(t_time * 1.7 + s * 0.13) * buf
 
         ds = 0.5
         dxds = (curve_x(s + ds) - curve_x(s - ds)) / (2.0 * ds)
@@ -10569,7 +10917,8 @@ def build_phase4_props():
 def _ground_y(s, side, d, w_b, t_time):
     hs = terrain_heights(float(s), float(d), t_time)
     return curve_y(s) + sum(float(w_b[j]) * float(hs[j])
-                            for j in range(BIOME_COUNT))
+                            for j in range(BIOME_COUNT)) \
+        - ravine_depth_at(s)
 
 
 def draw_guardrails(s_car, amb_rgb):
@@ -10583,12 +10932,16 @@ def draw_guardrails(s_car, amb_rgb):
     wR = biome_weights_vec(s_arr, +1)
     curv = np.array([road_curv(float(sv)) for sv in s_arr],
                     dtype=np.float32)
-    # no guardrails inside a bore — the tunnel walls do that job
+    # no guardrails inside a bore (tunnel walls) or on bridge spans
+    # (the railings take over there)
     tun = tunnel_near(s_car)
     tun_mask = np.ones(NS, dtype=np.float32)
     if tun is not None:
         inside = (s_arr >= tun['s0'] - 4.0) & (s_arr <= tun['s1'] + 4.0)
         tun_mask[inside] = 0.0
+    for sp in bridge_spans_near(s_car):
+        onsp = (s_arr >= sp['s0'] - 4.0) & (s_arr <= sp['s1'] + 4.0)
+        tun_mask[onsp] = 0.0
     glDisable(GL_TEXTURE_2D)
     rail = (min(1.0, amb_rgb[0] * 0.80), min(1.0, amb_rgb[1] * 0.82),
             min(1.0, amb_rgb[2] * 0.86))
@@ -11651,6 +12004,12 @@ def _cinematic_post_process(W, H, cfg=CINEMATIC_CFG):
         glBindTexture(GL_TEXTURE_2D, tex)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        # Clamp: even if a texture-matrix translation ever leaks into
+        # this pass again, the frame must never WRAP around the screen.
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                        GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                        GL_CLAMP_TO_EDGE)
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, W, H, 0,
                      GL_RGB, GL_UNSIGNED_BYTE, None)
         tcache[(W, H)] = tex
@@ -11658,6 +12017,9 @@ def _cinematic_post_process(W, H, cfg=CINEMATIC_CFG):
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, W, H,
                     GL_RGB, GL_UNSIGNED_BYTE, out)
 
+    glMatrixMode(GL_TEXTURE)
+    glPushMatrix()
+    glLoadIdentity()    # texcoords must map 1:1, whatever leaked before
     glMatrixMode(GL_PROJECTION)
     glPushMatrix()
     glLoadIdentity()
@@ -11679,9 +12041,15 @@ def _cinematic_post_process(W, H, cfg=CINEMATIC_CFG):
     glTexCoord2f(0, 1); glVertex2f(0, H)
     glEnd()
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+    # Unbind the frame texture: if it stayed bound, any later pass that
+    # enables texturing without its own bind would paint a copy of the
+    # whole screen onto its geometry.
+    glBindTexture(GL_TEXTURE_2D, 0)
     glDisable(GL_TEXTURE_2D)
     glPopMatrix()
     glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_TEXTURE)
     glPopMatrix()
     glMatrixMode(GL_MODELVIEW)
     glEnable(GL_DEPTH_TEST)
@@ -11787,6 +12155,38 @@ def _resolve_audio_devices(mode):
 
 
 # --- Main ---
+def _gl_drawable_size():
+    """True GL drawable size in pixels, straight from SDL (or None).
+    pygame doesn't expose SDL_GL_GetDrawableSize, but the SDL symbols
+    are already loaded in-process — resolve via the global table.
+    Needed because macOS resizes the drawable ASYNCHRONOUSLY (the
+    fullscreen transition finishes after set_mode returns, Retina
+    modes scale, Space switches can re-shape the surface)."""
+    sdl = _gl_drawable_size.__dict__.get('_sdl', False)
+    if sdl is False:
+        try:
+            sdl = ctypes.CDLL(None)
+            sdl.SDL_GL_GetCurrentWindow.restype = ctypes.c_void_p
+        except Exception:
+            sdl = None
+        _gl_drawable_size._sdl = sdl
+    if sdl is None:
+        return None
+    try:
+        win = sdl.SDL_GL_GetCurrentWindow()
+        if not win:
+            return None
+        w = ctypes.c_int(0)
+        h = ctypes.c_int(0)
+        sdl.SDL_GL_GetDrawableSize(ctypes.c_void_p(win),
+                                   ctypes.byref(w), ctypes.byref(h))
+        if w.value > 0 and h.value > 0:
+            return (int(w.value), int(h.value))
+    except Exception:
+        return None
+    return None
+
+
 def main(argv=None):
     args = _build_arg_parser().parse_args(argv)
 
@@ -11825,6 +12225,29 @@ def main(argv=None):
         pygame.display.set_mode((W, H), DOUBLEBUF | OPENGL | FULLSCREEN)
     pygame.display.set_caption("Roads")
     pygame.mouse.set_visible(False)
+
+    # The REAL GL drawable can differ from the requested mode (macOS
+    # notch / menu bar / scaled or Retina modes) — and it KEEPS
+    # changing for a moment while the fullscreen transition animates.
+    # Adopt the real size now; the main loop re-checks every frame.
+    _ds = _gl_drawable_size()
+    if _ds is not None and _ds != (W, H):
+        W, H = _ds
+    # Byte-tight pixel rows for RGB readback/upload: with the default
+    # 4-byte alignment, any drawable width not divisible by 4 shears
+    # the post-process image diagonally.
+    glPixelStorei(GL_PACK_ALIGNMENT, 1)
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+
+    # Present clean black frames IMMEDIATELY, before the heavy texture/
+    # display-list init (~seconds). Until the first flip the visible
+    # front buffer is undefined — on macOS that means stale VRAM, which
+    # can show tiles of old GPU frames (e.g., previous runs or offline
+    # renders) as if the app were displaying extra camera views.
+    glClearColor(0.0, 0.0, 0.0, 1.0)
+    for _ in range(2):      # clear BOTH buffers of the swap chain
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        pygame.display.flip()
 
     glEnable(GL_DEPTH_TEST)
     glEnable(GL_LINE_SMOOTH)
@@ -12087,6 +12510,7 @@ def main(argv=None):
     _headless_time_override = args.time is not None
     _headless_storm_override = args.storm is not None
     _apply_cinematic = not args.no_cinematic
+    debug_shot_queued = False
     while running:
         dt = clock.tick(60) / 1000.0
         for e in pygame.event.get():
@@ -12103,6 +12527,11 @@ def main(argv=None):
                     # exploring; still goes through the normal bolt +
                     # flash pipeline + thunder clap.
                     manual_strike_queued = True
+                elif e.key == K_l:
+                    # Debug snapshot: saved post-flip so the PNG is
+                    # exactly what the screen showed, plus a .txt
+                    # report of everything active in the frame.
+                    debug_shot_queued = True
 
         # Up/Down + Left/Right: held-key polling so changes feel
         # proportional to how long the key is held.
@@ -12279,6 +12708,21 @@ def main(argv=None):
                * (1.0 - 0.6 * tun_depth))
         glFogf(GL_FOG_END, vis_end)
         glClearColor(horizon[0], horizon[1], horizon[2], 1.0)
+
+        # Drawable tracking (macOS): the GL surface can change size at
+        # ANY time — the fullscreen transition completes a moment after
+        # launch, Retina modes scale, Space switches re-shape it. The
+        # scene, the post-process readback and the writeback quad must
+        # always agree on the REAL size, or stale bands appear at the
+        # edges of the screen.
+        _ds = _gl_drawable_size()
+        if _ds is not None and _ds != (W, H):
+            W, H = _ds
+            glMatrixMode(GL_PROJECTION)
+            glLoadIdentity()
+            gluPerspective(68.0, W / float(H), 0.1, 1800.0)
+            glMatrixMode(GL_MODELVIEW)
+        glViewport(0, 0, W, H)
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
@@ -12573,7 +13017,8 @@ def main(argv=None):
         # Bridges + tunnels: placed where biomes dictate (river / mountain)
         # so they never collide with trees, buildings, or other structures.
         # Concrete tint wet-darkens off the same wetness memory.
-        draw_civil_structures(s_car, concrete_tex, amb, wetness, frost_i)
+        draw_civil_structures(s_car, concrete_tex, amb, wetness, frost_i,
+                              t_day=t_day)
         # Roadside furniture (4.2): rare concrete overpasses, guardrails
         # on drop-offs, meaningful signage, rural power lines, billboards
         # and bus shelters at the phase-2 stop slots.
@@ -12723,6 +13168,109 @@ def main(argv=None):
             except BrokenPipeError:
                 running = False
 
+        # Debug snapshot (L key): PNG of exactly what the user just saw
+        # (front buffer, post-grade) named by the elapsed run time, plus
+        # a .txt report of everything active in the frame — for pinning
+        # down WHEN a visual bug happens and which systems were live.
+        if debug_shot_queued:
+            debug_shot_queued = False
+            _dbg_dir = os.path.join(tempfile.gettempdir(), 'roads_debug')
+            os.makedirs(_dbg_dir, exist_ok=True)
+            _base = os.path.join(_dbg_dir, f"shot_t{t_time:08.2f}s")
+            _save_screenshot(_base + '.png', W, H)
+            try:
+                _wn = [f"{_BIOME_DBG_NAMES[j]}={float(v):.2f}"
+                       for j, v in enumerate(biome_weights_vec(
+                           np.array([s_car], dtype=np.float32), -1)[0])
+                       if v > 0.05]
+                _we = [f"{_BIOME_DBG_NAMES[j]}={float(v):.2f}"
+                       for j, v in enumerate(biome_weights_vec(
+                           np.array([s_car], dtype=np.float32), +1)[0])
+                       if v > 0.05]
+                _tun = tunnel_near(s_car)
+                _rv = ravine_near(s_car)
+                _spans = [sp for sp in bridge_spans_near(s_car)
+                          if sp['s1'] > s_car - 100.0
+                          and sp['s0'] < s_car + 900.0]
+                _rw = roadworks_near(s_car)
+                _toll = toll_near(s_car)
+                _trap = trap_near(s_car)
+                _ds_now = _gl_drawable_size()
+                lines = [
+                    f"wall clock     : {_time_mod.strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"run time       : {t_time:.2f} s   frame {_frame_no}"
+                    f"   fps {clock.get_fps():.1f}",
+                    f"render size W,H: {W} x {H}",
+                    f"drawable (SDL) : {_ds_now}",
+                    f"window logical : {pygame.display.get_window_size()}",
+                    f"viewport       : "
+                    f"{[int(v) for v in glGetIntegerv(GL_VIEWPORT)]}",
+                    "",
+                    f"s_car          : {s_car:.1f} m   speed {speed:.1f} m/s"
+                    f"   camera_yaw {camera_yaw:.1f}°"
+                    f"   cam_roll {math.degrees(cam_roll):.2f}°",
+                    f"time of day    : {t_day * 24.0:05.2f} h"
+                    f"   night_a {night_a:.2f}",
+                    f"ambient rgb    : ({amb[0]:.2f}, {amb[1]:.2f},"
+                    f" {amb[2]:.2f})   horizon ({horizon[0]:.2f},"
+                    f" {horizon[1]:.2f}, {horizon[2]:.2f})",
+                    f"weather        : {WEATHER_NAMES[weather.state]}"
+                    f"   storm_i {storm_i:.2f}  rain_i {rain_i:.2f}"
+                    f"  frost_i {frost_i:.2f}  wetness {wetness:.2f}"
+                    f"  wind {wind_strength:.2f}  flash {flash:.2f}",
+                    f"fog            : end {vis_end:.0f} m"
+                    f"   dawn_fog {dawn_fog:.2f}",
+                    "",
+                    f"biome left     : {', '.join(_wn) or '-'}",
+                    f"biome right    : {', '.join(_we) or '-'}",
+                    f"corner         : curvature {road_curv(s_car):+.4f}"
+                    f"   bank roll {road_roll(s_car):+.3f}",
+                    f"tunnel         : depth {tun_depth:.2f}   span "
+                    f"{[round(_tun['s0']), round(_tun['s1'])] if _tun else '-'}",
+                    f"bridges near   : "
+                    + (', '.join(f"{sp['kind']}[{sp['s0']:.0f}"
+                                 f"..{sp['s1']:.0f}]"
+                                 + ('*landmark' if sp.get('landmark')
+                                    else '')
+                                 for sp in _spans) or '-'),
+                    f"ravine         : "
+                    + (f"[{_rv['s0']:.0f}..{_rv['s1']:.0f}]"
+                       f" depth {_rv['depth']:.1f}" if _rv else '-'),
+                    f"roadworks      : "
+                    + (f"[{_rw['s0']:.0f}..{_rw['s1']:.0f}] lane"
+                       f" {_rw['lane']} sub {_rw['sub']}" if _rw else '-'),
+                    f"toll / trap    : "
+                    + (f"toll@{_toll['s']:.0f}" if _toll else 'toll -')
+                    + '   '
+                    + (f"trap@{_trap['s']:.0f}" if _trap else 'trap -'),
+                    "",
+                    "traffic (in render window 0..+880 m ahead /"
+                    " -60 m behind):",
+                ]
+                for st in (car_state, truck_state, moto_state,
+                           van_state, bus_state, emerg_state):
+                    vis = [c for c in st['cars']
+                           if -60.0 <= c['s'] - s_car <= 880.0]
+                    if not vis:
+                        continue
+                    parked = sum(1 for c in vis if c.get('parked'))
+                    lines.append(
+                        f"  {st['kind']:<12s} {len(vis):2d} visible"
+                        f" ({parked} parked); nearest: "
+                        + ', '.join(
+                            f"{'same' if c['lane'] == -1 else 'onc'}"
+                            f"@{c['s'] - s_car:+.0f}m"
+                            f" v={c['speed']:.0f}"
+                            for c in sorted(
+                                vis,
+                                key=lambda c: abs(c['s'] - s_car))[:4]))
+                with open(_base + '.txt', 'w') as fh:
+                    fh.write('\n'.join(lines) + '\n')
+                print(f"saved: {_base}.txt", file=sys.stderr)
+            except Exception as exc:  # report must never kill the sim
+                with open(_base + '.txt', 'w') as fh:
+                    fh.write(f"debug report failed: {exc!r}\n")
+
         # Headless: after warmup frames elapse, capture a screenshot and
         # end the loop. Saving reads the FRONT buffer post-flip so the
         # captured image is exactly what we just displayed (same trick as
@@ -12743,4 +13291,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    # New Wave is the canonical application. Keeping the procedural audio and
+    # generation definitions in this module avoids a risky big-bang file split;
+    # the former linear-road entry point remains callable as main() for tests.
+    from new_wave.game import main as new_wave_main
+    new_wave_main(audio_module=sys.modules[__name__])

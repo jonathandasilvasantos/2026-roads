@@ -1,0 +1,325 @@
+{
+  "backend": {
+    "vendor": "",
+    "architecture": "",
+    "device": "Apple M4",
+    "description": "",
+    "stackgroup_min_size": 4,
+    "stackgroup_max_size": 128,
+    "vendor_id": 0,
+    "device_id": 0,
+    "adapter_type": "IntegratedGPU",
+    "backend_type": "Metal",
+    "fullscreen": false,
+    "render_resolution": [
+      1280,
+      720
+    ],
+    "display_resolution": [
+      2560,
+      1440
+    ]
+  },
+  "quality": "Balanced",
+  "resolution": [
+    1280,
+    720
+  ],
+  "world": {
+    "seed": 2026,
+    "chunk_size": 128,
+    "radius": 4,
+    "resolution": 24,
+    "density": 1.0,
+    "workers": 2,
+    "road_spacing": 384
+  },
+  "vehicle": {
+    "mass": 1250.0,
+    "center_of_gravity": 0.48,
+    "engine_force": 7800.0,
+    "braking_force": 14500.0,
+    "max_speed": 52.0,
+    "reverse_speed": 12.0,
+    "steering_angle": 0.56,
+    "steering_curve": 0.045,
+    "steering_response": 5.5,
+    "suspension_stiffness": 42000.0,
+    "suspension_damping": 12500.0,
+    "suspension_travel": 0.24,
+    "tire_grip": 1.1,
+    "drag": 0.44,
+    "rolling_resistance": 165.0,
+    "wheelbase": 2.65,
+    "track_width": 1.58,
+    "wheel_radius": 0.34,
+    "ride_height": 0.64,
+    "collision_radius": 1.05,
+    "collision_restitution": 0.1,
+    "fixed_dt": 0.008333333333333333,
+    "max_frame_dt": 0.25
+  },
+  "duration_seconds": 26.807413417001953,
+  "warmup_seconds": 2.0,
+  "measured_frames": 1488,
+  "vsync": true,
+  "frame": {
+    "mean_ms": 16.670047098785446,
+    "p99_ms": 16.670582994411234,
+    "peak_ms": 19.67891599633731
+  },
+  "physics": {
+    "mean_ms": 0.14071707150295518,
+    "p99_ms": 0.2613073671818711,
+    "peak_ms": 0.7788329967297614
+  },
+  "stream": {
+    "mean_ms": 0.028130692660324124,
+    "p99_ms": 0.046517545124515836,
+    "peak_ms": 2.0671249949373305
+  },
+  "cpu_submit": {
+    "mean_ms": 1.0950058512139305,
+    "p99_ms": 2.2566515553626205,
+    "peak_ms": 2.8356249968055636
+  },
+  "gpu_scene": {
+    "mean_ms": 0.8193800945307226,
+    "p99_ms": 1.504084,
+    "peak_ms": 1.504084
+  },
+  "average_fps": 59.98783291217326,
+  "one_percent_low_fps": 59.98590453226784,
+  "cpu_one_core_percent": 22.29371370909524,
+  "max_rss_mb": 242.34375,
+  "peak_chunks": 81,
+  "peak_pending": 4,
+  "peak_meshes": 92,
+  "generation": {
+    "mean_ms": 3.451386556359163,
+    "p99_ms": 8.357131141237913,
+    "peak_ms": 9.203499997965991
+  },
+  "last_render": {
+    "cpu_submit_ms": 1.5854999946895987,
+    "gpu_ms": 0.927,
+    "draw_calls": 96,
+    "triangles": 192732
+  },
+  "route": [
+    {
+      "seconds": 0.0,
+      "x": 0.0,
+      "z": -35.0,
+      "speed": 0.0,
+      "chunks": 81,
+      "rss_mb": 234.015625
+    },
+    {
+      "seconds": 2.15,
+      "x": 0.0,
+      "z": -35.07,
+      "speed": 0.93,
+      "chunks": 81,
+      "rss_mb": 242.34375
+    },
+    {
+      "seconds": 4.15,
+      "x": 0.0,
+      "z": -49.02,
+      "speed": 12.83,
+      "chunks": 81,
+      "rss_mb": 242.34375
+    },
+    {
+      "seconds": 6.15,
+      "x": 0.0,
+      "z": -85.48,
+      "speed": 23.26,
+      "chunks": 81,
+      "rss_mb": 242.34375
+    },
+    {
+      "seconds": 8.15,
+      "x": -5.13,
+      "z": -139.86,
+      "speed": 31.13,
+      "chunks": 81,
+      "rss_mb": 242.34375
+    },
+    {
+      "seconds": 10.15,
+      "x": -36.68,
+      "z": -192.54,
+      "speed": 19.38,
+      "chunks": 81,
+      "rss_mb": 242.34375
+    },
+    {
+      "seconds": 12.15,
+      "x": -38.9,
+      "z": -209.36,
+      "speed": -1.96,
+      "chunks": 81,
+      "rss_mb": 242.34375
+    },
+    {
+      "seconds": 14.15,
+      "x": -36.01,
+      "z": -197.57,
+      "speed": -9.82,
+      "chunks": 81,
+      "rss_mb": 242.34375
+    },
+    {
+      "seconds": 16.15,
+      "x": -36.01,
+      "z": -197.57,
+      "speed": -9.82,
+      "chunks": 81,
+      "rss_mb": 242.34375
+    },
+    {
+      "seconds": 18.15,
+      "x": -30.44,
+      "z": -179.71,
+      "speed": -3.8,
+      "chunks": 81,
+      "rss_mb": 242.34375
+    },
+    {
+      "seconds": 20.15,
+      "x": -17.9,
+      "z": -179.2,
+      "speed": 0.0,
+      "chunks": 81,
+      "rss_mb": 242.34375
+    },
+    {
+      "seconds": 22.15,
+      "x": -16.33,
+      "z": -185.96,
+      "speed": 8.87,
+      "chunks": 81,
+      "rss_mb": 242.34375
+    },
+    {
+      "seconds": 24.15,
+      "x": 3.52,
+      "z": -186.47,
+      "speed": 10.26,
+      "chunks": 81,
+      "rss_mb": 242.34375
+    },
+    {
+      "seconds": 26.15,
+      "x": 18.8,
+      "z": -182.07,
+      "speed": 3.43,
+      "chunks": 81,
+      "rss_mb": 242.34375
+    }
+  ],
+  "limitations": [
+    "GPU timestamps bracket shadow, scene and rain; Metal excludes HUD/presentation, OpenGL includes HUD but excludes blit/presentation",
+    "RSS is process high-water mark; unified driver allocation not separately available"
+  ],
+  "physics_dropped_seconds": 0.0,
+  "startup_dropped_seconds": 0.0,
+  "weather": "clear",
+  "time_hour": 16,
+  "replay": "development/replay-controls.json",
+  "input_events": [
+    {
+      "seconds": 0.0,
+      "keys": [],
+      "speed": 0.0,
+      "x": 0.0,
+      "z": -35.0
+    },
+    {
+      "seconds": 2.015,
+      "keys": [
+        87
+      ],
+      "speed": 0.0,
+      "x": 0.0,
+      "z": -35.0
+    },
+    {
+      "seconds": 7.002,
+      "keys": [
+        65,
+        87
+      ],
+      "speed": 26.971919332866165,
+      "x": 0.0,
+      "z": -106.60472775298858
+    },
+    {
+      "seconds": 9.002,
+      "keys": [
+        32,
+        68
+      ],
+      "speed": 33.60928871676875,
+      "x": -17.973921275585113,
+      "z": -163.74848300805357
+    },
+    {
+      "seconds": 10.003,
+      "keys": [
+        83
+      ],
+      "speed": 20.55903476309425,
+      "x": -36.87171161332882,
+      "z": -188.8707053048635
+    },
+    {
+      "seconds": 14.003,
+      "keys": [
+        80
+      ],
+      "speed": -9.834770831987765,
+      "x": -35.9984238235962,
+      "z": -197.51879416714453
+    },
+    {
+      "seconds": 16.203,
+      "keys": [
+        80
+      ],
+      "speed": -9.834770831987765,
+      "x": -35.9984238235962,
+      "z": -197.51879416714453
+    },
+    {
+      "seconds": 16.403,
+      "keys": [
+        83
+      ],
+      "speed": -9.83365144542267,
+      "x": -35.530021151225625,
+      "z": -195.60877004809547
+    },
+    {
+      "seconds": 18.403,
+      "keys": [
+        82
+      ],
+      "speed": -3.370440286180571,
+      "x": -29.902049940665677,
+      "z": -179.20474171974482
+    },
+    {
+      "seconds": 20.603,
+      "keys": [
+        68,
+        87
+      ],
+      "speed": 0.0,
+      "x": -17.902049940665677,
+      "z": -179.20474171974482
+    }
+  ]
+}

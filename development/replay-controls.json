@@ -1,0 +1,15 @@
+[
+  {"duration": 2, "keys": []},
+  {"duration": 5, "keys": ["W"]},
+  {"duration": 2, "keys": ["W", "A"]},
+  {"duration": 1, "keys": ["SPACE", "D"]},
+  {"duration": 4, "keys": ["S"]},
+  {"duration": 0.2, "keys": ["P"]},
+  {"duration": 2, "keys": []},
+  {"duration": 0.2, "keys": ["P"]},
+  {"duration": 2, "keys": ["S"]},
+  {"duration": 0.2, "keys": ["R"]},
+  {"duration": 2, "keys": []},
+  {"duration": 2, "keys": ["W", "D"]},
+  {"duration": 2, "keys": []}
+]

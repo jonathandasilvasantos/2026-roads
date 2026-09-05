@@ -1,5 +1,32 @@
 # 2026-roads
 
+## New Wave — free driving on Metal and OpenGL
+
+New Wave is the canonical game: a playable car and an endless world in every
+horizontal direction. On macOS, the default renderer uses **Metal on the GPU**.
+The same game also runs through **OpenGL 4.1** with the same physics, world,
+assets and adaptive procedural score.
+
+```bash
+./env/bin/python -m pip install -r requirements.txt
+./run.sh                          # fullscreen, Metal on macOS
+./run.sh --backend opengl          # same game through OpenGL
+./run.sh --windowed                # development window
+./run.sh --quality Quality         # more terrain and foliage, same resolution
+./run.sh --no-music                # ambience only
+```
+
+WASD or arrows drive; S/Down brakes then reverses. Space: handbrake. Left Ctrl:
+brake. R: recovery. C: camera. H: controls. T: change time. P: pause. Esc exits.
+F12 saves a screenshot. Standard GLFW gamepads use the left stick,
+right/left triggers, A for handbrake and Y for recovery.
+
+Configuration is in [new_wave/config.json](new_wave/config.json); see
+[New Wave guide](development/NEW_WAVE.md) for physics, world architecture,
+validation, performance evidence, references and limitations. The legacy
+implementation below remains internal reference material; it is no longer a
+separate public game mode.
+
 An endless driving demo in the spirit of the Atari 2600 *Enduro* camera, built
 with Python + PyOpenGL. A procedural road winds through procedural terrain
 (plains, hills, mountains, rivers, forests) under a full day/night cycle with
@@ -20,6 +47,10 @@ python3.12 -m venv env
 Press **Esc** to quit. Runs fullscreen at the native display resolution.
 
 ### Audio
+
+New Wave restores the existing procedural Rhodes-and-strings music and adapts
+its brightness, ambience and volume smoothly to speed, daylight, rain and biome.
+Use `--no-music` to keep environmental ambience only, or `--no-audio` for silence.
 
 - Continuous ambient **brown noise** (1/f² spectrum, FFT-synthesised) plays
   under the scene. Its playback speed tracks the camera speed so
@@ -442,6 +473,29 @@ research as the design criterion. Per-cycle snapshots live under
   guardrails extend along corner outsides wherever centripetal math
   says a design-speed vehicle would leave the road; skid-mark decals
   drift toward the outside through the hardest apexes.
+
+### Bridges & viaducts (light branch — plan v2 phase 3)
+- **River bridges**: the old parapet strips over river zones are now a
+  true structure — deck fascia with an upstand, underside slab, twin
+  edge girders, piers every 18 m down to the water with splash
+  collars, and a see-through railing (posts + double rail) replacing
+  the guardrail across the span. Baked per span into world-space VBOs
+  split by shade group, so daylight modulates with three glColor
+  calls.
+- **Ravine viaducts**: the base terrain never drops far below the
+  road, so valleys are created — deterministic transverse ravines
+  (9-15 m deep, 75-135 m long) carved through hill/mountain zones,
+  applied after the road-edge blend so the ground genuinely falls away
+  under the deck (verified: −12 to −15 m at centre span). The viaduct
+  then spans the gap it created, piers reaching the ravine floor —
+  the same "structure earns itself" logic as the tunnels.
+- **Landmark crossings** (~1 per 15 km): the longest river spans roll
+  cable-stay twin towers at the deck edges (H-frame + crossbeam, the
+  carriageway stays clear) with live-drawn cable fans to both edges.
+- **Integration**: bridge spans never overlap a tunnel bore (the rock
+  wins); guardrails, snow shoulders and ponds are suppressed on decks;
+  tall vehicles catch ~50% more crosswind buffeting mid-span; small
+  birds perch along the railings at dawn and dusk.
 
 ### Tunnels (light branch — plan v2 phase 2)
 - **Placement that earns itself**: one candidate per ~2.6 km hash

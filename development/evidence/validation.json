@@ -1,0 +1,132 @@
+{
+  "timestamp_utc": "2026-09-05T14:49:53.007980+00:00",
+  "python": "3.12.13 (main, Mar  3 2026, 12:39:30) [Clang 17.0.0 (clang-1700.6.3.2)]",
+  "executable": "/Users/jonathansantos/projects/roads/env/bin/python",
+  "passed": true,
+  "seconds": 38.73360700000194,
+  "checks": [
+    {
+      "name": "smoke_audio.py",
+      "passed": true,
+      "returncode": 0,
+      "seconds": 0.6189361669821665,
+      "stdout": "pygame 2.6.1 (SDL 2.28.4, Python 3.12.13)\nHello from the pygame community. https://www.pygame.org/contribute.html\ngenerators: pass-by clips + birdsong finite and normalised\nmixer: stereo pan correct, loops fade in, varispeed runs\npass-bys: fire on camera-plane crossing, pan correctly, louder when wet, quiet overall\nmotorcycles: silent by design\nALL ASSERTIONS PASSED\n",
+      "stderr": ""
+    },
+    {
+      "name": "smoke_bridges.py",
+      "passed": true,
+      "returncode": 0,
+      "seconds": 0.21948070800863206,
+      "stdout": "pygame 2.6.1 (SDL 2.28.4, Python 3.12.13)\nHello from the pygame community. https://www.pygame.org/contribute.html\nspans/120km: 62 river bridges, 5 viaducts, 8 landmarks\nexclusion: no bridge span overlaps a tunnel bore\nravine: terrain -11.7 m below road at centre (vs -0.3 m outside the span)\non_bridge: true mid-span, false off-span\nALL ASSERTIONS PASSED\n",
+      "stderr": ""
+    },
+    {
+      "name": "smoke_corners.py",
+      "passed": true,
+      "returncode": 0,
+      "seconds": 1.3951896250073332,
+      "stdout": "pygame 2.6.1 (SDL 2.28.4, Python 3.12.13)\nHello from the pygame community. https://www.pygame.org/contribute.html\ngeometry: max kappa 0.0106 (< fold limit), 1997 sharp metres / 120 km\nzones: {'plain': 81, 'wind': 62, 'hair': 25, 'straight': 32}\nbanking: roll within \u00b10.14 (8\u00b0), centreline unchanged\nbehaviour: apex 17.0 m/s vs straight 26.3 m/s (kappa 0.0076); min gap 4.47 m\nALL ASSERTIONS PASSED\n",
+      "stderr": ""
+    },
+    {
+      "name": "smoke_incidents.py",
+      "passed": true,
+      "returncode": 0,
+      "seconds": 7.201898291998077,
+      "stdout": "pygame 2.6.1 (SDL 2.28.4, Python 3.12.13)\nHello from the pygame community. https://www.pygame.org/contribute.html\nzones: roadworks@19918 (lane 1, sub 1), toll@24400, trap@10012 \u2014 all deterministic\nbreakdown: pulls out, parks on the shoulder, recycles; min gap 4.43 m\nroadworks: sampled (zone n=1216); min gap 1.97\ntoll: 392 samples at the booth line, max 11.6 m/s\nALL ASSERTIONS PASSED\n",
+      "stderr": ""
+    },
+    {
+      "name": "smoke_traffic.py",
+      "passed": true,
+      "returncode": 0,
+      "seconds": 26.502693874994293,
+      "stdout": "pygame 2.6.1 (SDL 2.28.4, Python 3.12.13)\nHello from the pygame community. https://www.pygame.org/contribute.html\nrush hour 18h      splits=  4 dwells= 2 em=1 min_gap=   4.26m moto_close_passes=1\nnoon               splits=  1 dwells= 2 em=1 min_gap=   4.26m moto_close_passes=0\n3am                splits=  1 dwells= 1 em=1 min_gap=   4.17m moto_close_passes=0\nnoon heavy storm   splits=  2 dwells= 1 em=1 min_gap=   4.62m moto_close_passes=0\nfrost dusk         splits=  4 dwells= 3 em=1 min_gap=   5.21m moto_close_passes=0\nplayer 90          splits=  8 dwells= 1 em=1 min_gap=   2.45m moto_close_passes=0\nplayer 0           splits=  2 dwells= 0 em=1 min_gap=   4.40m moto_close_passes=0\nALL ASSERTIONS PASSED\n",
+      "stderr": ""
+    },
+    {
+      "name": "smoke_tunnels.py",
+      "passed": true,
+      "returncode": 0,
+      "seconds": 1.6960839999956079,
+      "stdout": "pygame 2.6.1 (SDL 2.28.4, Python 3.12.13)\nHello from the pygame community. https://www.pygame.org/contribute.html\nplacement: 7 tunnels / 156 km, all on mountain runs\ndepth: 0 outside, ramps through the portal, 1 mid-bore\nsuppression: zero tree slots inside the bore\nincidents: roadworks/tolls/traps never inside a bore\ntraffic: zero in-bore lane changes; min gap 4.92 m\nALL ASSERTIONS PASSED\n",
+      "stderr": ""
+    },
+    {
+      "name": "smoke_weather.py",
+      "passed": true,
+      "returncode": 0,
+      "seconds": 0.3242174159968272,
+      "stdout": "pygame 2.6.1 (SDL 2.28.4, Python 3.12.13)\nHello from the pygame community. https://www.pygame.org/contribute.html\nweather machine: 7 rain events/hour, peak level 1.00, all states visited\nseasonal frost: winter zones 17 vs summer 2\nday length: summer 0.55 vs winter 0.47\nnight floor: new moon 0.176 vs full moon 0.264\nwetness: saturates in rain, dries in 1.9 sim hours at noon\nALL ASSERTIONS PASSED\n",
+      "stderr": ""
+    },
+    {
+      "name": "smoke_world.py",
+      "passed": true,
+      "returncode": 0,
+      "seconds": 0.19294133302173577,
+      "stdout": "pygame 2.6.1 (SDL 2.28.4, Python 3.12.13)\nHello from the pygame community. https://www.pygame.org/contribute.html\nbiomes: all 11 occur\nsurfaces: asphalt/old/concrete all occur, weights normalised\nsignage: 96 curve warnings over 20 km, all before real bends\nALL ASSERTIONS PASSED\n",
+      "stderr": ""
+    },
+    {
+      "name": "new-system unit tests",
+      "passed": true,
+      "returncode": 0,
+      "seconds": 0.5227216669882182,
+      "stdout": "",
+      "stderr": "test_display_flags (test_controls.ControlTests.test_display_flags) ... ok\ntest_escape_always_exits (test_controls.ControlTests.test_escape_always_exits) ... ok\ntest_p_owns_pause (test_controls.ControlTests.test_p_owns_pause) ... ok\ntest_bounded_negative_and_long_travel (test_new_traffic.TrafficTests.test_bounded_negative_and_long_travel) ... ok\ntest_determinism_and_frame_rate (test_new_traffic.TrafficTests.test_determinism_and_frame_rate) ... ok\ntest_disabled (test_new_traffic.TrafficTests.test_disabled) ... ok\ntest_road_alignment_and_player_yield (test_new_traffic.TrafficTests.test_road_alignment_and_player_yield) ... ok\ntest_recovery_finds_clear_place_even_far_from_roads (test_recovery.RecoveryTests.test_recovery_finds_clear_place_even_far_from_roads) ... ok\ntest_valid_spawn_preserves_requested_position (test_recovery.RecoveryTests.test_valid_spawn_preserves_requested_position) ... ok\ntest_braking_reverse_and_negative_coordinates (test_vehicle.VehicleTests.test_braking_reverse_and_negative_coordinates) ... ok\ntest_handbrake_releases_grip_without_unbounded_speed (test_vehicle.VehicleTests.test_handbrake_releases_grip_without_unbounded_speed) ... ok\ntest_interpolation_and_rebase (test_vehicle.VehicleTests.test_interpolation_and_rebase) ... ok\ntest_invalid_configuration (test_vehicle.VehicleTests.test_invalid_configuration) ... ok\ntest_render_rate_independence (test_vehicle.VehicleTests.test_render_rate_independence) ... ok\ntest_spawn_overlap_resolved (test_vehicle.VehicleTests.test_spawn_overlap_resolved) ... ok\ntest_stall_is_bounded_and_reported (test_vehicle.VehicleTests.test_stall_is_bounded_and_reported) ... ok\ntest_steering_is_progressive_and_speed_sensitive (test_vehicle.VehicleTests.test_steering_is_progressive_and_speed_sensitive) ... ok\ntest_swept_collision_does_not_tunnel (test_vehicle.VehicleTests.test_swept_collision_does_not_tunnel) ... ok\ntest_terrain_and_recovery_remain_finite (test_vehicle.VehicleTests.test_terrain_and_recovery_remain_finite) ... ok\ntest_bounded_lifecycle_after_teleports (test_world.WorldTests.test_bounded_lifecycle_after_teleports) ... ok\ntest_deterministic_positive_negative (test_world.WorldTests.test_deterministic_positive_negative) ... ok\ntest_diversity_landmarks_and_colliders (test_world.WorldTests.test_diversity_landmarks_and_colliders) ... ok\ntest_landforms_remain_bounded_and_roads_flat (test_world.WorldTests.test_landforms_remain_bounded_and_roads_flat) ... ok\ntest_local_coordinates_at_long_distance (test_world.WorldTests.test_local_coordinates_at_long_distance) ... ok\ntest_props_stay_clear_of_roads (test_world.WorldTests.test_props_stay_clear_of_roads) ... ok\ntest_road_network_flat_and_connected (test_world.WorldTests.test_road_network_flat_and_connected) ... ok\ntest_scalar_vector_height_and_valid_spawn (test_world.WorldTests.test_scalar_vector_height_and_valid_spawn) ... ok\ntest_shared_terrain_edges (test_world.WorldTests.test_shared_terrain_edges) ... ok\ntest_surface_height_matches_rendered_triangles (test_world.WorldTests.test_surface_height_matches_rendered_triangles) ... ok\n\n----------------------------------------------------------------------\nRan 29 tests in 0.393s\n\nOK\n"
+    },
+    {
+      "name": "compile",
+      "passed": true,
+      "returncode": 0,
+      "seconds": 0.026847625005757436,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "vehicle asset",
+      "passed": true,
+      "measurements": {
+        "body": {
+          "triangles": 2848,
+          "bounds_min": [
+            -1.100000023841858,
+            0.3536108136177063,
+            -2.1549999713897705
+          ],
+          "bounds_max": [
+            1.100000023841858,
+            1.5940001010894775,
+            2.179999828338623
+          ],
+          "dimensions": [
+            2.200000047683716,
+            1.240389347076416,
+            4.335000038146973
+          ]
+        },
+        "wheel": {
+          "triangles": 360,
+          "bounds_min": [
+            -0.1380000114440918,
+            -0.36000001430511475,
+            -0.36000001430511475
+          ],
+          "bounds_max": [
+            0.1380000114440918,
+            0.36000001430511475,
+            0.36000001430511475
+          ],
+          "dimensions": [
+            0.2760000228881836,
+            0.7200000286102295,
+            0.7200000286102295
+          ]
+        }
+      },
+      "seconds": 0.031704083987278864
+    }
+  ]
+}
