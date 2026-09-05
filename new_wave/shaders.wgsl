@@ -44,7 +44,10 @@ fn rotate(p: vec3<f32>, a: f32) -> vec3<f32> {
     }
     return g.light_vp*vec4(rotate(p,v.pose.w)+v.pose.xyz,1);
 }
-fn hash(p: vec2<f32>) -> f32 {return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+fn hash(p: vec2<f32>) -> f32 {
+    let wrapped=p-floor(p/4096.)*4096.;
+    return fract(sin(dot(wrapped,vec2(127.1,311.7)))*43758.5453);
+}
 fn noise(p:vec2<f32>)->f32 {
     let i=floor(p); var f=fract(p); f=f*f*(3.-2.*f);
     return mix(mix(hash(i),hash(i+vec2(1.,0.)),f.x),mix(hash(i+vec2(0.,1.)),hash(i+vec2(1.,1.)),f.x),f.y);
@@ -66,9 +69,10 @@ fn sky_color(ray:vec3<f32>)->vec3<f32> {
     let n=normalize(o.n); let d=distance(g.camera.xyz,o.world);
     var col=o.color;
     if(o.material<1.5) {
-        let grain=noise(o.world.xz*6.);
+        let texture_world=o.world.xz+g.effects.zw;
+        let grain=noise(texture_world*6.);
         col*=.92+.16*grain;
-        col*=.94+.12*noise(o.world.xz*.15);
+        col*=.94+.12*noise(texture_world*.125);
     }
     let lp=g.light_vp*vec4(o.world+n*.065,1.);
     let uv=lp.xy*.5+vec2(.5); let suv=vec2(uv.x,1.-uv.y);

@@ -61,7 +61,7 @@ void main(){
 }'''
 
 SKY_FUNCTIONS = '''
-float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+float hash(vec2 p){p=mod(p,4096.);return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
 float noise(vec2 p){
  vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
  return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x),f.y);
@@ -99,7 +99,7 @@ void main(){
    shade/=9.;
  }
  vec3 base=col;
- if(material<1.5){base*=.92+.16*noise(world.xz*6.);base*=.94+.12*noise(world.xz*.15);}
+ if(material<1.5){vec2 tw=world.xz+effects.zw;base*=.92+.16*noise(tw*6.);base*=.94+.12*noise(tw*.125);}
  vec3 ambient=mix(vec3(.075,.10,.16),vec3(.38,.43,.48),daylight);
  float hemi=.70+.30*max(n.y,0.);
  vec3 lit=base*(ambient*hemi+vec3(1.,.86,.67)*ndl*shade*.80*daylight);
@@ -292,7 +292,7 @@ class GLRenderer:
         sun=normalize(sun[:3])
         effects=effects or {}
         rain=float(effects.get('rain',0))
-        effect_vector=(rain,float(effects.get('brake',0)),0.,0.)
+        effect_vector=(rain,float(effects.get('brake',0)),*effects.get('texture_origin',(0.,0.)))
         car=effects.get('car',(*target,0.))
         focus=np.asarray(target,dtype=np.float32)
         eye=focus+sun*230

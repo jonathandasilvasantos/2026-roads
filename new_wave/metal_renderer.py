@@ -98,7 +98,7 @@ class MetalRenderer:
         light=light_matrix(target,sun[:3])
         values=np.concatenate((vp.T.ravel(),light.T.ravel(),[*camera,1],sun,[*fog_color,1],
             [fog_distance,self.width/self.height,time,self.shadow_size],[*r,0],[*u,0],[*f,0],effects.get('car',[0,0,0,0]),
-            [effects.get('rain',0),effects.get('brake',0),0,0])).astype(np.float32)
+            [effects.get('rain',0),effects.get('brake',0),*effects.get('texture_origin',[0,0])])).astype(np.float32)
         d.queue.write_buffer(self.uniform,0,values)
         if hud_image is not None:
             d.queue.write_texture({'texture':self.hud},np.asarray(hud_image,dtype=np.uint8),{'bytes_per_row':self.width*4},(self.width,self.height,1))

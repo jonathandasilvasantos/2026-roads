@@ -1,0 +1,12 @@
+{
+  "backend": "Legacy PyOpenGL on Apple M4",
+  "resolution": [1280, 720],
+  "scene": "Classic headless calibration, time 16, s_car 0, cinematic grade enabled",
+  "command": "./env/bin/python tools/benchmark_classic.py --headless --width 1280 --height 720 --time 16 --s-car 0 --screenshot /tmp/roads-baseline.png --warmup-frames 300",
+  "measured_frames": 282,
+  "average_fps": 29.530990406315514,
+  "p99_ms": 35.7187125031487,
+  "peak_ms": 619.8252089961898,
+  "max_rss_mb": 378.671875,
+  "notes": "Recorded output of benchmark_classic.py. Excludes first 20 intervals; includes a late first-use stall. Legacy calibration scene differs from free-driving benchmark; this is a diagnostic baseline, not a controlled same-scene comparison. GPU and subsystem timing were unavailable in this wrapper."
+}

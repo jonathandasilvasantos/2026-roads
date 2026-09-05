@@ -104,3 +104,39 @@ of this run; performance remained stable. Detailed route and settings in JSON.
 Validation runner: all eight original smoke scripts, new unittest suite,
 compilation and vehicle geometry passed (11/11 groups, 35.31s). Fresh Blender
 GLB import confirmed136 meshes,4288triangles, materials/UVs and correct scale.
+
+## Final evidence
+
+OpenGL equivalent 90-second drive: 59.944 FPS average, p99 16.683 ms,
+peak 29.798 ms, GPU scene mean 1.177 ms, process CPU 21.5% of one core,
+RSS 236.2 MiB. No dropped physics time.
+
+Metal 180-second night/rain drive: 59.994 FPS average, p99 16.671 ms,
+peak 17.339 ms, GPU scene mean .645 ms, process CPU 20.6% of one core,
+RSS 248.9 MiB. It held 81 chunks, four outstanding jobs and 92 GPU meshes.
+RSS reached its plateau early and stayed flat. Startup shader preparation caused
+.534 s of bounded dropped simulation before measurement; measured dropped time
+was zero. Metal/Quality at explicit 1920x1080 sustained 59.903 FPS over 20
+seconds; GPU scene mean 1.626 ms, p99 2.445 ms. One 48.171 ms frame occurred.
+
+GPU results use the `gpu_scene` field and include shadows; Metal reads samples
+every 120 frames, while OpenGL uses asynchronous elapsed queries. The scope
+does not include identical presentation work on both APIs, so cross-API GPU
+figures are indicative. Dedicated GPU utilization and memory were unavailable.
+
+The final independent evaluator inspected seven representative screenshots and
+all sustained reports: no obvious terrain/road seam, intersection break or
+long-coordinate failure. The test captures include 128-million-metre coordinates.
+The scenery remains stylized and below the generated concepts in fine detail.
+Static screenshots cannot substantiate subjective driving feel.
+
+The 26.7-second keyboard replay exercised the actual mapped controls:
+accelerated from 0 to 27 m/s, steered and handbraked, reversed to -9.33 m/s,
+paused with exact position/speed preservation for 2.2 seconds, recovered onto
+clear ground with speed zero, then drove again. Frame p99 was 16.669 ms, peak
+17.145 ms. This is a synthetic input replay; GLFW found no connected gamepad.
+
+The last refinement locks procedural surface-grain coordinates across renderer
+origin changes, preventing texture motion at chunk rebases. Invalid zero-valued
+resolution/radius overrides now fail instead of silently selecting defaults.
+Selected captures are reproducible with `tools/capture_scenes.py`.

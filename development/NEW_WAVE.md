@@ -142,6 +142,24 @@ not full hardware utilization percentages. Process RSS includes unified-memory
 allocations visible to the process; dedicated GPU memory/utilization and whole
 system CPU utilization were not available from these APIs.
 
+Measured on Mac mini Mac16,10, Apple M4 (10 CPU / 10 GPU cores), 16 GB unified
+memory, macOS 26.5.1 (25F80), attached 3840×2160 60 Hz display. Both principal runs
+used Balanced, explicit1280×720, radius4, 12 traffic slots, clear16h lighting,
+vsync and60 FPS limiter, 90 seconds after eight seconds of warmup:
+
+| API | Average FPS | p99-equivalent 1% low | Peak frame | GPU scene mean | Process peak RSS |
+|---|---:|---:|---:|---:|---:|
+| Metal | 59.995 | 59.990 | 17.817 ms | .625 ms | 239.9 MiB |
+| OpenGL | 59.944 | 59.942 | 29.798 ms | 1.177 ms | 236.2 MiB |
+
+Both maintained at most81 chunks/four jobs and dropped zero measured physics
+time. OpenGL had an isolated peak above budget; its p99 remained16.683ms.
+Metal process CPU averaged23.1% of one core. JSON files include the corresponding
+OpenGL CPU/subsystem figures and sampled route. CPU regression tests ran during
+part of the Metal run, so that result includes some additional system load.
+Classic's different calibration scene measured29.53 FPS with CPU color grading;
+its baseline JSON is diagnostic, not an identical-scene comparison.
+
 Selected real screenshots and generated concepts are in `development/reference`:
 `before-driving.png` (Classic baseline), `concept-road.png`, `concept-car.png`
 (generated targets), `car-close-after.png`, and backend-specific night/rain shots.

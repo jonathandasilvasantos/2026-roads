@@ -88,9 +88,10 @@ def main(argv=None):
     replay=json.loads(args.replay.read_text()) if args.replay else None
     config=json.loads(args.config.read_text())
     quality=args.quality or config['quality'];preset=PRESETS[quality]
-    width=args.width or config['width'];height=args.height or config['height']
+    width=args.width if args.width is not None else config['width']
+    height=args.height if args.height is not None else config['height']
     if width<320 or height<240:raise ValueError('Resolution must be at least 320x240')
-    world_cfg=dict(config.get('world',{}),seed=args.seed if args.seed is not None else config['seed'],radius=args.radius or preset['radius'],resolution=preset['resolution'])
+    world_cfg=dict(config.get('world',{}),seed=args.seed if args.seed is not None else config['seed'],radius=args.radius if args.radius is not None else preset['radius'],resolution=preset['resolution'])
     world_cfg['density']=world_cfg.get('density',1)*preset['density']
     world=World(WorldConfig(**world_cfg))
     backend=args.backend
@@ -264,7 +265,8 @@ def main(argv=None):
                 hud=render_hud(width,height,state,dict(quality=quality,backend=backend,seed=world.config.seed,biome=world.biome(state.x,state.z),fps=fps,paused=paused,help=show_help,time=hour,notice=notice if elapsed<notice_until else '',controller=joystick))
                 hud_due=elapsed+.1
             stats=renderer.draw(batches,eye_local,target_local,sun,fog.tolist(),fog_distance,sim_time,hud_image=hud if update_hud else None,capture=capture,
-                effects={'car':[state.x-origin[0],state.y,state.z-origin[1],state.yaw],'brake':max(control.brake,float(control.throttle<0 and state.speed>1)),'rain':rain})
+                effects={'car':[state.x-origin[0],state.y,state.z-origin[1],state.yaw],'brake':max(control.brake,float(control.throttle<0 and state.speed>1)),'rain':rain,
+                    'texture_origin':[origin[0]%32768,origin[1]%32768]})
             if elapsed>args.warmup:
                 if measured_dropped is None:measured_dropped=car.dropped_time
                 samples.append(frame_interval*1000);physics_samples.append(physics_ms);stream_samples.append(stream_ms);render_samples.append(stats['cpu_submit_ms'])
