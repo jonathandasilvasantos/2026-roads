@@ -1,0 +1,15 @@
+{
+  "seed": 2026,
+  "quality": "Balanced",
+  "width": 1280,
+  "height": 720,
+  "traffic_count": 12,
+  "world": {"chunk_size": 128, "density": 1.0, "road_spacing": 384},
+  "vehicle": {},
+  "controls": {
+    "accelerate": "W", "reverse": "S", "left": "A", "right": "D",
+    "brake": "LEFT_CONTROL", "handbrake": "SPACE", "recover": "R"
+  },
+  "controller_deadzone": 0.12,
+  "reduced_motion": false
+}

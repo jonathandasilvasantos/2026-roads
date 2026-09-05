@@ -1,5 +1,31 @@
 # 2026-roads
 
+## New Wave — free driving on Metal and OpenGL
+
+The `new-wave` branch adds a playable car and an endless world in every horizontal
+direction. On macOS, the default renderer uses **Metal on the GPU**. The same
+game also runs through **OpenGL 4.1** with the same physics, world and assets.
+The original road demo, asset viewer, weather systems and soundscape remain
+available as Classic mode; their documentation continues below.
+
+```bash
+./env/bin/python -m pip install -r requirements.txt
+./run.sh                          # Metal on macOS, Balanced 1280×720
+./run.sh --backend opengl          # same game through OpenGL
+./run.sh --quality Quality         # more terrain and foliage, same resolution
+./run.sh --classic                 # original demo and audio routing menu
+```
+
+WASD or arrows drive; S/Down brakes then reverses. Space: handbrake. Left Ctrl:
+brake. R: recovery. C: camera. H: controls. T: change time. Esc: pause; Q while
+paused quits. F12 saves a screenshot. Standard GLFW gamepads use the left stick,
+right/left triggers, A for handbrake and Y for recovery.
+
+Configuration is in [new_wave/config.json](new_wave/config.json); see
+[New Wave guide](development/NEW_WAVE.md) for physics, world architecture,
+validation, performance evidence, references and limitations. The remainder
+of this README describes **Classic mode** (`app.py`).
+
 An endless driving demo in the spirit of the Atari 2600 *Enduro* camera, built
 with Python + PyOpenGL. A procedural road winds through procedural terrain
 (plains, hills, mountains, rivers, forests) under a full day/night cycle with

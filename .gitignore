@@ -11,3 +11,9 @@ soundfonts/*.sf2
 soundfonts/*.7z
 plan.txt
 .grade_lut_*.npy
+development/reference/*-first.png
+development/reference/*-c2.png
+development/reference/opengl-refined.png
+development/evidence/*-first.json
+development/evidence/*-c2.json
+development/evidence/opengl-refined.json
