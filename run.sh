@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Launcher for Roads free driving; --classic retains the original demo.
-# Prompts the user to choose an audio output routing, then runs app.py
-# inside the local venv (./env). Pass any extra args after the menu —
-# they're forwarded to app.py (e.g. ./run.sh --time 18).
+# Launcher for fullscreen Roads free driving; --classic retains the original
+# demo and --windowed is available for development/capture workflows.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -15,7 +13,16 @@ if [[ ! -x "$PY" ]]; then
 fi
 
 if [[ "${1:-}" != "--classic" ]]; then
-    exec "$PY" drive.py "$@"
+    WINDOWED=0
+    for arg in "$@"; do
+        if [[ "$arg" == "--windowed" ]]; then
+            WINDOWED=1
+        fi
+    done
+    if [[ "$WINDOWED" == "1" ]]; then
+        exec "$PY" drive.py "$@"
+    fi
+    exec "$PY" drive.py --fullscreen "$@"
 fi
 shift
 

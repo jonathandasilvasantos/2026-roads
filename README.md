@@ -10,15 +10,16 @@ available as Classic mode; their documentation continues below.
 
 ```bash
 ./env/bin/python -m pip install -r requirements.txt
-./run.sh                          # Metal on macOS, Balanced 1280×720
+./run.sh                          # fullscreen, Metal on macOS
 ./run.sh --backend opengl          # same game through OpenGL
+./run.sh --windowed                # development window
 ./run.sh --quality Quality         # more terrain and foliage, same resolution
 ./run.sh --classic                 # original demo and audio routing menu
 ```
 
 WASD or arrows drive; S/Down brakes then reverses. Space: handbrake. Left Ctrl:
-brake. R: recovery. C: camera. H: controls. T: change time. Esc: pause; Q while
-paused quits. F12 saves a screenshot. Standard GLFW gamepads use the left stick,
+brake. R: recovery. C: camera. H: controls. T: change time. P: pause. Esc exits.
+F12 saves a screenshot. Standard GLFW gamepads use the left stick,
 right/left triggers, A for handbrake and Y for recovery.
 
 Configuration is in [new_wave/config.json](new_wave/config.json); see

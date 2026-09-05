@@ -67,9 +67,9 @@ def _base(width, height, help_visible, controller):
         d.text((margin+p(15), height-margin-p(74)), first, font=font(12), fill=IVORY)
         d.text((margin+p(15), height-margin-p(51)), second, font=font(12), fill=IVORY)
         d.text((margin+p(15), height-margin-p(27)),
-               "R recover   C camera   H help   ESC pause", font=font(11), fill=MUTED)
+               "R recover   C camera   H help   P pause   ESC quit", font=font(11), fill=MUTED)
     else:
-        d.text((margin, height-margin-p(17)), "H  CONTROLS   /   ESC  PAUSE", font=font(10), fill=IVORY,
+        d.text((margin, height-margin-p(17)), "H  CONTROLS   /   P  PAUSE   /   ESC  QUIT", font=font(10), fill=IVORY,
                stroke_width=1, stroke_fill=(15,25,28,170))
     return image
 
@@ -132,6 +132,6 @@ def render_hud(width, height, state, info):
         text((cx,cy-p(73)), "Paused",font=font(37,True),fill=IVORY,anchor="ma")
         text((cx,cy-p(13)), "Explore freely. Your next road is yours.",font=font(13),fill=MUTED,anchor="ma")
         d.line((cx-p(165),cy+p(21),cx+p(165),cy+p(21)),fill=(81,91,91,160))
-        text((cx,cy+p(41)), "ESC  RESUME     /     Q  QUIT",font=font(13,True),fill=IVORY,anchor="ma")
+        text((cx,cy+p(41)), "P  RESUME     /     ESC  QUIT",font=font(13,True),fill=IVORY,anchor="ma")
         text((cx,cy+p(86)), f"WORLD SEED  {info.get('seed', 0)}",font=font(10),fill=MUTED,anchor="ma")
     return image

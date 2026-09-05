@@ -49,11 +49,26 @@ def parser():
     p.add_argument('--uncapped',action='store_true',help='disable frame limiter and vsync; recorded in report')
     p.add_argument('--no-hud',action='store_true')
     p.add_argument('--reduced-motion',action='store_true')
+    display=p.add_mutually_exclusive_group()
+    display.add_argument('--fullscreen',action='store_true',dest='fullscreen',
+                         help='use the primary display in fullscreen mode')
+    display.add_argument('--windowed',action='store_false',dest='fullscreen',
+                         help='run in a window (default for drive.py directly)')
+    p.set_defaults(fullscreen=False)
     return p
 
 
 def instance(x,y,z,yaw=0,scale=1,pitch=0,roll=0,material=0):
     return np.array([[x,y,z,yaw,scale,scale,scale,pitch,1,1,1,material+roll]],dtype=np.float32)
+
+
+def meta_key_actions(pressed, paused):
+    """Return (paused, quit); kept pure so exit behavior cannot regress."""
+    if glfw.KEY_ESCAPE in pressed:
+        return paused, True
+    if glfw.KEY_P in pressed:
+        paused=not paused
+    return paused, glfw.KEY_Q in pressed and paused
 
 
 class Camera:
@@ -103,6 +118,19 @@ def main(argv=None):
     renderer=None;audio=None
     try:
         renderer=Renderer(width,height,'ROADS / NEW WAVE',vsync=not args.uncapped,shadow_size=preset['shadow'])
+        if args.fullscreen:
+            monitor=glfw.get_primary_monitor()
+            mode=glfw.get_video_mode(monitor) if monitor else None
+            if not monitor or not mode:
+                raise RuntimeError('Primary display is unavailable for fullscreen mode')
+            glfw.set_window_monitor(renderer.window,monitor,0,0,
+                                    mode.size.width,mode.size.height,
+                                    mode.refresh_rate)
+            renderer.poll()
+        display_size=glfw.get_framebuffer_size(renderer.window)
+        renderer.info.update(fullscreen=args.fullscreen,
+                             render_resolution=[width,height],
+                             display_resolution=list(display_size))
         print('RENDERER '+json.dumps(renderer.info),flush=True)
         meshes=prop_meshes()
         for key,mesh in meshes.items():renderer.upload_mesh(key,mesh)
@@ -142,7 +170,7 @@ def main(argv=None):
         while not renderer.should_close() and not quit_requested:
             now=time.perf_counter();dt=now-last;frame_interval=now-last;last=now;elapsed=now-start
             renderer.poll()
-            keys={k for k in set(bindings.values())|{glfw.KEY_UP,glfw.KEY_DOWN,glfw.KEY_LEFT,glfw.KEY_RIGHT,glfw.KEY_ESCAPE,glfw.KEY_H,glfw.KEY_C,glfw.KEY_Q,glfw.KEY_F12,glfw.KEY_T} if glfw.get_key(renderer.window,k)==glfw.PRESS}
+            keys={k for k in set(bindings.values())|{glfw.KEY_UP,glfw.KEY_DOWN,glfw.KEY_LEFT,glfw.KEY_RIGHT,glfw.KEY_ESCAPE,glfw.KEY_P,glfw.KEY_H,glfw.KEY_C,glfw.KEY_Q,glfw.KEY_F12,glfw.KEY_T} if glfw.get_key(renderer.window,k)==glfw.PRESS}
             if replay:
                 cursor=0
                 for segment in replay:
@@ -152,8 +180,10 @@ def main(argv=None):
             pressed=keys-previous_keys;previous_keys=keys
             if pressed or frame==0:
                 input_events.append(dict(seconds=round(elapsed,3),keys=sorted(keys),speed=car.state.speed,x=car.state.x,z=car.state.z))
-            if glfw.KEY_ESCAPE in pressed:paused=not paused;hud_due=0
-            if glfw.KEY_Q in pressed and paused:quit_requested=True
+            old_paused=paused
+            paused,requested=meta_key_actions(pressed,paused)
+            quit_requested|=requested
+            if paused!=old_paused:hud_due=0
             if glfw.KEY_H in pressed:show_help=not show_help;hud_due=0
             if glfw.KEY_C in pressed:
                 modes=['chase','close','wide','road'];mode=modes[(modes.index(mode)+1)%4];camera=Camera()

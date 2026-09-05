@@ -131,12 +131,16 @@ The scenery remains stylized and below the generated concepts in fine detail.
 Static screenshots cannot substantiate subjective driving feel.
 
 The 26.7-second keyboard replay exercised the actual mapped controls:
-accelerated from 0 to 27 m/s, steered and handbraked, reversed to -9.33 m/s,
+accelerated from 0 to 26.97 m/s, steered and handbraked, reversed to -9.83 m/s,
 paused with exact position/speed preservation for 2.2 seconds, recovered onto
 clear ground with speed zero, then drove again. Frame p99 was 16.669 ms, peak
-17.145 ms. This is a synthetic input replay; GLFW found no connected gamepad.
+19.679 ms. This is a synthetic input replay; GLFW found no connected gamepad.
 
 The last refinement locks procedural surface-grain coordinates across renderer
 origin changes, preventing texture motion at chunk rebases. Invalid zero-valued
 resolution/radius overrides now fail instead of silently selecting defaults.
 Selected captures are reproducible with `tools/capture_scenes.py`.
+
+Launcher refinement: `run.sh` now requests fullscreen on the primary display;
+`--windowed` is an explicit development override. Esc exits immediately and P
+owns pause/resume. Both behaviors were verified on Metal and OpenGL.

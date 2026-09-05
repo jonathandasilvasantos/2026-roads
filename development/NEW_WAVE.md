@@ -11,6 +11,7 @@ python3.12 -m venv env
 ./env/bin/python -m pip install -r requirements.txt
 ./run.sh
 ./run.sh --backend opengl
+./run.sh --windowed
 ./run.sh --quality Performance
 ./run.sh --quality Quality --width 1920 --height 1080
 ./run.sh --time 22 --weather rain
@@ -24,9 +25,11 @@ camera, input and HUD. OpenGL requires a hardware OpenGL 4.1 core context.
 On this Mac the OpenGL driver itself identifies as `4.1 Metal - 90.5`; that is
 still an **OpenGL API context**, distinct from wgpu's explicit Metal backend.
 
-The render resolution is fixed and explicit, independent of the window's backing
-scale. Resizing scales the rendered image to the window; it does not silently
-change render quality. All presets default to 1280×720 and are capped at 60 FPS.
+`run.sh` opens the primary display in fullscreen. `--windowed` is provided for
+development and capture workflows. The render resolution is fixed and explicit,
+independent of the display or window's backing scale. Fullscreen scales that image
+to the display; it does not silently change render quality. All presets default
+to 1280×720 and are capped at 60 FPS.
 `--uncapped` disables the limiter and requests no vsync. No automatic resolution
 or quality reductions occur.
 
@@ -43,8 +46,8 @@ A/D or Left/Right steer. Left Ctrl brakes without selecting reverse. Space
 releases rear grip for a controlled slide. R searches for a nearby clear road
 position, or clear terrain when far from roads, and settles the chassis. C cycles
 chase, close, wide and road cameras. T cycles lighting in six-hour steps. H hides
-the control legend. Esc pauses; Esc resumes and Q quits while paused. Window
-close also exits. F12 saves `development/reference/capture.png`.
+the control legend. P pauses or resumes. Esc exits immediately; window close also
+exits. F12 saves `development/reference/capture.png`.
 
 Standard GLFW gamepads use left-stick steering, right trigger forward, left
 trigger brake/reverse, A handbrake and Y recovery. Keyboard remains available.
