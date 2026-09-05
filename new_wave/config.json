@@ -3,7 +3,7 @@
   "quality": "Balanced",
   "width": 1280,
   "height": 720,
-  "traffic_count": 12,
+  "traffic_count": 24,
   "music_volume": 0.22,
   "world": {"chunk_size": 128, "density": 1.0, "road_spacing": 384},
   "vehicle": {},

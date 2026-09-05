@@ -85,6 +85,8 @@ uniform vec3 camera; uniform vec3 sun; uniform vec3 fogColor;
 uniform mat4 lightVP; uniform float elapsedTime;
 uniform vec4 car; uniform vec4 effects;
 uniform float fogDistance; uniform float daylight; uniform sampler2D shadowTex; uniform int useShadow;
+uniform sampler2D groundTex;
+uniform vec3 streetLamp;
 out vec4 outputColor;
 ''' + SKY_FUNCTIONS + '''
 void main(){
@@ -99,7 +101,14 @@ void main(){
    shade/=9.;
  }
  vec3 base=col;
- if(material<1.5){vec2 tw=world.xz+effects.zw;base*=.92+.16*noise(tw*6.);base*=.94+.12*noise(tw*.125);}
+ vec3 groundDetail=texture(groundTex,(world.xz+effects.zw)*.5).rgb;
+ if(material<1.5){
+  vec2 tw=world.xz+effects.zw+vec2(world.y*.73,world.y*.91)*(1.-abs(n.y));
+  base*=.92+.16*noise(tw*6.);base*=.94+.12*noise(tw*.125);
+  if(material>.5 && col.r>.18 && col.g>col.r*1.08)base*=mix(vec3(.7),groundDetail*2.5,.8);
+  if(material>.5 && col.r<.2 && col.g<.2){base*=.75+.50*noise(tw*28.);base+=vec3(.035,.030,.020)*smoothstep(.52,.75,noise(tw*.33));}
+  if(material<.5 && col.r>.5 && abs(n.y)<.5)base*=.80+.28*noise(tw*3.1);
+ }
  vec3 ambient=mix(vec3(.075,.10,.16),vec3(.38,.43,.48),daylight);
  float hemi=.70+.30*max(n.y,0.);
  vec3 lit=base*(ambient*hemi+vec3(1.,.86,.67)*ndl*shade*.80*daylight);
@@ -107,6 +116,8 @@ void main(){
  float spec=pow(max(dot(n,normalize(sun+view)),0.),48.);
  if(material>3.) {
   lit+=vec3(1.,.86,.65)*spec*.32*shade*daylight;
+  if(col.r>.25 && col.g>.07 && col.g<.5)
+   lit=mix(lit,sky_color(reflect(-view,n)),.035+.10*pow(1.-max(dot(n,view),0.),4.));
   if(col.b>col.r*1.4 && col.g>.05)
    lit=mix(lit,sky_color(reflect(-view,n))*.65,.18+.50*pow(1.-max(dot(n,view),0.),4.));
   if(col.r>.3 && col.g<.06)lit+=vec3(1.,.015,.005)*(.25+.8*effects.y);
@@ -119,6 +130,10 @@ void main(){
  float attenuation=1./(1.+lightDistance*lightDistance*.009)* (1.-smoothstep(45.,60.,lightDistance));
  float headlight=cone*attenuation*max(n.y,0.)*(1.-daylight)*2.2;
  lit+=col*vec3(1.,.92,.72)*headlight;
+ vec3 street=streetLamp-world;
+ lit+=col*vec3(1.,.75,.40)*max(dot(n,normalize(street)),0.)*3./(1.+dot(street,street)*.09)*(1.-daylight);
+ if(material<.5 && col.r>.78 && col.g>.72 && col.b<.7)lit+=vec3(1.,.73,.35)*(1.-daylight);
+ if(material<.5 && col.b>col.r*1.4 && col.g>.15)lit+=vec3(.22,.13,.045)*(1.-daylight);
  if(material<1.5 && abs(col.r-col.g)<.06 && col.r<.35){
   lit*=1.-effects.x*.15;
   lit+=vec3(.7,.8,.9)*spec*effects.x*.35*daylight+vec3(1.,.91,.7)*headlight*effects.x*.25;
@@ -208,6 +223,14 @@ class GLRenderer:
         gl.glReadBuffer(gl.GL_NONE)
         self._check_fbo()
         self.hud = self._texture(self.width, self.height)
+        from PIL import Image
+        from pathlib import Path
+        ground=Image.open(Path(__file__).resolve().parents[1]/'assets/new_wave/meadow-albedo.png').convert('RGBA')
+        self.ground=self._texture(*ground.size)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D,0,gl.GL_RGBA8,*ground.size,0,gl.GL_RGBA,gl.GL_UNSIGNED_BYTE,np.asarray(ground))
+        gl.glGenerateMipmap(gl.GL_TEXTURE_2D)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D,gl.GL_TEXTURE_MIN_FILTER,gl.GL_LINEAR_MIPMAP_LINEAR)
+        for axis in (gl.GL_TEXTURE_WRAP_S,gl.GL_TEXTURE_WRAP_T):gl.glTexParameteri(gl.GL_TEXTURE_2D,axis,gl.GL_REPEAT)
         self.has_hud = False
         self.last_hud = -1.
         self.queries = list(gl.glGenQueries(6))
@@ -342,11 +365,16 @@ class GLRenderer:
         gl.glDrawArrays(gl.GL_TRIANGLES,0,3)
         gl.glEnable(gl.GL_DEPTH_TEST)
         gl.glUseProgram(self.program)
+        self._uniform(self.program,'streetLamp',(effects or {}).get('street_lamp',[0,-1000,0]))
         for name,value in [('vp',vp),('lightVP',lightvp),('camera',camera),('sun',sun),
                            ('fogColor',fog_color),('fogDistance',fog_distance),('daylight',daylight),('elapsedTime',time),('car',car),('effects',effect_vector),('shadowTex',0),('useShadow',int(self.shadow_size>0))]:
             self._uniform(self.program,name,value)
         gl.glActiveTexture(gl.GL_TEXTURE0)
         gl.glBindTexture(gl.GL_TEXTURE_2D,self.shadow)
+        gl.glUniform1i(gl.glGetUniformLocation(self.program,'groundTex'),1)
+        gl.glActiveTexture(gl.GL_TEXTURE1)
+        gl.glBindTexture(gl.GL_TEXTURE_2D,self.ground)
+        gl.glActiveTexture(gl.GL_TEXTURE0)
         triangles=0
         for mesh,count in ready:
             gl.glBindVertexArray(mesh[0])
@@ -413,7 +441,7 @@ class GLRenderer:
         glfw.make_context_current(self.window)
         for key in list(self.meshes):
             self.remove_mesh(key)
-        gl.glDeleteTextures([self.color,self.shadow,self.hud])
+        gl.glDeleteTextures([self.color,self.shadow,self.hud,self.ground])
         gl.glDeleteFramebuffers(2,[self.fbo,self.shadow_fbo])
         gl.glDeleteRenderbuffers(1,[self.depth])
         gl.glDeleteVertexArrays(1,[self.quad])

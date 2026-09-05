@@ -7,6 +7,12 @@ horizontal direction. On macOS, the default renderer uses **Metal on the GPU**.
 The same game also runs through **OpenGL 4.1** with the same physics, world,
 assets and adaptive procedural score.
 
+Roadside hamlets now include walking people, fences, lamps and more detailed
+houses. Traffic is present from startup; open leaf crowns, dense verge grass
+and a generated meadow texture enrich the landscape. See the
+[visual development notes](development/REALISM.md) for concepts, assets,
+performance measurements and the remaining gap to photorealism.
+
 ```bash
 ./env/bin/python -m pip install -r requirements.txt
 ./run.sh                          # fullscreen, Metal on macOS

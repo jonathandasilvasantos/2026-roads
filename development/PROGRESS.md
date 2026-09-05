@@ -169,3 +169,52 @@ are compatibility evidence, not replacements for the sustained benchmarks.
 Final verification: passed. Reports are `music-metal-smoke.json`,
 `opengl-integration-smoke.json`, `fullscreen-launch-smoke.json`, and
 `validation-integration.json` under `development/evidence`.
+
+## Inhabited world / realism iteration
+
+Acceptance: visible NPC traffic and people, richer plant silhouettes and ground,
+roadside environments grounded in the screenshot-generated realistic target,
+bounded streaming, Metal and OpenGL near 60 FPS at unchanged Balanced 1280×720.
+
+Built-in image generation produced a realistic edit of the actual baseline and
+a reusable meadow albedo. See `REALISM.md` for prompts, sources and limits.
+Native implementation added 24 traffic slots with loading-time visible placement,
+deterministic hamlets, walking people, fences, sidewalks, lamps, varied house
+proportions/colors, leaf geometry with LOD, dense grass, mipmapped ground texture,
+weathered surface variation, clearcoat reflection and village night lighting.
+Blender background mode generated editable roadside.blend plus GLB/NPZ exports.
+MCP was not exposed as a tool; no MCP operation is claimed.
+
+Independent evaluation found coarse leaf planes, repeated architecture, interrupted
+paths, simple people and flat materials. Refinements reduced leaf size, introduced
+LOD, aligned extended pavements to road tangents, varied house sizes and clothing,
+and added lights. Final evaluation confirms richer inhabited scenes but explicitly
+does not consider the result photorealistic or matched to the generated concept.
+The primary remaining gaps are character assets, architectural diversity, richer
+material maps, dense organic crowns and contact shading. The renderer currently
+uses vertex albedo plus one ground texture, not a full authored PBR asset pipeline.
+
+Initial driving test exposed a 120.97ms frame and 30.26ms stream peak. Vectorized
+grass placement and in-place cached-array rebasing reduced Metal stream peak to
+2.02ms. Final clear-day Metal: 45s after 5s warmup, 59.990 FPS, p99 16.671ms,
+peak 20.245ms, mean GPU scene 1.862ms, RSS high-water 345.69MiB. OpenGL: 30s
+after 5s warmup, 59.962 FPS, p99 16.676ms, peak 24.908ms, mean GPU scene 2.674ms,
+RSS 288.92MiB. Both used Apple M4, Balanced 1280×720, radius4, clear16h, audio
+disabled and 60 FPS limiter/vsync. No resolution reduction. These are recorded
+routes with obstacle stops, not uninterrupted long-travel stress tests. Metal was
+launched via app.py, GL via drive.py with GL error checks; RSS is not comparable
+as isolated renderer memory. The GL texture-sampler type bug found in capture
+testing was fixed before the final GL report. Later lamp/pose changes have real
+capture validation and a separate final night run.
+
+Final Metal night/rain: 25s after 5s warmup, 59.993 FPS, p99 16.669ms,
+peak 17.885ms, stream peak 2.150ms, GPU scene mean 2.077ms and RSS 286.34MiB.
+This used drive.py, the same Balanced resolution/radius and no audio. A final
+Blender GLB round-trip validated all 19 library meshes with UVs and vertex colors.
+
+Validation: all 11 validation groups passed, including 34 new-system unit tests.
+Final captures: `realism-before.png`, `realism-after.png`, `realism-road.png`
+(OpenGL), `realism-village.png`, `realism-night.png`; generated target is
+`realism-concept.png`. Intermediate debug captures are kept outside commits in
+ignored `development/scratch`. Benchmark reports retain the initial hitch evidence
+and final results. No claim of complete photorealism or perfect frame pacing.

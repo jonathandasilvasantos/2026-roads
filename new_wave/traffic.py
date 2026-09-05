@@ -35,6 +35,23 @@ class Traffic:
         self._accumulator = 0.
         self._rng = random.Random(world.config.seed ^ 0x54524146)
 
+    def populate(self, px, pz):
+        """Fill visible roads during loading, before the first gameplay frame.
+
+        Later recycling still happens outside fog, so cars never appear nearby.
+        """
+        old_fog=self.fog_distance
+        old_recycle=self.recycle_distance
+        self.fog_distance=min(old_fog,85.)
+        self.recycle_distance=min(old_recycle,300.)
+        try:
+            for slot in range(self.count):
+                car=self._spawn(slot,px,pz)
+                if car:self.vehicles.append(car)
+        finally:
+            self.fog_distance=old_fog
+            self.recycle_distance=old_recycle
+
     def _place(self, car):
         center = car.lane*self.world.config.road_spacing + 28*math.sin(car.along*.003)
         # Right-hand lanes, in both horizontal road families.

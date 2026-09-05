@@ -1,0 +1,285 @@
+{
+  "backend": {
+    "vendor": "Apple",
+    "renderer": "Apple M4",
+    "version": "4.1 Metal - 90.5",
+    "backend": "OpenGL",
+    "metal": false,
+    "resolution": [
+      1280,
+      720
+    ],
+    "driver_uses_metal": true,
+    "fullscreen": false,
+    "render_resolution": [
+      1280,
+      720
+    ],
+    "display_resolution": [
+      2560,
+      1440
+    ]
+  },
+  "quality": "Balanced",
+  "resolution": [
+    1280,
+    720
+  ],
+  "world": {
+    "seed": 2026,
+    "chunk_size": 128,
+    "radius": 4,
+    "resolution": 24,
+    "density": 1.0,
+    "workers": 2,
+    "road_spacing": 384
+  },
+  "vehicle": {
+    "mass": 1250.0,
+    "center_of_gravity": 0.48,
+    "engine_force": 7800.0,
+    "braking_force": 14500.0,
+    "max_speed": 52.0,
+    "reverse_speed": 12.0,
+    "steering_angle": 0.56,
+    "steering_curve": 0.045,
+    "steering_response": 5.5,
+    "suspension_stiffness": 42000.0,
+    "suspension_damping": 12500.0,
+    "suspension_travel": 0.24,
+    "tire_grip": 1.1,
+    "drag": 0.44,
+    "rolling_resistance": 165.0,
+    "wheelbase": 2.65,
+    "track_width": 1.58,
+    "wheel_radius": 0.34,
+    "ride_height": 0.64,
+    "collision_radius": 1.05,
+    "collision_restitution": 0.1,
+    "fixed_dt": 0.008333333333333333,
+    "max_frame_dt": 0.25
+  },
+  "duration_seconds": 35.01076475001173,
+  "warmup_seconds": 5.0,
+  "measured_frames": 1800,
+  "vsync": true,
+  "frame": {
+    "mean_ms": 16.677177847224,
+    "p99_ms": 16.675542822340503,
+    "peak_ms": 24.90833299816586
+  },
+  "physics": {
+    "mean_ms": 0.24749040450034146,
+    "p99_ms": 0.43117142136907205,
+    "peak_ms": 0.5649160011671484
+  },
+  "stream": {
+    "mean_ms": 0.03876407241073644,
+    "p99_ms": 1.2088372616562988,
+    "peak_ms": 3.20587502210401
+  },
+  "cpu_submit": {
+    "mean_ms": 0.929315426021478,
+    "p99_ms": 2.080626746464984,
+    "peak_ms": 13.805666996631771
+  },
+  "gpu_scene": {
+    "mean_ms": 2.6737029694444443,
+    "p99_ms": 5.06931183,
+    "peak_ms": 5.343375
+  },
+  "average_fps": 59.96218359969429,
+  "one_percent_low_fps": 59.96806284832199,
+  "cpu_one_core_percent": 28.23159411276981,
+  "max_rss_mb": 288.921875,
+  "peak_chunks": 81,
+  "peak_pending": 4,
+  "peak_meshes": 102,
+  "generation": {
+    "mean_ms": 9.803528112122818,
+    "p99_ms": 28.95758349040989,
+    "peak_ms": 31.438957987120375
+  },
+  "last_render": {
+    "cpu_submit_ms": 0.786207994678989,
+    "gpu_ms": 2.202751,
+    "draw_calls": 102,
+    "triangles": 356894,
+    "shadow_triangles": 356894,
+    "render_ms": 1.05870800325647
+  },
+  "route": [
+    {
+      "seconds": 0.0,
+      "x": 0.0,
+      "z": -35.0,
+      "speed": 0.0,
+      "chunks": 81,
+      "rss_mb": 279.984375
+    },
+    {
+      "seconds": 2.02,
+      "x": 0.0,
+      "z": -43.81,
+      "speed": 8.67,
+      "chunks": 81,
+      "rss_mb": 283.046875
+    },
+    {
+      "seconds": 4.02,
+      "x": 0.0,
+      "z": -69.38,
+      "speed": 16.72,
+      "chunks": 81,
+      "rss_mb": 283.53125
+    },
+    {
+      "seconds": 6.02,
+      "x": 0.0,
+      "z": -110.12,
+      "speed": 23.78,
+      "chunks": 81,
+      "rss_mb": 284.0625
+    },
+    {
+      "seconds": 8.03,
+      "x": 0.0,
+      "z": -163.86,
+      "speed": 29.61,
+      "chunks": 81,
+      "rss_mb": 285.671875
+    },
+    {
+      "seconds": 10.03,
+      "x": -13.12,
+      "z": -205.89,
+      "speed": 21.0,
+      "chunks": 81,
+      "rss_mb": 286.265625
+    },
+    {
+      "seconds": 12.03,
+      "x": -13.16,
+      "z": -254.47,
+      "speed": 27.34,
+      "chunks": 81,
+      "rss_mb": 286.265625
+    },
+    {
+      "seconds": 14.03,
+      "x": -13.16,
+      "z": -314.5,
+      "speed": 32.44,
+      "chunks": 81,
+      "rss_mb": 286.59375
+    },
+    {
+      "seconds": 16.03,
+      "x": -13.16,
+      "z": -383.52,
+      "speed": 36.36,
+      "chunks": 81,
+      "rss_mb": 286.8125
+    },
+    {
+      "seconds": 18.03,
+      "x": -23.93,
+      "z": -451.19,
+      "speed": 28.9,
+      "chunks": 81,
+      "rss_mb": 287.453125
+    },
+    {
+      "seconds": 20.04,
+      "x": -29.42,
+      "z": -514.26,
+      "speed": 33.67,
+      "chunks": 78,
+      "rss_mb": 287.515625
+    },
+    {
+      "seconds": 22.04,
+      "x": -29.42,
+      "z": -585.42,
+      "speed": 37.3,
+      "chunks": 81,
+      "rss_mb": 287.609375
+    },
+    {
+      "seconds": 24.04,
+      "x": -28.37,
+      "z": -611.88,
+      "speed": 0.15,
+      "chunks": 81,
+      "rss_mb": 287.703125
+    },
+    {
+      "seconds": 26.04,
+      "x": -28.04,
+      "z": -612.06,
+      "speed": 0.18,
+      "chunks": 81,
+      "rss_mb": 287.71875
+    },
+    {
+      "seconds": 28.04,
+      "x": -27.64,
+      "z": -612.36,
+      "speed": 0.27,
+      "chunks": 81,
+      "rss_mb": 287.734375
+    },
+    {
+      "seconds": 30.04,
+      "x": -27.25,
+      "z": -612.78,
+      "speed": 0.3,
+      "chunks": 81,
+      "rss_mb": 287.8125
+    },
+    {
+      "seconds": 32.04,
+      "x": -26.85,
+      "z": -613.43,
+      "speed": 0.38,
+      "chunks": 81,
+      "rss_mb": 287.859375
+    },
+    {
+      "seconds": 34.04,
+      "x": -26.57,
+      "z": -614.51,
+      "speed": 0.6,
+      "chunks": 81,
+      "rss_mb": 287.90625
+    }
+  ],
+  "limitations": [
+    "GPU timestamps bracket shadow, scene and rain; Metal excludes HUD/presentation, OpenGL includes HUD but excludes blit/presentation",
+    "RSS is process high-water mark; unified driver allocation not separately available"
+  ],
+  "physics_dropped_seconds": 0.0,
+  "startup_dropped_seconds": 0.0,
+  "weather": "clear",
+  "time_hour": 16,
+  "replay": null,
+  "input_events": [
+    {
+      "seconds": 0.0,
+      "keys": [],
+      "speed": 0.0,
+      "x": 0.0,
+      "z": -35.0
+    }
+  ],
+  "audio_enabled": false,
+  "music_enabled": false,
+  "music_profile": null,
+  "population": {
+    "traffic": 24,
+    "traffic_budget": 24,
+    "pedestrians": 108
+  },
+  "foliage_lod_metres": 85,
+  "grass_cull_metres": 90
+}

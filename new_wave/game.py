@@ -133,7 +133,10 @@ def main(argv=None,audio_module=None):
                              render_resolution=[width,height],
                              display_resolution=list(display_size))
         print('RENDERER '+json.dumps(renderer.info),flush=True)
-        meshes=prop_meshes()
+        if (ROOT/'assets/new_wave/roadside.npz').exists():
+            with np.load(ROOT/'assets/new_wave/roadside.npz') as library:
+                meshes={key:library[key] for key in library.files}
+        else:meshes=prop_meshes()
         for key,mesh in meshes.items():renderer.upload_mesh(key,mesh)
         with np.load(ROOT/'assets/new_wave/roamer.npz') as asset:
             renderer.upload_mesh('car_body',asset['body']);renderer.upload_mesh('car_wheel',asset['wheel'])
@@ -155,6 +158,7 @@ def main(argv=None,audio_module=None):
         car.state.x,car.state.z=clear_position(world,car.state.x,car.state.z,prefer_road=False)
         car.recover(world.surface_height)
         traffic=Traffic(world,count=config.get('traffic_count',12),fog_distance=(world.config.radius-.4)*world.config.chunk_size)
+        traffic.populate(car.state.x,car.state.z)
         if not args.no_audio and not args.benchmark:
             try:
                 if audio_module is None:
@@ -246,8 +250,13 @@ def main(argv=None,audio_module=None):
             for chunk in world.completed():accept(chunk)
             new_origin=(math.floor(state.x/world.config.chunk_size)*world.config.chunk_size,math.floor(state.z/world.config.chunk_size)*world.config.chunk_size)
             if new_origin!=origin:
+                dx,dz=origin[0]-new_origin[0],origin[1]-new_origin[1]
+                # Shift cached instance arrays instead of rebuilding tens of
+                # thousands of Python prop records at every chunk crossing.
+                for groups in chunk_instances.values():
+                    for rows in groups.values():
+                        rows[:,0]+=dx;rows[:,2]+=dz
                 origin=new_origin
-                chunk_instances={key:instances_for_chunk(chunk,origin) for key,chunk in world.chunks.items()}
             stream_ms=(time.perf_counter()-before)*1000
             eye,target=camera.update(state,world,max(dt,1/240),mode,args.reduced_motion or config.get('reduced_motion',False))
             offset=np.array([origin[0],0,origin[1]]);eye_local=eye-offset;target_local=target-offset
@@ -260,8 +269,28 @@ def main(argv=None,audio_module=None):
                 if np.linalg.norm(rel[[0,2]])>fog_distance+110 or np.dot(rel,forward)<-120:continue
                 batches.append((key,instance(chunk.origin[0]-origin[0],0,chunk.origin[1]-origin[1],material=1)))
                 for kind,data in chunk_instances[key].items():
+                    if kind=='walker0':
+                        data=data.copy()
+                        walk_frames=(np.floor(sim_time*9+data[:,2]*.17).astype(int)%8)
+                        phase=sim_time*.42+data[:,2]*.013
+                        travel=np.sin(phase)*6
+                        data[:,0]+=np.sin(data[:,3])*travel
+                        data[:,2]+=np.cos(data[:,3])*travel
+                        data[:,1]+=.11
+                        data[:,3]+=np.where(np.cos(phase)>0,math.pi,0)
+                        kind=f'walker{int(sim_time*9)%8}'
                     rel=data[:,:3]-eye_local
-                    mask=(np.sum(rel*rel,axis=1)<(fog_distance*.92)**2)&(rel@forward>-20)
+                    limit=90 if kind=='grass' else 140 if kind.startswith('walker') else fog_distance*.92
+                    mask=(np.sum(rel*rel,axis=1)<limit**2)&(rel@forward>-20)
+                    if kind.startswith('walker'):
+                        for pose in range(8):
+                            selected=mask&(walk_frames==pose)
+                            if np.any(selected):groups.setdefault(f'walker{pose}',[]).append(data[selected])
+                        continue
+                    if kind=='broadleaf':
+                        far=np.sum(rel*rel,axis=1)>85**2
+                        if np.any(mask&far):groups.setdefault('broadleaf_lod',[]).append(data[mask&far])
+                        mask&=~far
                     if np.any(mask):groups.setdefault(kind,[]).append(data[mask])
             for kind,data in groups.items():batches.append((kind,np.concatenate(data)))
             # NPZ chassis includes wheel-relative ground offsets; spring height is above ground.
@@ -302,6 +331,15 @@ def main(argv=None,audio_module=None):
             if rain:
                 fog=fog*(1-rain*.22);sun[3]*=1-rain*.4;fog_distance*=1-rain*.18
             if music:music.update(dt,state.speed,sun[3],rain,world.biome(state.x,state.z))
+            street_lamp=[0.,-1000.,0.]
+            lamp_distance=float('inf')
+            for key,rows in batches:
+                if key!='village':continue
+                for row in rows:
+                    a=row[3]
+                    position=[row[0]+math.cos(a)*.65-math.sin(a)*7,row[1]+5.35,row[2]-math.sin(a)*.65-math.cos(a)*7]
+                    distance=(position[0]-(state.x-origin[0]))**2+(position[2]-(state.z-origin[1]))**2
+                    if distance<lamp_distance:street_lamp=position;lamp_distance=distance
             fps=fps*.95+.05/max(frame_interval,.001)
             capture=None
             stop=(args.frames and frame+1>=args.frames) or (args.benchmark and elapsed>=args.benchmark+args.warmup)
@@ -313,7 +351,7 @@ def main(argv=None,audio_module=None):
                 hud_due=elapsed+.1
             stats=renderer.draw(batches,eye_local,target_local,sun,fog.tolist(),fog_distance,sim_time,hud_image=hud if update_hud else None,capture=capture,
                 effects={'car':[state.x-origin[0],state.y,state.z-origin[1],state.yaw],'brake':max(control.brake,float(control.throttle<0 and state.speed>1)),'rain':rain,
-                    'texture_origin':[origin[0]%32768,origin[1]%32768]})
+                    'texture_origin':[origin[0]%32768,origin[1]%32768],'street_lamp':street_lamp})
             if elapsed>args.warmup:
                 if measured_dropped is None:measured_dropped=car.dropped_time
                 samples.append(frame_interval*1000);physics_samples.append(physics_ms);stream_samples.append(stream_ms);render_samples.append(stats['cpu_submit_ms'])
@@ -343,7 +381,10 @@ def main(argv=None,audio_module=None):
             physics_dropped_seconds=car.dropped_time-(measured_dropped or 0),startup_dropped_seconds=measured_dropped,
             weather=args.weather,time_hour=args.time,replay=str(args.replay) if args.replay else None,input_events=list(input_events),
             audio_enabled=audio is not None,music_enabled=music is not None,
-            music_profile=asdict(music.current) if music else None)
+            music_profile=asdict(music.current) if music else None,
+            population={'traffic':len(traffic.vehicles),'traffic_budget':traffic.count,
+                        'pedestrians':sum(p.kind=='walker0' for chunk in world.chunks.values() for p in chunk.props)},
+            foliage_lod_metres=85,grass_cull_metres=90)
         if args.report:
             args.report.parent.mkdir(parents=True,exist_ok=True);args.report.write_text(json.dumps(report,indent=2)+'\n')
         print(json.dumps(report,indent=2),flush=True)

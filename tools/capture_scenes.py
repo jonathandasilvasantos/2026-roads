@@ -6,6 +6,10 @@ import sys
 
 ROOT=Path(__file__).resolve().parents[1]
 SCENES={
+    'realism-after': ['--camera','chase'],
+    'realism-road': ['--camera','road'],
+    'realism-village': ['--camera','wide','--x','0','--z','-90'],
+    'realism-night': ['--camera','chase','--time','22','--weather','rain'],
     'driving-after': ['--camera','chase'],
     'car-close-after': ['--camera','close'],
     'road-level-after': ['--camera','road'],

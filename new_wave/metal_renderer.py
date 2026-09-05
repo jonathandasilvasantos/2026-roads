@@ -30,12 +30,25 @@ class MetalRenderer:
         self.uniform=d.create_buffer(size=272,usage=wgpu.BufferUsage.UNIFORM|wgpu.BufferUsage.COPY_DST)
         self.shadow=d.create_texture(size=(shadow_size,shadow_size,1),format='depth32float',usage=wgpu.TextureUsage.RENDER_ATTACHMENT|wgpu.TextureUsage.TEXTURE_BINDING)
         self.shadow_view=self.shadow.create_view()
+        from PIL import Image
+        import math
+        albedo=Image.open(Path(__file__).resolve().parents[1]/'assets/new_wave/meadow-albedo.png').convert('RGBA')
+        levels=int(math.log2(max(albedo.size)))+1
+        self.ground=d.create_texture(size=(*albedo.size,1),mip_level_count=levels,format='rgba8unorm',usage=wgpu.TextureUsage.TEXTURE_BINDING|wgpu.TextureUsage.COPY_DST)
+        for level in range(levels):
+            w,h=max(1,albedo.width>>level),max(1,albedo.height>>level)
+            pixels=np.asarray(albedo.resize((w,h),Image.Resampling.LANCZOS),dtype=np.uint8)
+            d.queue.write_texture({'texture':self.ground,'mip_level':level},pixels,{'bytes_per_row':w*4},(w,h,1))
         self.layout=d.create_bind_group_layout(entries=[
             {'binding':0,'visibility':3,'buffer':{'type':'uniform'}},
             {'binding':1,'visibility':2,'texture':{'sample_type':'depth'}},
-            {'binding':2,'visibility':2,'sampler':{'type':'comparison'}}])
+            {'binding':2,'visibility':2,'sampler':{'type':'comparison'}},
+            {'binding':3,'visibility':2,'texture':{'sample_type':'float'}},
+            {'binding':4,'visibility':2,'sampler':{'type':'filtering'}}])
         self.group=d.create_bind_group(layout=self.layout,entries=[{'binding':0,'resource':{'buffer':self.uniform}},
-            {'binding':1,'resource':self.shadow_view},{'binding':2,'resource':d.create_sampler(compare='less-equal',mag_filter='linear',min_filter='linear')}])
+            {'binding':1,'resource':self.shadow_view},{'binding':2,'resource':d.create_sampler(compare='less-equal',mag_filter='linear',min_filter='linear')},
+            {'binding':3,'resource':self.ground.create_view()},
+            {'binding':4,'resource':d.create_sampler(address_mode_u='repeat',address_mode_v='repeat',mag_filter='linear',min_filter='linear',mipmap_filter='linear',max_anisotropy=4)}])
         shader=d.create_shader_module(code=Path(__file__).with_name('shaders.wgsl').read_text())
         vertex_buffers=[{'array_stride':36,'step_mode':'vertex','attributes':[{'format':'float32x3','offset':i*12,'shader_location':i} for i in range(3)]},
                         {'array_stride':48,'step_mode':'instance','attributes':[{'format':'float32x4','offset':i*16,'shader_location':i+3} for i in range(3)]}]
@@ -96,8 +109,9 @@ class MetalRenderer:
         view,r,u,f=look_at(np.asarray(camera),target)
         vp=perspective(self.width/self.height)@view
         light=light_matrix(target,sun[:3])
+        street_lamp=effects.get('street_lamp',[0,-1000,0])
         values=np.concatenate((vp.T.ravel(),light.T.ravel(),[*camera,1],sun,[*fog_color,1],
-            [fog_distance,self.width/self.height,time,self.shadow_size],[*r,0],[*u,0],[*f,0],effects.get('car',[0,0,0,0]),
+            [fog_distance,self.width/self.height,time,self.shadow_size],[*r,street_lamp[0]],[*u,street_lamp[1]],[*f,street_lamp[2]],effects.get('car',[0,0,0,0]),
             [effects.get('rain',0),effects.get('brake',0),*effects.get('texture_origin',[0,0])])).astype(np.float32)
         d.queue.write_buffer(self.uniform,0,values)
         if hud_image is not None:

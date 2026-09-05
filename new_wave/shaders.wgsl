@@ -7,6 +7,8 @@ struct Globals {
 @group(0) @binding(0) var<uniform> g: Globals;
 @group(0) @binding(1) var shadow: texture_depth_2d;
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
+@group(0) @binding(3) var ground: texture_2d<f32>;
+@group(0) @binding(4) var ground_sampler: sampler;
 struct Vert {
     @location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) c: vec3<f32>,
     @location(3) pose: vec4<f32>, @location(4) scale: vec4<f32>, @location(5) tint: vec4<f32>,
@@ -68,11 +70,23 @@ fn sky_color(ray:vec3<f32>)->vec3<f32> {
 @fragment fn fragment(o:Out)->@location(0) vec4<f32> {
     let n=normalize(o.n); let d=distance(g.camera.xyz,o.world);
     var col=o.color;
+    let ground_detail=textureSample(ground,ground_sampler,(o.world.xz+g.effects.zw)*.5).rgb;
     if(o.material<1.5) {
-        let texture_world=o.world.xz+g.effects.zw;
+        let texture_world=o.world.xz+g.effects.zw+vec2(o.world.y*.73,o.world.y*.91)*(1.-abs(n.y));
         let grain=noise(texture_world*6.);
         col*=.92+.16*grain;
         col*=.94+.12*noise(texture_world*.125);
+        if(o.material>.5 && o.color.r>.18 && o.color.g>o.color.r*1.08) {
+            col*=mix(vec3(.7),ground_detail*2.5,.8);
+        }
+        if(o.material>.5 && o.color.r<.2 && o.color.g<.2) {
+            let aggregate=noise(texture_world*28.);
+            col*=.75+.50*aggregate;
+            col+=vec3(.035,.030,.020)*smoothstep(.52,.75,noise(texture_world*.33));
+        }
+        if(o.material<.5 && o.color.r>.5 && abs(n.y)<.5) {
+            col*=.80+.28*noise(texture_world*3.1);
+        }
     }
     let lp=g.light_vp*vec4(o.world+n*.065,1.);
     let uv=lp.xy*.5+vec2(.5); let suv=vec2(uv.x,1.-uv.y);
@@ -91,6 +105,10 @@ fn sky_color(ray:vec3<f32>)->vec3<f32> {
     let spec=pow(max(dot(n,normalize(g.sun.xyz+view)),0.),48.);
     if(o.material>3.) {
         lit+=vec3(1.,.86,.65)*spec*.32*shade*g.sun.w;
+        if(o.color.r>.25 && o.color.g>.07 && o.color.g<.5) {
+            let coat=.035+.10*pow(1.-max(dot(n,view),0.),4.);
+            lit=mix(lit,sky_color(reflect(-view,n)),coat);
+        }
         if(o.color.b>o.color.r*1.4 && o.color.g>.05) {
             let reflected=sky_color(reflect(-view,n));
             let fresnel=.18+.50*pow(1.-max(dot(n,view),0.),4.);
@@ -105,6 +123,10 @@ fn sky_color(ray:vec3<f32>)->vec3<f32> {
     let beam=smoothstep(.93,.985,dot(normalize(lamp_ray),lamp_direction));
     let reach=1.-smoothstep(8.,60.,length(lamp_ray));
     lit+=col*vec3(1.,.89,.63)*beam*reach*max(n.y,.0)*2.2*(1.-g.sun.w);
+    let street=vec3(g.right.w,g.up.w,g.forward.w)-o.world;
+    lit+=col*vec3(1.,.75,.40)*max(dot(n,normalize(street)),0.)*3./(1.+dot(street,street)*.09)*(1.-g.sun.w);
+    if(o.material<.5 && o.color.r>.78 && o.color.g>.72 && o.color.b<.7) {lit+=vec3(1.,.73,.35)*(1.-g.sun.w);}
+    if(o.material<.5 && o.color.b>o.color.r*1.4 && o.color.g>.15) {lit+=vec3(.22,.13,.045)*(1.-g.sun.w);}
     if(o.material<1.5 && col.r<.2 && col.g<.2) {
         lit=mix(lit,lit*.72+sky_color(reflect(-view,n))*.13,g.effects.x);
     }

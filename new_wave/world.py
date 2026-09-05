@@ -132,10 +132,21 @@ class World:
             return max(terrain,self.height(x,z)+(.045 if distance < 5.8 else .025))
         return terrain
 
+    def ground_heights(self,x,z):
+        """Vectorized triangle heights for non-road decorative placement."""
+        step=self.config.chunk_size/self.config.resolution
+        ox=np.floor(x/self.config.chunk_size)*self.config.chunk_size
+        oz=np.floor(z/self.config.chunk_size)*self.config.chunk_size
+        x0=ox+np.floor((x-ox)/step)*step;z0=oz+np.floor((z-oz)/step)*step
+        fx=(x-x0)/step;fz=(z-z0)/step
+        h10=self._height(x0+step,z0);h01=self._height(x0,z0+step)
+        return np.where(fx+fz<=1,self._height(x0,z0)*(1-fx-fz)+h10*fx+h01*fz,
+                        self._height(x0+step,z0+step)*(fx+fz-1)+h10*(1-fz)+h01*(1-fx))
+
     def _colors(self, x, z):
         t = np.sin(x * .0017 + self._phase) + np.cos(z * .0021 - self._phase)
-        meadow = np.array([.47, .43, .24])
-        forest = np.array([.28, .34, .19])
+        meadow = np.array([.30, .37, .15])
+        forest = np.array([.22, .30, .12])
         dry = np.array([.60, .49, .29])
         a = np.clip((t + 1.1) / .7, 0, 1)[..., None]
         b = np.clip((t - .3) / .6, 0, 1)[..., None]
@@ -225,7 +236,22 @@ class World:
                 px = region_x * landmark_spacing + 28 * math.sin(pz*.003) + 29
                 if ox <= px < ox+c.chunk_size and oz <= pz < oz+c.chunk_size:
                     props.append(Prop("tower", px, self.surface_height(px,pz), pz, 1.3, 0., (.6,.6,.5), 3.5))
-        for _ in range(int(44 * c.density)):
+        # Roadside hamlets use global slots so ownership and spacing survive
+        # negative coordinates, streaming and rebases. Keep the road clear.
+        for index in range(math.floor(oz/28),math.ceil((oz+c.chunk_size)/28)):
+            pz=index*28.+14
+            if abs((pz+c.road_spacing/2)%c.road_spacing-c.road_spacing/2)<35:continue
+            if abs(index)%14>7:continue
+            for lane in range(math.floor((ox-40)/c.road_spacing),math.ceil((ox+c.chunk_size+40)/c.road_spacing)+1):
+                center=lane*c.road_spacing+28*math.sin(pz*.003)
+                for side in (-1,1):
+                    for kind,offset,scale,radius in (("village",10.7,1.,0.),("building",19.,1.25,5.),("walker0",10.5,1.,0.)):
+                        px=center+side*offset
+                        if not (ox<=px<ox+c.chunk_size and oz<=pz<oz+c.chunk_size):continue
+                        yaw=math.atan(.084*math.cos(pz*.003))+(0. if side>0 else math.pi)
+                        if kind=="building":yaw=-side*math.pi/2
+                        props.append(Prop(kind,px,self.surface_height(px,pz),pz,scale,yaw,(1.,1.,1.),radius))
+        for _ in range(int(95 * c.density)):
             px, pz = ox + rng.uniform(4, c.chunk_size - 4), oz + rng.uniform(4, c.chunk_size - 4)
             road = self.road_distance(px, pz)
             if road < 15:
@@ -256,14 +282,18 @@ class World:
             props.append(Prop(kind, float(px), self.surface_height(px, pz), float(pz), scale, float(rng.uniform(0, math.tau)), color, radius))
         # Sparse bunches break up the smooth verge. No colliders; shared mesh has
         # only 12 triangles and can be culled independently by the renderer.
-        for _ in range(int(64*c.density)):
-            px,pz=ox+rng.uniform(1,c.chunk_size-1),oz+rng.uniform(1,c.chunk_size-1)
-            distance=self.road_distance(px,pz)
-            if distance < 9 or distance > 48 or self.biome(px,pz) == "woodland":
-                continue
-            if any((p.x-px)**2+(p.z-pz)**2 < (p.radius+1)**2 for p in props if p.radius > 0):
-                continue
-            props.append(Prop("grass",float(px),self.surface_height(px,pz),float(pz),float(rng.uniform(.8,1.4)),float(rng.uniform(0,math.tau)),(.48,.46,.25),0.))
+        grass_candidates=rng.random((int(1700*c.density),4))
+        px=ox+1+grass_candidates[:,0]*(c.chunk_size-2)
+        pz=oz+1+grass_candidates[:,1]*(c.chunk_size-2)
+        distance=self._distance(px,pz)
+        valid=(distance>=12)&(distance<=65)
+        for p in props:
+            if p.radius>0:valid&=(p.x-px)**2+(p.z-pz)**2>=(p.radius+1)**2
+        px,pz=px[valid],pz[valid]
+        samples=grass_candidates[valid]
+        heights=self.ground_heights(px,pz)
+        for x,y,z,sample in zip(px,heights,pz,samples):
+            props.append(Prop("grass",float(x),float(y),float(z),float(.8+sample[2]*.6),float(sample[3]*math.tau),(.48,.46,.25),0.))
         return Chunk(key, (ox, oz), np.concatenate(pieces).astype(np.float32), props, (time.perf_counter() - started) * 1000)
 
     def update(self, x: float, z: float):

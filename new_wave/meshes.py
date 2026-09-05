@@ -76,11 +76,66 @@ def _pine():
     return b.finish()
 
 
-def _broadleaf():
+def _broadleaf(detailed=True):
     b=Builder()
-    b.cone((0,0,0),.35,4.6,(.31,.25,.18),8,.16)
-    for i,(pos,scale) in enumerate([((0,5.6,0),(2.3,2.4,2.3)),((-1.7,4.9,.3),(1.5,1.7,1.7)),((1.5,5,.8),(1.8,1.8,1.7)),((.3,4.8,-1.5),(1.8,1.7,1.5))]):
-        b.ellipsoid(pos,scale,(.29+i*.01,.35+i*.012,.17+i*.005),seed=i+1,rings=5,segments=10)
+    b.cone((0,0,0),.30,5.8,(.20,.16,.11),9,.06)
+    rng=np.random.default_rng(712)
+    # Open crowns made of small leaf sprays, not opaque polygonal balloons.
+    for i in range(13):
+        a=i*2.39996
+        center=np.array([math.cos(a)*1.9,4.4+rng.uniform(0,2.5),math.sin(a)*1.9])
+        _limb(b,(0,2.8,0),center,.065,(.23,.18,.12))
+        for j in range(110 if detailed else 28):
+            p=center+rng.normal(0,.59,3)
+            color=np.array((.20,.31,.105))*rng.uniform(.72,1.3)
+            size=1 if detailed else 1.8
+            u=np.array([math.cos(j)*.18,.025,math.sin(j)*.18])*size
+            v=np.array([-.045,.075,.04])*size
+            b.quad(p-u,p-v,p+u,p+v,color)
+            b.quad(p+v,p+u,p-v,p-u,color)
+    return b.finish()
+
+
+def _limb(b,a,c,r,color):
+    a,c=np.array(a),np.array(c)
+    direction=c-a
+    u=np.cross(direction,[0,0,1.])
+    if np.linalg.norm(u)<.001:u=np.cross(direction,[0,1.,0])
+    u=u/np.linalg.norm(u)*r
+    v=np.cross(direction,u);v=v/np.linalg.norm(v)*r
+    for i in range(6):
+        t=i*math.tau/6;s=(i+1)*math.tau/6
+        p=u*math.cos(t)+v*math.sin(t);q=u*math.cos(s)+v*math.sin(s)
+        b.quad(a+p,a+q,c+q*.75,c+p*.75,color)
+
+
+def _walker(phase):
+    b=Builder();skin=(.52,.32,.21);shirt=(.22,.32,.38);pants=(.09,.12,.16)
+    b.ellipsoid((0,1.62,0),(.12,.16,.115),skin,4,5,8)
+    b.ellipsoid((0,1.73,.015),(.125,.065,.12),(.10,.075,.045),3,3,8)
+    b.cone((0,.93,0),.20,.49,shirt,8,.24)
+    for side in (-1,1):
+        swing=math.sin(phase)*side*.23
+        hip=(side*.105,.96,0);knee=(side*.11,.52,swing*.5);foot=(side*.11,.09,swing)
+        _limb(b,hip,knee,.085,pants);_limb(b,knee,foot,.065,pants)
+        b.box((side*.11,.055,swing-.035),(.14,.11,.25),(.045,.04,.035))
+        elbow=(side*.29,1.02,-swing*.6);hand=(side*.27,.83,-swing)
+        _limb(b,(side*.21,1.38,0),elbow,.072,shirt);_limb(b,elbow,hand,.05,skin)
+    return b.finish()
+
+
+def _village():
+    b=Builder()
+    b.box((0,.04,0),(2.5,.14,28.2),(.45,.44,.40))
+    for z in range(-13,14,2):
+        b.box((-1.22,.08,z),(.15,.18,1.97),(.60,.58,.53))
+    for z in (-8,8):
+        b.box((3,.72,z),(5.5,.10,.10),(.29,.23,.15))
+        b.box((3,1.12,z),(5.5,.10,.10),(.29,.23,.15))
+        for x in (1,3,5):b.box((x,.65,z),(.13,1.3,.13),(.25,.20,.14))
+    b.cone((1.6,0,-7),.08,5.5,(.20,.22,.20),8,.045)
+    b.box((1.1,5.45,-7),(1.1,.11,.15),(.25,.26,.23))
+    b.box((.65,5.35,-7),(.55,.12,.3),(.85,.81,.60))
     return b.finish()
 
 
@@ -112,6 +167,16 @@ def _house():
             b.box((x,2.12,z),(1.03,1.17,.11),trim)
             b.box((x,2.12,z+math.copysign(.066,z)),(.85,.99,.035),glass)
             b.box((x,2.12,z+math.copysign(.09,z)),(.06,1.0,.04),(.68,.61,.46))
+    for x in (-2.54,2.54):
+        for z in (-.95,.95):
+            b.box((x,2.0,z),(.10,1.22,1.08),trim)
+            b.box((x+math.copysign(.06,x),2.,z),(.04,1.,.87),glass)
+    # Individual tile courses, gutter and plaster plinth establish real scale.
+    for y in range(12):
+        x=.12+y*.23
+        for side in (-1,1):
+            b.box((side*x,5.06-x*.6+.025,0),(.055,.045,4.62),(.37,.25,.18))
+    b.box((0,.35,0),(5.07,.30,4.07),(.49,.46,.39))
     return b.finish()
 
 
@@ -129,14 +194,15 @@ def _tower():
 
 def _grass():
     b=Builder()
-    for i in range(6):
-        a=i*math.tau/6
-        x,z=math.cos(a)*.20,math.sin(a)*.20
-        w=.025
+    rng=np.random.default_rng(981)
+    for i in range(42):
+        a=i*2.39996
+        x,z=math.cos(a)*rng.uniform(0,1.2),math.sin(a)*rng.uniform(0,1.2)
+        w=.025+rng.random()*.025
         p=(x-w,0,z)
         q=(x+w,0,z)
         r=(x+math.sin(i)*.09,.30+.09*math.sin(i*2),z+.08)
-        color=(.54+i*.012,.47+i*.006,.26)
+        color=np.array((.28,.37,.13))*rng.uniform(.8,1.45)
         b.tri(p,q,r,color)
         b.tri(r,q,p,color)
     return b.finish()
@@ -153,8 +219,9 @@ def _post():
 def prop_meshes():
     """Meshes are reusable across chunks; tree is the default world conifer."""
     pine,house=_pine(),_house()
-    return {"tree":pine,"pine":pine,"broadleaf":_broadleaf(),"rock":_rock(),
-            "building":house,"house":house,"tower":_tower(),"grass":_grass(),"post":_post()}
+    return {"tree":pine,"pine":pine,"broadleaf":_broadleaf(),"broadleaf_lod":_broadleaf(False),"rock":_rock(),
+            "building":house,"house":house,"tower":_tower(),"grass":_grass(),"post":_post(),
+            "village":_village(),**{f"walker{i}":_walker(i*math.tau/8) for i in range(8)}}
 
 
 def instances_for_chunk(chunk, origin=(0,0)):
@@ -164,6 +231,15 @@ def instances_for_chunk(chunk, origin=(0,0)):
         # Meshes already contain their material colors. A subtle per-instance tint
         # avoids multiplying foliage by an overly dark world categorical color.
         tint=.94+.06*math.sin(p.yaw*3)
+        rgb=(tint,tint,tint)
+        sx=sy=sz=p.scale
+        if p.kind=='building':
+            v=.5+.5*math.sin(p.x*17+p.z*3)
+            palette=((1.,.96,.88),(.88,.91,.91),(.90,.77,.66),(.83,.86,.70))
+            rgb=palette[int(v*3.99)]
+            sx*=.90+.24*v;sy*=.85+.25*v;sz*=1.18-.26*v
+        if p.kind.startswith('walker'):
+            rgb=(.7+.3*abs(math.sin(p.z)),.75+.25*abs(math.cos(p.z)),.85)
         grouped.setdefault(p.kind,[]).append((p.x-origin[0],p.y,p.z-origin[1],p.yaw,
-                                            p.scale,p.scale,p.scale,0,tint,tint,tint,0))
+                                            sx,sy,sz,0,*rgb,0))
     return {kind:np.asarray(rows,dtype=np.float32).reshape(-1,12) for kind,rows in grouped.items()}
